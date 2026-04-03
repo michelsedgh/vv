@@ -1,0 +1,529 @@
+<!DOCTYPE html>
+<html lang="en" class="dark">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Voice ID — Target Speaker Extraction</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = {
+      darkMode: 'class',
+      theme: {
+        extend: {
+          colors: {
+            surface: { DEFAULT: '#111827', 2: '#1f2937', 3: '#374151' },
+            accent: { DEFAULT: '#818cf8', dim: '#6366f1' },
+          }
+        }
+      }
+    }
+  </script>
+  <style>
+    body { background: #030712; color: #e5e7eb; font-family: system-ui, -apple-system, sans-serif; }
+    .pulse-dot { animation: pulse-dot 2s infinite; }
+    @keyframes pulse-dot { 0%, 100% { opacity: 1; } 50% { opacity: 0.3; } }
+    .event-enter { animation: slideIn 0.2s ease-out; }
+    @keyframes slideIn { from { opacity: 0; transform: translateY(-8px); } to { opacity: 1; transform: translateY(0); } }
+    #log::-webkit-scrollbar { width: 6px; }
+    #log::-webkit-scrollbar-track { background: transparent; }
+    #log::-webkit-scrollbar-thumb { background: #374151; border-radius: 3px; }
+    .waveform-bar { transition: height 0.05s ease-out; }
+  </style>
+</head>
+<body class="min-h-screen">
+
+  <!-- Header -->
+  <header class="border-b border-gray-800 px-6 py-4 flex items-center justify-between">
+    <div class="flex items-center gap-3">
+      <div class="w-9 h-9 rounded-lg bg-indigo-500/20 flex items-center justify-center">
+        <svg class="w-5 h-5 text-indigo-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 11a7 7 0 01-7 7m0 0a7 7 0 01-7-7m7 7v4m0 0H8m4 0h4m-4-8a3 3 0 01-3-3V5a3 3 0 116 0v6a3 3 0 01-3 3z"/>
+        </svg>
+      </div>
+      <h1 class="text-lg font-semibold text-white">Voice ID — TSE</h1>
+      <span id="statusBadge" class="ml-2 px-2 py-0.5 rounded-full text-xs font-medium bg-gray-700 text-gray-300">Offline</span>
+    </div>
+    <div class="flex items-center gap-3">
+      <button onclick="toggleMonitor()" id="monitorBtn"
+        class="px-4 py-2 rounded-lg text-sm font-medium bg-indigo-600 hover:bg-indigo-500 text-white transition-colors">
+        Start Extraction
+      </button>
+    </div>
+  </header>
+
+  <main class="max-w-6xl mx-auto p-6 grid grid-cols-1 lg:grid-cols-3 gap-6">
+
+    <!-- Left Column: Audio Output + Log -->
+    <div class="lg:col-span-2 flex flex-col gap-6">
+
+      <!-- Extracted Audio Output Panel -->
+      <section class="bg-surface rounded-xl border border-gray-800 p-5">
+        <div class="flex items-center justify-between mb-4">
+          <h2 class="text-sm font-medium text-gray-400 uppercase tracking-wide">Extracted Audio Output</h2>
+          <div class="flex items-center gap-3">
+            <span id="audioStatus" class="text-xs text-gray-500">Not running</span>
+            <button onclick="toggleMute()" id="muteBtn"
+              class="p-2 rounded-lg bg-surface-2 border border-gray-700 hover:border-indigo-500 transition-colors"
+              title="Toggle audio playback">
+              <svg id="muteIcon" class="w-5 h-5 text-indigo-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15.536 8.464a5 5 0 010 7.072M12 6l-4 4H4v4h4l4 4V6z"/>
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17.07 4.93a10 10 0 010 14.14"/>
+              </svg>
+            </button>
+          </div>
+        </div>
+        <!-- Waveform visualization -->
+        <div id="waveformContainer" class="h-24 bg-surface-2 rounded-lg flex items-end justify-center gap-[2px] px-2 overflow-hidden">
+          <p id="waveformPlaceholder" class="text-gray-500 text-sm self-center">Start extraction to see live audio</p>
+        </div>
+        <div class="flex items-center justify-between mt-3">
+          <div class="flex items-center gap-2">
+            <span class="text-xs text-gray-500">Volume</span>
+            <input type="range" id="volumeSlider" min="0" max="1" step="0.05" value="0.8"
+              class="w-24" oninput="setVolume(this.value)">
+          </div>
+          <span id="chunkInfo" class="text-xs text-gray-500"></span>
+        </div>
+      </section>
+
+      <!-- Live Event Log -->
+      <section class="bg-surface rounded-xl border border-gray-800 p-5 flex-1">
+        <div class="flex items-center justify-between mb-4">
+          <h2 class="text-sm font-medium text-gray-400 uppercase tracking-wide">Live Events</h2>
+          <button onclick="clearLog()" class="text-xs text-gray-500 hover:text-gray-300 transition-colors">Clear</button>
+        </div>
+        <div id="log" class="h-[400px] overflow-y-auto space-y-1 font-mono text-sm"></div>
+      </section>
+    </div>
+
+    <!-- Right Column: Speakers + Enroll -->
+    <div class="flex flex-col gap-6">
+
+      <!-- Enrolled Speakers -->
+      <section class="bg-surface rounded-xl border border-gray-800 p-5">
+        <div class="flex items-center justify-between mb-4">
+          <h2 class="text-sm font-medium text-gray-400 uppercase tracking-wide">Target Speaker</h2>
+          <button onclick="loadSpeakers()" class="text-xs text-gray-500 hover:text-gray-300 transition-colors">
+            Refresh
+          </button>
+        </div>
+        <div id="speakerList" class="space-y-2">
+          <p class="text-gray-500 text-sm">Loading...</p>
+        </div>
+      </section>
+
+      <!-- Enroll New Speaker -->
+      <section class="bg-surface rounded-xl border border-gray-800 p-5">
+        <h2 class="text-sm font-medium text-gray-400 uppercase tracking-wide mb-4">Enroll Voice</h2>
+        <div class="space-y-3">
+          <input id="enrollName" type="text" placeholder="Speaker name"
+            class="w-full px-3 py-2 rounded-lg bg-surface-2 border border-gray-700 text-white text-sm
+                   placeholder-gray-500 focus:outline-none focus:border-indigo-500 transition-colors">
+          <div class="flex gap-2">
+            <select id="enrollDuration"
+              class="flex-1 px-3 py-2 rounded-lg bg-surface-2 border border-gray-700 text-white text-sm
+                     focus:outline-none focus:border-indigo-500">
+              <option value="3">3 seconds</option>
+              <option value="5" selected>5 seconds</option>
+              <option value="10">10 seconds</option>
+              <option value="15">15 seconds</option>
+            </select>
+            <button onclick="enrollSpeaker()" id="enrollBtn"
+              class="px-4 py-2 rounded-lg text-sm font-medium bg-emerald-600 hover:bg-emerald-500 text-white transition-colors">
+              Record
+            </button>
+          </div>
+          <p id="enrollStatus" class="text-xs text-gray-500 hidden"></p>
+        </div>
+      </section>
+
+      <!-- Settings -->
+      <section class="bg-surface rounded-xl border border-gray-800 p-5">
+        <h2 class="text-sm font-medium text-gray-400 uppercase tracking-wide mb-4">Settings</h2>
+        <div class="space-y-3" id="settingsPanel">
+          <p class="text-gray-500 text-sm">Loading...</p>
+        </div>
+      </section>
+    </div>
+  </main>
+
+<script>
+// ─── State ────────────────────────────────────────────────────────
+let ws = null;
+let isMonitoring = false;
+let audioCtx = null;
+let gainNode = null;
+let isMuted = false;
+let nextPlayTime = 0;
+const WAVEFORM_BARS = 64;
+
+// ─── API helpers ──────────────────────────────────────────────────
+async function api(path, opts = {}) {
+  const res = await fetch(path, {
+    headers: { 'Content-Type': 'application/json' },
+    ...opts,
+    body: opts.body ? JSON.stringify(opts.body) : undefined,
+  });
+  const text = await res.text();
+  let data;
+  try { data = JSON.parse(text); } catch { throw new Error(`Server error (${res.status}): ${text.slice(0, 200)}`); }
+  if (!res.ok) throw new Error(data.detail || JSON.stringify(data));
+  return data;
+}
+
+// ─── Audio Playback (Web Audio API) ──────────────────────────────
+function initAudio() {
+  if (audioCtx) return;
+  audioCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 8000 });
+  gainNode = audioCtx.createGain();
+  gainNode.gain.value = parseFloat(document.getElementById('volumeSlider').value);
+  gainNode.connect(audioCtx.destination);
+  nextPlayTime = audioCtx.currentTime;
+  document.getElementById('audioStatus').textContent = 'Audio ready';
+}
+
+function playAudioChunk(b64Data, sampleRate, numSamples) {
+  if (!audioCtx || isMuted) return;
+
+  // Decode base64 -> Int16 -> Float32
+  const binary = atob(b64Data);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  const int16 = new Int16Array(bytes.buffer);
+  const float32 = new Float32Array(int16.length);
+  for (let i = 0; i < int16.length; i++) float32[i] = int16[i] / 32768.0;
+
+  // Create audio buffer and schedule playback
+  const buffer = audioCtx.createBuffer(1, float32.length, sampleRate);
+  buffer.getChannelData(0).set(float32);
+
+  const source = audioCtx.createBufferSource();
+  source.buffer = buffer;
+  source.connect(gainNode);
+
+  // Schedule seamlessly — reset if we've fallen too far behind
+  const now = audioCtx.currentTime;
+  if (nextPlayTime < now - 0.5 || nextPlayTime < now) {
+    // We're behind — play immediately with tiny lead to avoid clicks
+    nextPlayTime = now + 0.02;
+  }
+  source.start(nextPlayTime);
+  nextPlayTime += buffer.duration;
+
+  // Update waveform
+  updateWaveform(float32);
+  const dur = (numSamples / sampleRate).toFixed(2);
+  document.getElementById('audioStatus').textContent = 'Playing';
+  document.getElementById('chunkInfo').textContent = `${dur}s @ ${sampleRate}Hz`;
+}
+
+function toggleMute() {
+  isMuted = !isMuted;
+  const icon = document.getElementById('muteIcon');
+  if (isMuted) {
+    icon.innerHTML = '<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5.586 15H4a1 1 0 01-1-1v-4a1 1 0 011-1h1.586l4.707-4.707A1 1 0 0112 5v14a1 1 0 01-1.707.707L5.586 15z"/><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17 14l2-2m0 0l2-2m-2 2l-2-2m2 2l2 2"/>';
+    icon.className = 'w-5 h-5 text-red-400';
+  } else {
+    icon.innerHTML = '<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15.536 8.464a5 5 0 010 7.072M12 6l-4 4H4v4h4l4 4V6z"/><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17.07 4.93a10 10 0 010 14.14"/>';
+    icon.className = 'w-5 h-5 text-indigo-400';
+  }
+}
+
+function setVolume(val) {
+  if (gainNode) gainNode.gain.value = parseFloat(val);
+}
+
+// ─── Waveform Visualization ──────────────────────────────────────
+function initWaveformBars() {
+  const container = document.getElementById('waveformContainer');
+  const placeholder = document.getElementById('waveformPlaceholder');
+  if (placeholder) placeholder.remove();
+  container.innerHTML = '';
+  for (let i = 0; i < WAVEFORM_BARS; i++) {
+    const bar = document.createElement('div');
+    bar.className = 'waveform-bar bg-indigo-500/60 rounded-t-sm';
+    bar.style.width = `${100 / WAVEFORM_BARS - 0.5}%`;
+    bar.style.height = '2px';
+    bar.style.minHeight = '2px';
+    container.appendChild(bar);
+  }
+}
+
+function updateWaveform(float32) {
+  const bars = document.getElementById('waveformContainer').children;
+  if (!bars.length || bars[0].tagName === 'P') return;
+  const step = Math.floor(float32.length / WAVEFORM_BARS);
+  for (let i = 0; i < WAVEFORM_BARS; i++) {
+    let sum = 0;
+    for (let j = 0; j < step; j++) {
+      sum += Math.abs(float32[i * step + j] || 0);
+    }
+    const rms = sum / step;
+    const h = Math.max(2, Math.min(96, rms * 600));
+    bars[i].style.height = h + 'px';
+  }
+}
+
+// ─── Monitor Control ─────────────────────────────────────────────
+async function toggleMonitor() {
+  const btn = document.getElementById('monitorBtn');
+  btn.disabled = true;
+  btn.textContent = '...';
+  try {
+    if (isMonitoring) {
+      await api('/api/monitor/stop', { method: 'POST' });
+      setMonitorState(false);
+    } else {
+      initAudio();
+      await api('/api/monitor/start', { method: 'POST' });
+      setMonitorState(true);
+    }
+  } catch (e) {
+    addLog('error', 'Failed to toggle: ' + e.message);
+  }
+  btn.disabled = false;
+}
+
+function setMonitorState(running) {
+  isMonitoring = running;
+  const btn = document.getElementById('monitorBtn');
+  const badge = document.getElementById('statusBadge');
+  if (running) {
+    btn.textContent = 'Stop Extraction';
+    btn.className = btn.className.replace('bg-indigo-600 hover:bg-indigo-500', 'bg-red-600 hover:bg-red-500');
+    badge.textContent = 'Extracting';
+    badge.className = 'ml-2 px-2 py-0.5 rounded-full text-xs font-medium bg-emerald-900/50 text-emerald-400';
+    initWaveformBars();
+    connectWS();
+  } else {
+    btn.textContent = 'Start Extraction';
+    btn.className = btn.className.replace('bg-red-600 hover:bg-red-500', 'bg-indigo-600 hover:bg-indigo-500');
+    badge.textContent = 'Offline';
+    badge.className = 'ml-2 px-2 py-0.5 rounded-full text-xs font-medium bg-gray-700 text-gray-300';
+    document.getElementById('audioStatus').textContent = 'Not running';
+    document.getElementById('chunkInfo').textContent = '';
+  }
+}
+
+// ─── WebSocket ───────────────────────────────────────────────────
+function connectWS() {
+  if (ws) { try { ws.close(); } catch(e) {} }
+  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  ws = new WebSocket(`${proto}//${location.host}/ws/live`);
+  ws.onmessage = (e) => {
+    const ev = JSON.parse(e.data);
+    handleEvent(ev);
+  };
+  ws.onclose = () => {
+    if (isMonitoring) setTimeout(connectWS, 2000);
+  };
+}
+
+function handleEvent(ev) {
+  // Play audio chunks
+  if (ev.type === 'audio' && ev.data) {
+    playAudioChunk(ev.data, ev.sample_rate, ev.samples);
+    // Don't clutter log with every audio chunk — show message in chunkInfo instead
+    return;
+  }
+  addLog(ev.type, ev.message, ev.time);
+  if (ev.type === 'system' && ev.message && ev.message.includes('stopped')) {
+    setMonitorState(false);
+  }
+}
+
+// ─── Event Log ───────────────────────────────────────────────────
+function addLog(type, message, time) {
+  const log = document.getElementById('log');
+  const colors = {
+    system: 'text-indigo-400',
+    error: 'text-red-400',
+    audio: 'text-emerald-400',
+  };
+  const icons = {
+    system: '&#9881;',
+    error: '&#10007;',
+    audio: '&#9835;',
+  };
+  const color = colors[type] || 'text-gray-400';
+  const icon = icons[type] || '&bull;';
+  const t = time || new Date().toLocaleTimeString('en-US', { hour12: false });
+  const div = document.createElement('div');
+  div.className = `event-enter flex gap-2 ${color}`;
+  div.innerHTML = `<span class="text-gray-600 select-none shrink-0">${t}</span><span class="shrink-0">${icon}</span><span class="break-all">${message || ''}</span>`;
+  log.appendChild(div);
+  log.scrollTop = log.scrollHeight;
+  while (log.children.length > 300) log.removeChild(log.firstChild);
+}
+
+function clearLog() {
+  document.getElementById('log').innerHTML = '';
+}
+
+// ─── Speakers List ───────────────────────────────────────────────
+async function loadSpeakers() {
+  try {
+    const data = await api('/api/speakers');
+    const el = document.getElementById('speakerList');
+    if (!data.speakers || data.speakers.length === 0) {
+      el.innerHTML = '<p class="text-gray-500 text-sm">No target speaker enrolled. Record one below.</p>';
+      return;
+    }
+    el.innerHTML = data.speakers.map(s => `
+      <div class="flex items-center justify-between bg-surface-2 rounded-lg px-3 py-2.5">
+        <div class="flex items-center gap-2.5">
+          <div class="w-8 h-8 rounded-full bg-indigo-600/30 flex items-center justify-center">
+            <span class="text-indigo-400 font-bold text-sm">${s.display_name.charAt(0)}</span>
+          </div>
+          <div>
+            <p class="text-white text-sm font-medium">${s.display_name}</p>
+            <p class="text-gray-500 text-xs">${s.num_samples} sample${s.num_samples !== 1 ? 's' : ''} ${s.has_reference ? '<span class="text-emerald-400">&#10003; reference</span>' : '<span class="text-amber-400">no reference</span>'}</p>
+          </div>
+        </div>
+        <button onclick="deleteSpeaker('${s.name}')"
+          class="p-1.5 rounded-md hover:bg-red-900/30 text-gray-500 hover:text-red-400 transition-colors"
+          title="Delete">
+          <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"/>
+          </svg>
+        </button>
+      </div>
+    `).join('');
+  } catch (e) {
+    document.getElementById('speakerList').innerHTML = '<p class="text-red-400 text-sm">Failed to load</p>';
+  }
+}
+
+async function deleteSpeaker(name) {
+  if (!confirm(`Delete speaker "${name}"?`)) return;
+  try {
+    await api(`/api/speakers/${name}`, { method: 'DELETE' });
+    loadSpeakers();
+  } catch (e) {
+    alert('Failed to delete: ' + e.message);
+  }
+}
+
+// ─── Enrollment ──────────────────────────────────────────────────
+async function enrollSpeaker() {
+  const name = document.getElementById('enrollName').value.trim();
+  if (!name) { alert('Enter a speaker name'); return; }
+  const duration = parseInt(document.getElementById('enrollDuration').value);
+  const btn = document.getElementById('enrollBtn');
+  const status = document.getElementById('enrollStatus');
+
+  btn.disabled = true;
+  btn.textContent = 'Recording...';
+  status.className = 'text-xs text-amber-400';
+  status.classList.remove('hidden');
+
+  const safeName = name.toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_|_$/g, '');
+  try {
+    await api(`/api/speakers/${safeName}/enroll`, {
+      method: 'POST',
+      body: { duration, display_name: name },
+    });
+    status.textContent = `Recording ${duration}s — speak now!`;
+    await pollEnrollment(btn, status);
+  } catch (e) {
+    status.textContent = 'Failed: ' + e.message;
+    status.className = 'text-xs text-red-400';
+    btn.disabled = false;
+    btn.textContent = 'Record';
+  }
+}
+
+async function pollEnrollment(btn, status) {
+  const poll = async () => {
+    try {
+      const data = await api('/api/enroll/status');
+      status.textContent = data.message || data.status;
+
+      if (data.status === 'recording') {
+        status.className = 'text-xs text-amber-400';
+        btn.textContent = 'Recording...';
+      } else if (data.status === 'processing') {
+        status.className = 'text-xs text-blue-400';
+        btn.textContent = 'Processing...';
+      } else if (data.status === 'done') {
+        const r = data.result;
+        status.textContent = `Enrolled! Reference: ${r.ref_duration}s, RMS: ${r.rms}`;
+        status.className = 'text-xs text-emerald-400';
+        document.getElementById('enrollName').value = '';
+        btn.disabled = false;
+        btn.textContent = 'Record';
+        loadSpeakers();
+        return;
+      } else if (data.status === 'error') {
+        status.textContent = 'Error: ' + data.message;
+        status.className = 'text-xs text-red-400';
+        btn.disabled = false;
+        btn.textContent = 'Record';
+        return;
+      }
+      setTimeout(poll, 500);
+    } catch (e) {
+      status.textContent = 'Poll error: ' + e.message;
+      status.className = 'text-xs text-red-400';
+      btn.disabled = false;
+      btn.textContent = 'Record';
+    }
+  };
+  await poll();
+}
+
+// ─── Settings ────────────────────────────────────────────────────
+async function loadSettings() {
+  try {
+    const config = await api('/api/config');
+    const el = document.getElementById('settingsPanel');
+    el.innerHTML = `
+      <label class="block">
+        <span class="text-xs text-gray-400">Chunk Duration (seconds)</span>
+        <input type="range" min="1" max="5" step="0.5" value="${config.tse.chunk_seconds}"
+          class="w-full mt-1" oninput="this.nextElementSibling.textContent=this.value+'s'"
+          onchange="saveSetting('chunk_seconds', parseFloat(this.value))">
+        <span class="text-xs text-indigo-400">${config.tse.chunk_seconds}s</span>
+      </label>
+      <label class="block">
+        <span class="text-xs text-gray-400">Hop Duration (seconds)</span>
+        <input type="range" min="0.25" max="2" step="0.25" value="${config.tse.hop_seconds}"
+          class="w-full mt-1" oninput="this.nextElementSibling.textContent=this.value+'s'"
+          onchange="saveSetting('hop_seconds', parseFloat(this.value))">
+        <span class="text-xs text-indigo-400">${config.tse.hop_seconds}s</span>
+      </label>
+      <p class="text-[10px] text-gray-600 pt-1">Settings apply on next extraction start.</p>
+    `;
+  } catch (e) {
+    document.getElementById('settingsPanel').innerHTML = '<p class="text-red-400 text-sm">Failed to load settings</p>';
+  }
+}
+
+async function saveSetting(key, value) {
+  try {
+    await api('/api/config', { method: 'PATCH', body: { [key]: value } });
+  } catch (e) {
+    console.error('Failed to save setting:', e);
+  }
+}
+
+// ─── Init ────────────────────────────────────────────────────────
+async function init() {
+  loadSpeakers();
+  loadSettings();
+  try {
+    const st = await api('/api/monitor/status');
+    if (st.running) {
+      initAudio();
+      setMonitorState(true);
+      // Load log events only (audio events are NOT stored, so no replay issue)
+      const evData = await api('/api/monitor/events?limit=50');
+      if (evData.events) evData.events.filter(ev => ev.type !== 'audio').forEach(ev => handleEvent(ev));
+    }
+  } catch (e) {}
+}
+
+init();
+</script>
+</body>
+</html>

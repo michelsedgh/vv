@@ -1,0 +1,26 @@
+audio:
+  device_index: 0
+  mic_sample_rate: 16000
+  model_sample_rate: 8000
+device: cuda
+enrollment:
+  dir: enrolled_speakers
+  duration_default: 5
+tse:
+  attn_approx_qk_dim: 512
+  attn_n_head: 4
+  beta: 1.0
+  buffer_seconds: 6.0
+  checkpoint: exp/pTFGridNet_WHAMR/checkpoint/best.pt.tar
+  chunk_seconds: 1.5
+  emb_dim: 64
+  emb_hs: 2
+  emb_ks: 4
+  hop_seconds: 1.0
+  lstm_hidden_units: 256
+  model_dir: X-TF-GridNet
+  n_fft: 256
+  n_layers: 3
+  num_spks: 101
+  win_shift: 0.008
+  win_size: 0.032
