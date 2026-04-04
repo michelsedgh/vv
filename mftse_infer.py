@@ -84,7 +84,6 @@ class MeanFlowTSERunner:
         device: Optional[str] = None,
         use_t_predictor: bool = True,
         t_predictor_checkpoint: Optional[Path] = None,
-        chunk_seconds: float = 3.0,
     ):
         self.base_config_path = Path(base_config_path)
         self.checkpoint_path = Path(checkpoint_path)
@@ -133,10 +132,13 @@ class MeanFlowTSERunner:
         self.hop_length = int(self.ds["hop_length"])
         self.win_length = int(self.ds["win_length"])
         self.sample_rate = int(self.ds["sample_rate"])
-        self.chunk_seconds = float(chunk_seconds)
-        # pad_and_reshape tile width (STFT frames); must match live mixture chunk duration (eval uses segment=3).
-        samples = int(round(self.chunk_seconds * self.sample_rate))
-        self._multiple = samples // self.hop_length + 1
+        # pad_and_reshape tile width (STFT frames) must match eval_steps / training — NOT live chunk_seconds.
+        # eval always uses segment-length tiles (e.g. 3s → 376 frames); shorter mic chunks get spectrogram
+        # zero-pad to this width before the UDiT. Using chunk-sized _multiple broke enroll|mix time layout
+        # (train ~752 STFT positions vs ~502 for 1s chunks) and caused silence/garbage between segments.
+        seg_sec = float(self.ds.get("segment", 3))
+        seg_samples = int(round(seg_sec * self.sample_rate))
+        self._multiple = seg_samples // self.hop_length + 1
 
     @torch.inference_mode()
     def infer_chunk(

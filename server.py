@@ -381,7 +381,7 @@ def _run_meanflow_monitor():
         enroll_sec = float(mf.get("enroll_seconds", 3))
         euler_steps = int(mf.get("euler_steps", 1))
 
-        chunk_samples = int(chunk_sec * sr)
+        chunk_samples = int(round(float(chunk_sec) * sr))
         enroll_samples = int(enroll_sec * sr)
         cap_samples = max_chunks * chunk_samples
 
@@ -401,8 +401,8 @@ def _run_meanflow_monitor():
                     "type": "system",
                     "time": _now(),
                     "message": (
-                        f"Note: chunk_seconds={chunk_sec} vs training segment={seg_ds}s in yaml — "
-                        f"lower latency if smaller; quality may dip slightly vs 3s training tiles."
+                        f"chunk_seconds={chunk_sec} (mic FIFO); STFT/model pad uses dataset.segment={seg_ds}s "
+                        f"from {base_cfg.name} — shorter chunks are zero-padded in the spectrogram to match training."
                     ),
                 }
             )
@@ -417,7 +417,6 @@ def _run_meanflow_monitor():
             device=config.get("device"),
             use_t_predictor=use_tp,
             t_predictor_checkpoint=tp_ckpt if use_tp else None,
-            chunk_seconds=chunk_sec,
         )
 
         enroll_root = BASE_DIR / enroll_cfg["dir"]

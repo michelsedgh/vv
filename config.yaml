@@ -25,9 +25,9 @@ meanflow:
   # ECAPA t-predictor (Lightning ckpt); alpha before Euler, same as eval_steps --t_predicter ECAPAMLP
   use_t_predictor: true
   t_predictor_checkpoint: models/meanflow/t-predictor-noisy-weights.ckpt
-  # Live latency ≈ chunk_seconds + GPU time each hop (FIFO: wait for a full chunk of mic audio).
-  # Training used dataset.segment=3s; 3 = best match. Use 2 or 1.5 for lower delay (small quality tradeoff).
-  chunk_seconds: 2
+  # Live latency ≈ chunk_seconds + GPU time (FIFO). Shorter = snappier; STFT still pads to dataset.segment (3s)
+  # inside the model (see mftse_infer), so 1–2s chunks work without breaking the UDiT time layout.
+  chunk_seconds: 1
   # Smaller = less buffered audio when GPU falls behind (snappier, but easier dropouts if infer is slow).
   max_queued_chunks: 4
   # Optional minimum seconds between GPU runs (0 = run as fast as FIFO has a full chunk).
