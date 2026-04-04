@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Voice ID — Target Speaker Extraction</title>
+  <title>MeanFlow-TSE — live mic</title>
   <script src="https://cdn.tailwindcss.com"></script>
   <script>
     tailwind.config = {
@@ -40,7 +40,7 @@
           <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 11a7 7 0 01-7 7m0 0a7 7 0 01-7-7m7 7v4m0 0H8m4 0h4m-4-8a3 3 0 01-3-3V5a3 3 0 116 0v6a3 3 0 01-3 3z"/>
         </svg>
       </div>
-      <h1 class="text-lg font-semibold text-white">Voice ID — TSE</h1>
+      <h1 class="text-lg font-semibold text-white">MeanFlow-TSE</h1>
       <span id="statusBadge" class="ml-2 px-2 py-0.5 rounded-full text-xs font-medium bg-gray-700 text-gray-300">Offline</span>
     </div>
     <div class="flex items-center gap-3">
@@ -84,6 +84,10 @@
           </div>
           <span id="chunkInfo" class="text-xs text-gray-500"></span>
         </div>
+        <p class="text-xs text-amber-600/90 mt-3 leading-relaxed">
+          Use <strong class="font-medium text-amber-500">one tab only</strong> and <strong class="font-medium text-amber-500">headphones</strong>.
+          Multiple tabs or speakers→mic pick up the stream and it sounds like stutter/echo/repeats (not the model duplicating packets).
+        </p>
       </section>
 
       <!-- Live Event Log -->
@@ -150,12 +154,51 @@
 <script>
 // ─── State ────────────────────────────────────────────────────────
 let ws = null;
+let wsReconnectTimer = null;
 let isMonitoring = false;
 let audioCtx = null;
 let gainNode = null;
 let isMuted = false;
-let nextPlayTime = 0;
+/** End time (audioCtx.currentTime) of the last scheduled chunk; next chunk starts after this (no overlap). */
+let audioQueueEnd = 0;
+const playedChunkIds = new Set();
+const PLAYED_CHUNK_ID_CAP = 256;
 const WAVEFORM_BARS = 64;
+
+function takeChunkIdOnce(id) {
+  if (!id) return true;
+  if (playedChunkIds.has(id)) return false;
+  playedChunkIds.add(id);
+  while (playedChunkIds.size > PLAYED_CHUNK_ID_CAP) {
+    playedChunkIds.delete(playedChunkIds.values().next().value);
+  }
+  return true;
+}
+
+function clearAudioPlaybackState() {
+  playedChunkIds.clear();
+  audioQueueEnd = 0;
+}
+
+function teardownWebSocket() {
+  if (wsReconnectTimer) {
+    clearTimeout(wsReconnectTimer);
+    wsReconnectTimer = null;
+  }
+  if (!ws) return;
+  const old = ws;
+  ws = null;
+  if (old._pingInterval) {
+    clearInterval(old._pingInterval);
+    old._pingInterval = null;
+  }
+  old.onmessage = null;
+  old.onopen = null;
+  old.onclose = null;
+  try {
+    old.close();
+  } catch (e) {}
+}
 
 // ─── API helpers ──────────────────────────────────────────────────
 async function api(path, opts = {}) {
@@ -172,18 +215,23 @@ async function api(path, opts = {}) {
 }
 
 // ─── Audio Playback (Web Audio API) ──────────────────────────────
-function initAudio() {
-  if (audioCtx) return;
-  audioCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 8000 });
+async function initAudio() {
+  if (audioCtx) {
+    if (audioCtx.state === 'suspended') await audioCtx.resume();
+    return;
+  }
+  audioCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
   gainNode = audioCtx.createGain();
   gainNode.gain.value = parseFloat(document.getElementById('volumeSlider').value);
   gainNode.connect(audioCtx.destination);
-  nextPlayTime = audioCtx.currentTime;
+  audioQueueEnd = audioCtx.currentTime;
+  if (audioCtx.state === 'suspended') await audioCtx.resume();
   document.getElementById('audioStatus').textContent = 'Audio ready';
 }
 
-function playAudioChunk(b64Data, sampleRate, numSamples) {
+async function playAudioChunk(b64Data, sampleRate, numSamples) {
   if (!audioCtx || isMuted) return;
+  if (audioCtx.state === 'suspended') await audioCtx.resume();
 
   // Decode base64 -> Int16 -> Float32
   const binary = atob(b64Data);
@@ -201,14 +249,21 @@ function playAudioChunk(b64Data, sampleRate, numSamples) {
   source.buffer = buffer;
   source.connect(gainNode);
 
-  // Schedule seamlessly — reset if we've fallen too far behind
+  // Strict end-to-end queue: never overlap chunks (overlap = comb filtering / “repeating” / level drops).
   const now = audioCtx.currentTime;
-  if (nextPlayTime < now - 0.5 || nextPlayTime < now) {
-    // We're behind — play immediately with tiny lead to avoid clicks
-    nextPlayTime = now + 0.02;
+  if (audioQueueEnd < now) {
+    audioQueueEnd = now;
   }
-  source.start(nextPlayTime);
-  nextPlayTime += buffer.duration;
+  if (audioQueueEnd - now > 10) {
+    audioQueueEnd = now;
+  }
+  const gap = 0.01;
+  let startAt = audioQueueEnd + gap;
+  if (startAt < now + 0.02) {
+    startAt = now + 0.02;
+  }
+  source.start(startAt);
+  audioQueueEnd = startAt + buffer.duration;
 
   // Update waveform
   updateWaveform(float32);
@@ -274,7 +329,7 @@ async function toggleMonitor() {
       await api('/api/monitor/stop', { method: 'POST' });
       setMonitorState(false);
     } else {
-      initAudio();
+      await initAudio();
       await api('/api/monitor/start', { method: 'POST' });
       setMonitorState(true);
     }
@@ -294,6 +349,8 @@ function setMonitorState(running) {
     badge.textContent = 'Extracting';
     badge.className = 'ml-2 px-2 py-0.5 rounded-full text-xs font-medium bg-emerald-900/50 text-emerald-400';
     initWaveformBars();
+    clearAudioPlaybackState();
+    if (audioCtx) audioQueueEnd = audioCtx.currentTime;
     connectWS();
   } else {
     btn.textContent = 'Start Extraction';
@@ -302,27 +359,69 @@ function setMonitorState(running) {
     badge.className = 'ml-2 px-2 py-0.5 rounded-full text-xs font-medium bg-gray-700 text-gray-300';
     document.getElementById('audioStatus').textContent = 'Not running';
     document.getElementById('chunkInfo').textContent = '';
+    clearAudioPlaybackState();
+    teardownWebSocket();
   }
 }
 
 // ─── WebSocket ───────────────────────────────────────────────────
 function connectWS() {
-  if (ws) { try { ws.close(); } catch(e) {} }
+  if (wsReconnectTimer) {
+    clearTimeout(wsReconnectTimer);
+    wsReconnectTimer = null;
+  }
+  teardownWebSocket();
+
   const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-  ws = new WebSocket(`${proto}//${location.host}/ws/live`);
-  ws.onmessage = (e) => {
-    const ev = JSON.parse(e.data);
-    handleEvent(ev);
+  const socket = new WebSocket(`${proto}//${location.host}/ws/live`);
+  ws = socket;
+
+  socket.onopen = () => {
+    socket._pingInterval = setInterval(() => {
+      if (socket.readyState === WebSocket.OPEN) {
+        try {
+          socket.send('ping');
+        } catch (e) {}
+      }
+    }, 20000);
   };
-  ws.onclose = () => {
-    if (isMonitoring) setTimeout(connectWS, 2000);
+  socket.onmessage = async (e) => {
+    try {
+      const ev = JSON.parse(e.data);
+      await handleEvent(ev);
+    } catch (err) {
+      console.error('WebSocket message error:', err);
+    }
+  };
+  socket.onclose = (ev) => {
+    if (socket._pingInterval) {
+      clearInterval(socket._pingInterval);
+      socket._pingInterval = null;
+    }
+    if (ws !== socket) return;
+    ws = null;
+    if (!isMonitoring) return;
+    // Server closes older sockets when a new /ws/live connects (code 4000). Do not reconnect or you fight the new tab.
+    if (ev.code === 4000) {
+      addLog('system', 'This tab was disconnected because another tab opened the live stream.', new Date().toLocaleTimeString('en-US', { hour12: false }));
+      return;
+    }
+    wsReconnectTimer = setTimeout(() => {
+      wsReconnectTimer = null;
+      connectWS();
+    }, 2000);
   };
 }
 
-function handleEvent(ev) {
+window.addEventListener('beforeunload', () => {
+  teardownWebSocket();
+});
+
+async function handleEvent(ev) {
   // Play audio chunks
   if (ev.type === 'audio' && ev.data) {
-    playAudioChunk(ev.data, ev.sample_rate, ev.samples);
+    if (!takeChunkIdOnce(ev.chunk_id)) return;
+    await playAudioChunk(ev.data, ev.sample_rate, ev.samples);
     // Don't clutter log with every audio chunk — show message in chunkInfo instead
     return;
   }
@@ -373,11 +472,11 @@ async function loadSpeakers() {
       <div class="flex items-center justify-between bg-surface-2 rounded-lg px-3 py-2.5">
         <div class="flex items-center gap-2.5">
           <div class="w-8 h-8 rounded-full bg-indigo-600/30 flex items-center justify-center">
-            <span class="text-indigo-400 font-bold text-sm">${s.display_name.charAt(0)}</span>
+            <span class="text-indigo-400 font-bold text-sm">${(s.display_name || s.name).charAt(0)}</span>
           </div>
           <div>
-            <p class="text-white text-sm font-medium">${s.display_name}</p>
-            <p class="text-gray-500 text-xs">${s.num_samples} sample${s.num_samples !== 1 ? 's' : ''} ${s.has_reference ? '<span class="text-emerald-400">&#10003; reference</span>' : '<span class="text-amber-400">no reference</span>'}</p>
+            <p class="text-white text-sm font-medium">${s.display_name || s.name}</p>
+            <p class="text-gray-500 text-xs">${s.has_reference ? '<span class="text-emerald-400">&#10003; reference.wav</span>' : '<span class="text-amber-400">no reference</span>'}</p>
           </div>
         </div>
         <button onclick="deleteSpeaker('${s.name}')"
@@ -421,7 +520,7 @@ async function enrollSpeaker() {
   try {
     await api(`/api/speakers/${safeName}/enroll`, {
       method: 'POST',
-      body: { duration, display_name: name },
+      body: { duration },
     });
     status.textContent = `Recording ${duration}s — speak now!`;
     await pollEnrollment(btn, status);
@@ -446,8 +545,8 @@ async function pollEnrollment(btn, status) {
         status.className = 'text-xs text-blue-400';
         btn.textContent = 'Processing...';
       } else if (data.status === 'done') {
-        const r = data.result;
-        status.textContent = `Enrolled! Reference: ${r.ref_duration}s, RMS: ${r.rms}`;
+        const r = data.result || {};
+        status.textContent = `Enrolled! peak=${r.peak ?? '?'} (16 kHz reference.wav)`;
         status.className = 'text-xs text-emerald-400';
         document.getElementById('enrollName').value = '';
         btn.disabled = false;
@@ -476,34 +575,21 @@ async function pollEnrollment(btn, status) {
 async function loadSettings() {
   try {
     const config = await api('/api/config');
+    const mf = config.meanflow || {};
     const el = document.getElementById('settingsPanel');
     el.innerHTML = `
-      <label class="block">
-        <span class="text-xs text-gray-400">Chunk Duration (seconds)</span>
-        <input type="range" min="1" max="5" step="0.5" value="${config.tse.chunk_seconds}"
-          class="w-full mt-1" oninput="this.nextElementSibling.textContent=this.value+'s'"
-          onchange="saveSetting('chunk_seconds', parseFloat(this.value))">
-        <span class="text-xs text-indigo-400">${config.tse.chunk_seconds}s</span>
-      </label>
-      <label class="block">
-        <span class="text-xs text-gray-400">Hop Duration (seconds)</span>
-        <input type="range" min="0.25" max="2" step="0.25" value="${config.tse.hop_seconds}"
-          class="w-full mt-1" oninput="this.nextElementSibling.textContent=this.value+'s'"
-          onchange="saveSetting('hop_seconds', parseFloat(this.value))">
-        <span class="text-xs text-indigo-400">${config.tse.hop_seconds}s</span>
-      </label>
-      <p class="text-[10px] text-gray-600 pt-1">Settings apply on next extraction start.</p>
+      <p class="text-xs text-gray-500">MeanFlow uses <code class="text-gray-400">config.yaml</code> (no live PATCH API).</p>
+      <ul class="text-xs text-gray-400 mt-2 space-y-1 font-mono">
+        <li>sample_rate: ${config.audio?.sample_rate ?? '?'} Hz</li>
+        <li>chunk_seconds: ${mf.chunk_seconds ?? '?'}</li>
+        <li>max_queued_chunks: ${mf.max_queued_chunks ?? '?'}</li>
+        <li>min_inference_interval_seconds: ${mf.min_inference_interval_seconds ?? '?'}</li>
+        <li>enroll_seconds: ${mf.enroll_seconds ?? '?'}</li>
+        <li>use_t_predictor: ${mf.use_t_predictor ?? '?'}</li>
+      </ul>
     `;
   } catch (e) {
     document.getElementById('settingsPanel').innerHTML = '<p class="text-red-400 text-sm">Failed to load settings</p>';
-  }
-}
-
-async function saveSetting(key, value) {
-  try {
-    await api('/api/config', { method: 'PATCH', body: { [key]: value } });
-  } catch (e) {
-    console.error('Failed to save setting:', e);
   }
 }
 
@@ -514,7 +600,7 @@ async function init() {
   try {
     const st = await api('/api/monitor/status');
     if (st.running) {
-      initAudio();
+      await initAudio();
       setMonitorState(true);
       // Load log events only (audio events are NOT stored, so no replay issue)
       const evData = await api('/api/monitor/events?limit=50');

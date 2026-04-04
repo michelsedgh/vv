@@ -1,26 +1,40 @@
+# MeanFlow-TSE live mic dashboard (replaces Laura pipeline)
+
 audio:
   device_index: 0
-  mic_sample_rate: 16000
-  model_sample_rate: 8000
+  sample_rate: 16000  # must match MeanFlow training (16 kHz)
+
 device: cuda
+
 enrollment:
   dir: enrolled_speakers
-  duration_default: 5
-tse:
-  attn_approx_qk_dim: 512
-  attn_n_head: 4
-  beta: 1.0
-  buffer_seconds: 6.0
-  checkpoint: exp/pTFGridNet_WHAMR/checkpoint/best.pt.tar
-  chunk_seconds: 1.5
-  emb_dim: 64
-  emb_hs: 2
-  emb_ks: 4
-  hop_seconds: 1.0
-  lstm_hidden_units: 256
-  model_dir: X-TF-GridNet
-  n_fft: 256
-  n_layers: 3
-  num_spks: 101
-  win_shift: 0.008
-  win_size: 0.032
+  # Mic capture length (seconds). Should be >= meanflow.enroll_seconds. 3 matches LibriMix segment_aux.
+  record_seconds: 3
+  # Folder name under enrolled_speakers (e.g. michel). If null, use newest reference.wav.
+  active_speaker: null
+
+# Used by legacy enroll_speaker.py / stream_monitor.py
+verification:
+  enrollment_dir: enrolled_speakers
+
+meanflow:
+  # Path to MeanFlow-TSE yaml (inside cloned repo). Use *_noisy.yaml with noisy Drive weights.
+  base_config: meanflow_tse/config/config_MeanFlowTSE_noisy.yaml
+  # Main checkpoint (gdown: see models/meanflow/download_weights.sh)
+  checkpoint: models/meanflow/best-noisy-weights.ckpt
+  # ECAPA t-predictor (Lightning ckpt); alpha before Euler, same as eval_steps --t_predicter ECAPAMLP
+  use_t_predictor: true
+  t_predictor_checkpoint: models/meanflow/t-predictor-noisy-weights.ckpt
+  # One model segment = dataset.segment (3 s); same as eval pad_and_reshape tile length.
+  chunk_seconds: 3
+  # Max unprocessed 3 s segments queued (mic is faster than GPU). Oldest dropped when exceeded.
+  max_queued_chunks: 4
+  # Optional minimum seconds between GPU runs (0 = run as fast as FIFO has a full chunk).
+  min_inference_interval_seconds: 0
+  euler_steps: 1
+  # Reference length for STFT + t-predictor (seconds); must match dataset segment_aux (3) in yaml
+  enroll_seconds: 3
+
+server:
+  host: 0.0.0.0
+  port: 8042

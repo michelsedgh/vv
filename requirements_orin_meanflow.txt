@@ -1,0 +1,54 @@
+# MeanFlow-TSE + voice server — Jetson Orin (keep NVIDIA PyTorch)
+#
+# BEFORE this file: install torch / torchaudio / torchvision from NVIDIA for your JetPack
+# (e.g. 2.3.0). Do NOT install meanflow_tse/requirements.txt on Jetson.
+#
+# Pin your current Jet stack so pip does NOT replace it with PyPI torch:
+#   ./scripts/mk_constraints_orin.sh
+#   pip install -r requirements_orin_meanflow.txt -c constraints_orin.txt
+#
+# If you skip -c, asteroid/lightning can pull a generic aarch64 torch and break CUDA.
+
+# Core scientific
+numpy>=1.24.0,<2.0.0
+scipy>=1.10.0
+pandas>=2.0.0
+matplotlib>=3.7.0
+seaborn>=0.12.0
+h5py>=3.9.0
+tqdm
+
+# Audio
+librosa>=0.10.2
+soundfile>=0.12.1
+pydub>=0.25.1
+resampy>=0.4.2
+
+pytorch-lightning>=2.1.0,<2.5.0
+tensorboard
+
+asteroid==0.6.0
+asteroid-filterbanks
+
+julius
+torch-optimizer>=0.0.1a12,<0.2.0
+
+flow-matching
+
+cached-property
+pystoi>=0.3.3
+
+einops>=0.6.1
+timm>=0.9.5,<1.0.0
+
+openpyxl
+omegaconf>=2.3.0
+hydra-core>=1.3.2
+pyyaml>=6.0
+
+transformers>=4.30.0,<4.41.0
+accelerate>=0.20.0,<0.35.0
+
+fastapi>=0.100.0
+uvicorn[standard]>=0.22.0
+sounddevice>=0.4.6

@@ -1,4 +1,45 @@
-# Voice ID — Real-Time Speaker Diarization + Verification
+# Voice — MeanFlow-TSE live mic (STT-oriented)
+
+This repo includes a **web dashboard + API** that runs **[MeanFlow-TSE](https://github.com/rikishimizu/MeanFlow-TSE)** on the microphone: enroll a short reference, then stream **extracted target speech** (16 kHz) over WebSockets for playback or an STT backend.
+
+### Quick start (MeanFlow)
+
+**Orin Nano / Jetson:** use **`requirements_orin_meanflow.txt` + constraints** so pip never swaps your **NVIDIA torch 2.3.x** for a random PyPI `torch` wheel.
+
+Do **not** run `pip install -r meanflow_tse/requirements.txt` on Jetson — that file is for **x86 + cu118** only (see warning at top of that file).
+
+```bash
+cd ~/Documents/Voice
+conda activate voice_id
+
+# 1) Install PyTorch the NVIDIA way (torch 2.3.0 + matching torchaudio for your JetPack):
+#    https://docs.nvidia.com/deeplearning/frameworks/install-pytorch-jetson-platform/
+
+# 2) If an earlier `pip install` broke torch, reinstall your `.whl` files first.
+
+# 3) Freeze torch* versions, then install MeanFlow deps WITHOUT upgrading torch:
+chmod +x scripts/mk_constraints_orin.sh
+./scripts/mk_constraints_orin.sh
+pip install -r requirements_orin_meanflow.txt -c constraints_orin.txt
+
+# (Optional) If you have no torch yet, copy and edit versions:
+#   cp constraints_orin.example.txt constraints_orin.txt
+
+# Download MeanFlow + t-predictor weights → models/meanflow/ (see models/meanflow/README.md).
+# config.yaml: 16 kHz, enroll/record 3 s (segment_aux), chunk 3 s, use_t_predictor + noisy ckpts.
+
+python server.py
+# Open http://<orin-ip>:8042 — Enroll, then Start.
+```
+
+**x86 Linux + CUDA 11.8 (not Jetson):** use `meanflow_tse/requirements.txt` (includes torch 2.0.1 + cu118 index).
+
+- **Config:** `config.yaml` — `audio.sample_rate` 16000, `enrollment.record_seconds`, `meanflow.enroll_seconds` / `chunk_seconds` (3), `use_t_predictor`, checkpoint paths.
+- **Mic overflow:** increase mic `block` in `server.py` or reduce GPU load; streaming uses FIFO `chunk_seconds` segments (see `max_queued_chunks` in `config.yaml`).
+
+---
+
+# Voice ID — Real-Time Speaker Diarization + Verification (legacy)
 
 Real-time speaker diarization and verification system for Jetson Orin Nano 8GB.
 Continuously monitors a microphone, identifies "who spoke when" via diart, and verifies

@@ -1,19 +1,15 @@
 #!/usr/bin/env python3
 """
-FastAPI backend for Voice ID Dashboard.
-Target Speaker Extraction (TSE) using X-TF-GridNet.
-Records a reference clip, then continuously extracts that speaker's voice
-from live microphone audio using a rolling buffer + overlap-add approach.
+MeanFlow-TSE live mic → WebSocket (for STT or headphones).
+Enrollment: per-speaker reference.wav at 16 kHz mono (first enroll_seconds used at inference).
 """
+from __future__ import annotations
 
 import asyncio
 import base64
-import json
-import os
-import struct
-import sys
 import threading
 import time
+import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -29,15 +25,6 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse
 from pydantic import BaseModel
 
-# ─── App ─────────────────────────────────────────────────────────────
-app = FastAPI(title="Voice ID API")
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
 BASE_DIR = Path(__file__).parent
 CONFIG_PATH = BASE_DIR / "config.yaml"
 
@@ -47,59 +34,87 @@ def load_config():
         return yaml.safe_load(f)
 
 
-# ─── Global State ────────────────────────────────────────────────────
+app = FastAPI(title="MeanFlow-TSE Voice")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+loop: Optional[asyncio.AbstractEventLoop] = None
+
+
 class MonitorState:
     def __init__(self):
         self.running = False
         self.thread: Optional[threading.Thread] = None
         self.events: list = []
-        self.max_events = 500
-        self.active_speakers: dict = {}
+        self.max_events = 300
         self.ws_clients: list = []
+        self.ws_lock = threading.Lock()
         self.lock = threading.Lock()
         self.stop_event = threading.Event()
+        # Set on /api/monitor/start: enrolled folder name (slug) or None → use config / newest file
+        self.start_speaker: Optional[str] = None
 
     def add_event(self, event: dict):
-        """Store event in log and broadcast to WS clients."""
         with self.lock:
             self.events.append(event)
             if len(self.events) > self.max_events:
-                self.events = self.events[-self.max_events:]
-        asyncio.run_coroutine_threadsafe(self._broadcast(event), loop)
+                self.events = self.events[-self.max_events :]
+        if loop is not None:
+            asyncio.run_coroutine_threadsafe(self._broadcast(event), loop)
 
     def send_audio(self, event: dict):
-        """Broadcast audio to WS clients WITHOUT storing (prevents replay)."""
-        asyncio.run_coroutine_threadsafe(self._broadcast(event), loop)
+        if loop is not None:
+            asyncio.run_coroutine_threadsafe(self._broadcast(event), loop)
 
     async def _broadcast(self, event: dict):
+        with self.ws_lock:
+            clients = list(self.ws_clients)
+        if event.get("type") == "audio":
+            st = event.get("step")
+            if st is not None and st % 20 == 0:
+                print(
+                    f"[ws] audio step={st} -> {len(clients)} WebSocket client(s) "
+                    f"(if >1, same chunk plays in every tab/device)",
+                    flush=True,
+                )
         dead = []
-        for ws in self.ws_clients:
+        for client in clients:
             try:
-                await ws.send_json(event)
+                await client.send_json(event)
             except Exception:
-                dead.append(ws)
-        for ws in dead:
-            self.ws_clients.remove(ws)
+                dead.append(client)
+        if not dead:
+            return
+        with self.ws_lock:
+            for d in dead:
+                try:
+                    self.ws_clients.remove(d)
+                except ValueError:
+                    pass
 
 
 monitor = MonitorState()
-loop: Optional[asyncio.AbstractEventLoop] = None
+# Prevents two concurrent POST /monitor/start from spawning two GPU/mic threads (would duplicate audio + load).
+monitor_start_stop_lock = threading.Lock()
 
 
-# ─── Enrollment State ────────────────────────────────────────────────
-class EnrollmentJob:
+class EnrollJob:
     def __init__(self):
-        self.status = "idle"       # idle | recording | processing | done | error
+        self.status = "idle"
         self.message = ""
         self.speaker_name = ""
-        self.result = {}
+        self.result: dict = {}
         self.lock = threading.Lock()
 
     def set(self, status, message="", result=None):
         with self.lock:
             self.status = status
             self.message = message
-            if result:
+            if result is not None:
                 self.result = result
 
     def get(self):
@@ -112,579 +127,523 @@ class EnrollmentJob:
             }
 
 
-enroll_job = EnrollmentJob()
-
-
-# ─── Models ──────────────────────────────────────────────────────────
-class SpeakerInfo(BaseModel):
-    name: str
-    display_name: str
-    has_reference: bool
-    num_samples: int
-
-
-class EnrollRequest(BaseModel):
-    duration: int = 5
-    display_name: Optional[str] = None
-
-
-class MonitorStatus(BaseModel):
-    running: bool
-    event_count: int
-
-
-class ConfigUpdate(BaseModel):
-    chunk_seconds: Optional[float] = None
-    hop_seconds: Optional[float] = None
-
-
-# ─── Speaker Management API ──────────────────────────────────────────
-@app.get("/api/speakers")
-def list_speakers():
-    config = load_config()
-    enrollment_dir = BASE_DIR / config["enrollment"]["dir"]
-    speakers = []
-    if enrollment_dir.exists():
-        for d in sorted(enrollment_dir.iterdir()):
-            if d.is_dir():
-                has_ref = (d / "reference.wav").exists()
-                samples = list(d.glob("sample_*.wav"))
-                speakers.append(SpeakerInfo(
-                    name=d.name,
-                    display_name=d.name.replace("_", " ").title(),
-                    has_reference=has_ref,
-                    num_samples=len(samples),
-                ))
-    return {"speakers": [s.dict() for s in speakers]}
-
-
-@app.delete("/api/speakers/{name}")
-def delete_speaker(name: str):
-    config = load_config()
-    enrollment_dir = BASE_DIR / config["enrollment"]["dir"]
-    speaker_dir = enrollment_dir / name
-    if not speaker_dir.exists():
-        raise HTTPException(404, "Speaker not found")
-    import shutil
-    shutil.rmtree(speaker_dir)
-    return {"status": "deleted", "name": name}
-
-
-@app.get("/api/speakers/{name}/audio/{sample_id}")
-def get_speaker_audio(name: str, sample_id: int):
-    config = load_config()
-    enrollment_dir = BASE_DIR / config["enrollment"]["dir"]
-    wav_path = enrollment_dir / name / f"sample_{sample_id}.wav"
-    if not wav_path.exists():
-        raise HTTPException(404, "Audio sample not found")
-    return FileResponse(str(wav_path), media_type="audio/wav")
-
-
-@app.post("/api/speakers/{name}/enroll")
-def enroll_speaker(name: str, req: EnrollRequest):
-    """Start async enrollment: record a reference audio clip for TSE."""
-    if enroll_job.status in ("recording", "processing"):
-        raise HTTPException(409, detail="Enrollment already in progress")
-
-    enroll_job.speaker_name = name
-    enroll_job.result = {}
-    enroll_job.set("recording", f"Recording {req.duration}s...")
-
-    thread = threading.Thread(
-        target=_do_enrollment,
-        args=(name, req.duration),
-        daemon=True,
-    )
-    thread.start()
-
-    return {"status": "started", "message": f"Recording {req.duration}s..."}
-
-
-@app.get("/api/enroll/status")
-def get_enroll_status():
-    return enroll_job.get()
-
-
-def _do_enrollment(name: str, duration: int):
-    """Background enrollment: record reference clip, trim silence, save as reference.wav.
-    
-    X-TF-GridNet uses the raw reference audio directly (no embedding extraction).
-    The model's internal AuxEncoder handles speaker representation.
-    """
-    config = load_config()
-    mic_sr = config["audio"]["mic_sample_rate"]
-    model_sr = config["audio"]["model_sample_rate"]
-    device_index = config["audio"]["device_index"]
-    enrollment_dir = BASE_DIR / config["enrollment"]["dir"]
-
-    speaker_dir = enrollment_dir / name.lower().replace(" ", "_")
-    speaker_dir.mkdir(parents=True, exist_ok=True)
-
-    existing = list(speaker_dir.glob("sample_*.wav"))
-    sample_num = len(existing) + 1
-
-    # Record at mic sample rate
-    try:
-        print(f"[ENROLL] Recording {duration}s from device {device_index}...", flush=True)
-        enroll_job.set("recording", f"Recording {duration}s — speak now!")
-        audio = sd.rec(
-            int(duration * mic_sr),
-            samplerate=mic_sr,
-            channels=1,
-            dtype="float32",
-            device=device_index,
-        )
-        sd.wait()
-        audio = audio.squeeze()
-        rms = float(np.sqrt(np.mean(audio ** 2)))
-        print(f"[ENROLL] Recorded {len(audio)} samples, RMS={rms:.4f}", flush=True)
-    except Exception as e:
-        print(f"[ENROLL] Recording failed: {e}", flush=True)
-        enroll_job.set("error", f"Recording failed: {e}")
-        return
-
-    # Trim silence
-    enroll_job.set("processing", "Processing reference clip...")
-
-    def _trim_silence(audio_1d, sr, frame_ms=25, threshold=0.01):
-        frame_len = int(sr * frame_ms / 1000)
-        n_frames = len(audio_1d) // frame_len
-        if n_frames == 0:
-            return audio_1d
-        frame_rms = np.array([
-            np.sqrt(np.mean(audio_1d[i*frame_len:(i+1)*frame_len] ** 2))
-            for i in range(n_frames)
-        ])
-        above = np.where(frame_rms > threshold)[0]
-        if len(above) == 0:
-            return audio_1d
-        first = max(0, above[0] - 1)
-        last = min(n_frames - 1, above[-1] + 1)
-        return audio_1d[first * frame_len : (last + 1) * frame_len]
-
-    trimmed = _trim_silence(audio, mic_sr)
-    trim_dur = len(trimmed) / mic_sr
-    print(f"[ENROLL] Trimmed silence: {len(audio)/mic_sr:.1f}s -> {trim_dur:.1f}s speech", flush=True)
-
-    # Save full recording as sample
-    wav_path = speaker_dir / f"sample_{sample_num}.wav"
-    sf.write(str(wav_path), audio, mic_sr)
-
-    # Resample trimmed audio to model sample rate (8kHz) and save as reference.wav
-    try:
-        import librosa
-        trimmed_8k = librosa.resample(trimmed, orig_sr=mic_sr, target_sr=model_sr)
-        ref_path = speaker_dir / "reference.wav"
-        sf.write(str(ref_path), trimmed_8k, model_sr)
-        ref_dur = len(trimmed_8k) / model_sr
-        print(f"[ENROLL] Saved reference.wav ({ref_dur:.1f}s at {model_sr}Hz)", flush=True)
-
-        enroll_job.set("done", "Enrollment complete!", result={
-            "name": name,
-            "sample_num": sample_num,
-            "duration": duration,
-            "rms": round(rms, 4),
-            "ref_duration": round(ref_dur, 1),
-        })
-    except Exception as e:
-        import traceback
-        print(f"[ENROLL] Processing FAILED:\n{traceback.format_exc()}", flush=True)
-        enroll_job.set("error", f"Processing failed: {e}")
-
-
-# ─── Config API ──────────────────────────────────────────────────────
-@app.get("/api/config")
-def get_config():
-    return load_config()
-
-
-@app.patch("/api/config")
-def update_config(update: ConfigUpdate):
-    config = load_config()
-    if update.chunk_seconds is not None:
-        config["tse"]["chunk_seconds"] = update.chunk_seconds
-    if update.hop_seconds is not None:
-        config["tse"]["hop_seconds"] = update.hop_seconds
-    with open(CONFIG_PATH, "w") as f:
-        yaml.dump(config, f, default_flow_style=False)
-    return config
-
-
-# ─── Audio Devices API ───────────────────────────────────────────────
-@app.get("/api/devices")
-def list_audio_devices():
-    devices = []
-    for i, d in enumerate(sd.query_devices()):
-        if d["max_input_channels"] > 0:
-            devices.append({
-                "index": i,
-                "name": d["name"],
-                "channels": d["max_input_channels"],
-                "sample_rate": d["default_samplerate"],
-            })
-    return {"devices": devices}
-
-
-# ─── Monitor Control API ─────────────────────────────────────────────
-@app.get("/api/monitor/status")
-def get_monitor_status():
-    return MonitorStatus(
-        running=monitor.running,
-        event_count=len(monitor.events),
-    )
-
-
-@app.get("/api/monitor/events")
-def get_monitor_events(limit: int = 100):
-    return {"events": monitor.events[-limit:]}
-
-
-@app.post("/api/monitor/start")
-def start_monitor():
-    if monitor.running:
-        return {"status": "already_running"}
-
-    monitor.stop_event.clear()
-    monitor.events.clear()
-    monitor.active_speakers.clear()
-    monitor.thread = threading.Thread(target=_run_monitor, daemon=True)
-    monitor.thread.start()
-    monitor.running = True
-    return {"status": "started"}
-
-
-@app.post("/api/monitor/stop")
-def stop_monitor():
-    if not monitor.running:
-        return {"status": "not_running"}
-    monitor.stop_event.set()
-    monitor.running = False
-    return {"status": "stopping"}
-
-
-def _load_tse_model(config):
-    """Load X-TF-GridNet model and return (model, device)."""
-    tse = config["tse"]
-    compute_device = torch.device(config["device"])
-
-    sys.path.insert(0, str(BASE_DIR / tse["model_dir"] / "nnet"))
-    from pTFGridNet import pTFGridNet
-
-    net = pTFGridNet(
-        n_fft=tse["n_fft"],
-        n_layers=tse["n_layers"],
-        lstm_hidden_units=tse["lstm_hidden_units"],
-        attn_n_head=tse["attn_n_head"],
-        attn_approx_qk_dim=tse["attn_approx_qk_dim"],
-        emb_dim=tse["emb_dim"],
-        emb_ks=tse["emb_ks"],
-        emb_hs=tse["emb_hs"],
-        num_spks=tse["num_spks"],
-        activation="prelu",
-        eps=1e-5,
-    )
-
-    cpt_path = str(BASE_DIR / tse["model_dir"] / tse["checkpoint"])
-    cpt = torch.load(cpt_path, map_location="cpu")
-    net.load_state_dict(cpt["model_state_dict"])
-    net.to(compute_device).eval()
-    n_params = sum(p.numel() for p in net.parameters()) / 1e6
-    print(f"[TSE] Loaded X-TF-GridNet ({n_params:.2f}M params, epoch {cpt.get('epoch', '?')})", flush=True)
-    return net, compute_device
-
-
-def _prepare_stft(waveform_tensor, config, device):
-    """Convert raw waveform to STFT representation for X-TF-GridNet.
-    Input: waveform_tensor [B, samples] on device
-    Output: stft_input [B, 2, T, F] on device, n_frames
-    """
-    tse = config["tse"]
-    sr = config["audio"]["model_sample_rate"]
-    win_size = int(sr * tse["win_size"])   # 256
-    win_shift = int(sr * tse["win_shift"]) # 64
-    n_fft = tse["n_fft"]
-    beta = tse["beta"]
-
-    hann = torch.hann_window(win_size).to(device)
-    stft = torch.stft(
-        waveform_tensor, n_fft=n_fft, hop_length=win_shift,
-        win_length=win_size, return_complex=True, window=hann,
-    )
-    stft = torch.view_as_real(stft)  # [B, F, T, 2]
-    mag = torch.norm(stft, dim=-1) ** beta
-    phase = torch.atan2(stft[..., -1], stft[..., 0])
-    # [B, 2, T, F]
-    out = torch.stack((mag * torch.cos(phase), mag * torch.sin(phase)), dim=-1)
-    out = out.permute(0, 3, 2, 1)
-    return out
-
-
-def _istft_from_output(est_stft, config, device, length):
-    """Convert X-TF-GridNet output [B, 2, T, F] back to waveform."""
-    tse = config["tse"]
-    sr = config["audio"]["model_sample_rate"]
-    win_size = int(sr * tse["win_size"])
-    win_shift = int(sr * tse["win_shift"])
-    n_fft = tse["n_fft"]
-    beta = tse["beta"]
-
-    # [B, 2, T, F] -> [B, F, T, 2]
-    est = est_stft.permute(0, 3, 2, 1)
-    mag = torch.norm(est, dim=-1) ** (1.0 / beta)
-    phase = torch.atan2(est[..., -1], est[..., 0])
-    est_complex = torch.stack((mag * torch.cos(phase), mag * torch.sin(phase)), dim=-1)
-    est_complex = torch.view_as_complex(est_complex)
-
-    hann = torch.hann_window(win_size).to(device)
-    wav = torch.istft(
-        est_complex, n_fft=n_fft, hop_length=win_shift,
-        win_length=win_size, window=hann, length=length,
-    )
-    return wav  # [B, samples]
-
-
-def _run_monitor():
-    """Target Speaker Extraction pipeline.
-
-    Rolling buffer captures mic audio -> process chunk_seconds windows every
-    hop_seconds -> X-TF-GridNet extracts target speaker -> linear crossfade
-    stitching -> stream extracted audio to dashboard via WebSocket.
-    """
-    try:
-        config = load_config()
-        mic_sr = config["audio"]["mic_sample_rate"]
-        model_sr = config["audio"]["model_sample_rate"]
-        device_index = config["audio"]["device_index"]
-        tse_cfg = config["tse"]
-        enrollment_dir = BASE_DIR / config["enrollment"]["dir"]
-
-        chunk_sec = tse_cfg["chunk_seconds"]
-        hop_sec = tse_cfg["hop_seconds"]
-        chunk_samples = int(chunk_sec * model_sr)
-        hop_samples = int(hop_sec * model_sr)
-        overlap_samples = chunk_samples - hop_samples
-
-        monitor.add_event({"type": "system", "time": _now(), "message": "Loading X-TF-GridNet..."})
-
-        # Load model
-        net, device = _load_tse_model(config)
-
-        # Find enrolled speaker and load reference
-        ref_audio = None
-        speaker_name = None
-        if enrollment_dir.exists():
-            for d in sorted(enrollment_dir.iterdir()):
-                ref_path = d / "reference.wav"
-                if d.is_dir() and ref_path.exists():
-                    ref_data, ref_sr = sf.read(str(ref_path))
-                    ref_audio = ref_data.astype(np.float32).squeeze()
-                    if ref_sr != model_sr:
-                        import librosa
-                        ref_audio = librosa.resample(ref_audio, orig_sr=ref_sr, target_sr=model_sr)
-                    speaker_name = d.name.replace("_", " ").title()
-                    print(f"[TSE] Loaded reference for '{speaker_name}' ({len(ref_audio)/model_sr:.1f}s)", flush=True)
-                    break
-
-        if ref_audio is None:
-            monitor.add_event({"type": "error", "time": _now(),
-                               "message": "No enrolled speaker found. Enroll a speaker first."})
-            return
-
-        # Prepare reference STFT (computed once, reused every chunk)
-        # Use max-abs normalization (matches model training pipeline)
-        ref_scale = np.max(np.abs(ref_audio))
-        if ref_scale < 1e-8:
-            ref_scale = 1.0
-        ref_norm = ref_audio / ref_scale
-        ref_tensor = torch.tensor(ref_norm, dtype=torch.float32).unsqueeze(0).to(device)
-        ref_stft = _prepare_stft(ref_tensor, config, device)
-        ref_n_frames = ref_stft.shape[2]
-        ref_len_t = torch.tensor([ref_n_frames], dtype=torch.int, device=device)
-
-        monitor.add_event({
-            "type": "system", "time": _now(),
-            "message": f"Model loaded. Target: {speaker_name}. Listening...",
-        })
-
-        # Rolling buffer at model sample rate (8kHz)
-        buffer_max = int(tse_cfg["buffer_seconds"] * model_sr)
-        audio_buffer = np.zeros(0, dtype=np.float32)
-
-        # Crossfade state: store the tail of the previous chunk for blending
-        prev_tail = None  # will hold last overlap_samples of previous output
-
-        chunk_count = 0
-
-        # Mic callback: accumulate audio into buffer
-        mic_buffer_lock = threading.Lock()
-        ratio = int(mic_sr / model_sr)  # 16000/8000 = 2
-
-        def mic_callback(indata, frames, time_info, status):
-            nonlocal audio_buffer
-            if status:
-                print(f"[MIC] {status}", flush=True)
-            mono = indata[:, 0].astype(np.float32)
-            # Anti-aliased 2:1 decimation: average adjacent sample pairs
-            if ratio > 1:
-                # Truncate to even length, then average pairs
-                n = (len(mono) // ratio) * ratio
-                downsampled = mono[:n].reshape(-1, ratio).mean(axis=1)
-            else:
-                downsampled = mono
-            with mic_buffer_lock:
-                audio_buffer = np.concatenate([audio_buffer, downsampled])
-                if len(audio_buffer) > buffer_max:
-                    audio_buffer = audio_buffer[-buffer_max:]
-
-        # Start mic stream — use small blocksize for low latency
-        block_ms = 50  # 50ms blocks
-        block_samples_mic = int(block_ms / 1000 * mic_sr)
-        stream = sd.InputStream(
-            samplerate=mic_sr,
-            device=device_index,
-            channels=1,
-            dtype="float32",
-            blocksize=block_samples_mic,
-            callback=mic_callback,
-        )
-        stream.start()
-        print(f"[TSE] Mic stream started (block={block_samples_mic}, chunk={chunk_sec}s, hop={hop_sec}s, overlap={overlap_samples/model_sr:.2f}s)", flush=True)
-
-        # Build linear crossfade ramps once
-        if overlap_samples > 0:
-            fade_in = np.linspace(0.0, 1.0, overlap_samples, dtype=np.float32)
-            fade_out = 1.0 - fade_in
-        else:
-            fade_in = fade_out = None
-
-        # Track buffer position: we want to advance by hop_samples each iteration
-        last_buf_end = 0  # how many total samples we've consumed from the buffer
-
-        # Main processing loop — poll frequently, process when ready
-        while not monitor.stop_event.is_set():
-            time.sleep(0.05)  # 50ms poll interval — low latency
-
-            with mic_buffer_lock:
-                buf_len = len(audio_buffer)
-
-            if buf_len < chunk_samples:
-                continue
-
-            # Only process if hop_samples of new audio have arrived since last chunk
-            if chunk_count > 0 and buf_len < last_buf_end + hop_samples:
-                continue
-
-            # Grab the latest chunk_samples from buffer
-            with mic_buffer_lock:
-                chunk = audio_buffer[-chunk_samples:].copy()
-            last_buf_end = buf_len
-
-            # Max-abs normalization (matches model training pipeline)
-            chunk_scale = np.max(np.abs(chunk))
-            if chunk_scale < 1e-6:
-                # Silence — skip
-                continue
-            chunk_norm = chunk / chunk_scale
-
-            # Run TSE inference
-            t0 = time.perf_counter()
-            mix_tensor = torch.tensor(chunk_norm, dtype=torch.float32).unsqueeze(0).to(device)
-            mix_stft = _prepare_stft(mix_tensor, config, device)
-
-            with torch.no_grad():
-                est_stft, _ = net(mix_stft, ref_stft, ref_len_t)
-
-            est_wav = _istft_from_output(est_stft, config, device, length=chunk_samples)
-            est_np = est_wav.squeeze().cpu().numpy() * chunk_scale  # denormalize
-            infer_ms = (time.perf_counter() - t0) * 1000
-
-            chunk_count += 1
-
-            # ── Linear crossfade stitching ──
-            # Split output into: overlap region (start) + new region (rest)
-            if prev_tail is not None and overlap_samples > 0:
-                # Crossfade: blend prev_tail with start of current output
-                blended = prev_tail * fade_out + est_np[:overlap_samples] * fade_in
-                # New audio = crossfaded overlap + non-overlapping new portion
-                new_audio = np.concatenate([blended, est_np[overlap_samples:]])
-            else:
-                # First chunk — send everything
-                new_audio = est_np
-
-            # Store tail for next crossfade
-            if overlap_samples > 0:
-                prev_tail = est_np[-overlap_samples:].copy()
-            else:
-                prev_tail = None
-
-            # Clip to prevent distortion
-            peak = np.max(np.abs(new_audio))
-            if peak > 1.0:
-                new_audio = new_audio / peak
-
-            # Encode as 16-bit PCM -> base64 and send via WebSocket (NOT stored)
-            pcm_16 = (new_audio * 32767).astype(np.int16)
-            audio_b64 = base64.b64encode(pcm_16.tobytes()).decode("ascii")
-
-            monitor.send_audio({
-                "type": "audio",
-                "time": _now(),
-                "data": audio_b64,
-                "sample_rate": model_sr,
-                "samples": len(pcm_16),
-            })
-
-            # Log every 5 chunks (not audio data, just status)
-            if chunk_count % 5 == 1:
-                monitor.add_event({
-                    "type": "system", "time": _now(),
-                    "message": f"Chunk {chunk_count}: {infer_ms:.0f}ms inference, {len(new_audio)/model_sr:.2f}s audio",
-                })
-
-        stream.stop()
-        stream.close()
-
-    except Exception as e:
-        import traceback
-        print(f"[MONITOR] Crashed:\n{traceback.format_exc()}", flush=True)
-        monitor.add_event({"type": "error", "time": _now(), "message": f"Monitor crashed: {e}"})
-    finally:
-        monitor.running = False
-        monitor.add_event({"type": "system", "time": _now(), "message": "Monitor stopped."})
+enroll_job = EnrollJob()
 
 
 def _now():
     return datetime.now().strftime("%H:%M:%S")
 
 
-# ─── WebSocket ───────────────────────────────────────────────────────
+# ─── API models ─────────────────────────────────────────────────────
+class EnrollRequest(BaseModel):
+    # Seconds of mic capture; default from enrollment.record_seconds (≥ meanflow.enroll_seconds)
+    duration: Optional[int] = None
+
+
+class SpeakerInfo(BaseModel):
+    name: str
+    display_name: str
+    has_reference: bool
+
+
+# ─── Speakers ───────────────────────────────────────────────────────
+@app.get("/api/speakers")
+def list_speakers():
+    config = load_config()
+    root = BASE_DIR / config["enrollment"]["dir"]
+    out = []
+    if root.exists():
+        for d in sorted(root.iterdir()):
+            if d.is_dir():
+                out.append(
+                    SpeakerInfo(
+                        name=d.name,
+                        display_name=d.name.replace("_", " ").title(),
+                        has_reference=(d / "reference.wav").exists(),
+                    )
+                )
+    return {"speakers": [s.dict() for s in out]}
+
+
+@app.delete("/api/speakers/{name}")
+def delete_speaker(name: str):
+    config = load_config()
+    p = BASE_DIR / config["enrollment"]["dir"] / name
+    if not p.exists():
+        raise HTTPException(404, "Not found")
+    import shutil
+
+    shutil.rmtree(p)
+    return {"status": "deleted"}
+
+
+@app.get("/api/config")
+def get_config():
+    return load_config()
+
+
+@app.get("/api/devices")
+def list_devices():
+    devs = []
+    for i, d in enumerate(sd.query_devices()):
+        if d["max_input_channels"] > 0:
+            devs.append(
+                {
+                    "index": i,
+                    "name": d["name"],
+                    "channels": d["max_input_channels"],
+                    "sample_rate": d["default_samplerate"],
+                }
+            )
+    return {"devices": devs}
+
+
+# ─── Enrollment (reference.wav for MeanFlow) ─────────────────────────
+@app.post("/api/speakers/{name}/enroll")
+def enroll_start(name: str, req: EnrollRequest):
+    if enroll_job.status in ("recording", "processing"):
+        raise HTTPException(409, "Enrollment in progress")
+    cfg = load_config()
+    rec_default = int(cfg["enrollment"].get("record_seconds") or cfg["meanflow"]["enroll_seconds"])
+    need = int(cfg["meanflow"]["enroll_seconds"])
+    duration = req.duration if req.duration is not None else rec_default
+    if duration < need:
+        raise HTTPException(
+            400,
+            f"duration must be >= meanflow.enroll_seconds ({need}s); got {duration}s",
+        )
+    enroll_job.speaker_name = name
+    enroll_job.result = {}
+    enroll_job.set("recording", f"Recording {duration}s @ {cfg['audio']['sample_rate']} Hz...")
+    threading.Thread(
+        target=_do_enroll,
+        args=(name, duration),
+        daemon=True,
+    ).start()
+    return {"status": "started"}
+
+
+@app.get("/api/enroll/status")
+def enroll_status():
+    return enroll_job.get()
+
+
+def _do_enroll(name: str, duration: int):
+    config = load_config()
+    sr = int(config["audio"]["sample_rate"])
+    dev = int(config["audio"]["device_index"])
+    root = BASE_DIR / config["enrollment"]["dir"]
+    safe = name.lower().replace(" ", "_")
+    speaker_dir = root / safe
+    speaker_dir.mkdir(parents=True, exist_ok=True)
+
+    try:
+        enroll_job.set("recording", "Speak now...")
+        audio = sd.rec(
+            int(duration * sr),
+            samplerate=sr,
+            channels=1,
+            dtype="float32",
+            device=dev,
+        )
+        sd.wait()
+        mono = audio.squeeze()
+        peak = float(np.max(np.abs(mono)))
+        ref_path = speaker_dir / "reference.wav"
+        sf.write(str(ref_path), mono, sr)
+        enroll_job.set(
+            "done",
+            "Saved reference.wav",
+            {"name": name, "peak": round(peak, 4), "path": str(ref_path)},
+        )
+    except Exception as e:
+        enroll_job.set("error", str(e))
+
+
+# ─── Monitor ──────────────────────────────────────────────────────────
+@app.get("/api/monitor/status")
+def monitor_status():
+    return {"running": monitor.running, "events": len(monitor.events)}
+
+
+@app.get("/api/monitor/events")
+def monitor_events(limit: int = 80):
+    return {"events": monitor.events[-limit:]}
+
+
+@app.post("/api/monitor/start")
+def monitor_start(speaker: Optional[str] = None):
+    """
+    speaker: optional enrolled folder name (same as /api/speakers). If omitted, uses
+    enrollment.active_speaker from config, else the newest reference.wav under enrolled_speakers/.
+    """
+    with monitor_start_stop_lock:
+        if monitor.running:
+            return {"status": "already_running"}
+        monitor.stop_event.clear()
+        monitor.events.clear()
+        monitor.start_speaker = (
+            speaker.strip().lower().replace(" ", "_") if speaker and speaker.strip() else None
+        )
+        monitor.running = True
+        try:
+            t = threading.Thread(
+                target=_run_meanflow_monitor,
+                daemon=True,
+                name="meanflow-monitor",
+            )
+            monitor.thread = t
+            t.start()
+        except Exception:
+            monitor.running = False
+            raise
+    return {"status": "started"}
+
+
+@app.post("/api/monitor/stop")
+def monitor_stop():
+    with monitor_start_stop_lock:
+        if not monitor.running:
+            return {"status": "not_running"}
+        monitor.stop_event.set()
+        monitor.running = False
+    return {"status": "stopping"}
+
+
+def _normalize_speaker_slug(name: Optional[str]) -> Optional[str]:
+    if not name or not str(name).strip():
+        return None
+    return str(name).strip().lower().replace(" ", "_")
+
+
+def _resolve_enrollment_reference(
+    enroll_root: Path,
+    sr: int,
+    *,
+    start_speaker: Optional[str],
+    config_speaker: Optional[str],
+) -> tuple[Optional[np.ndarray], Optional[str], Optional[str]]:
+    """
+    Pick reference.wav per MeanFlow/LibriMix: mono float32 @ sr, first enroll_seconds used later.
+    Priority: API start_speaker → config active_speaker → newest reference.wav by mtime.
+    Returns (audio, display_name, dir_name) or (None, None, None).
+    """
+    from mftse_infer import to_mono_float32
+
+    if not enroll_root.is_dir():
+        return None, None, None
+    rows: list[tuple[str, Path, float]] = []
+    for d in enroll_root.iterdir():
+        if not d.is_dir():
+            continue
+        ref = d / "reference.wav"
+        if ref.is_file():
+            rows.append((d.name, ref, ref.stat().st_mtime))
+    if not rows:
+        return None, None, None
+
+    want = _normalize_speaker_slug(start_speaker) or _normalize_speaker_slug(config_speaker)
+    if want:
+        for dir_name, ref_path, _ in rows:
+            if dir_name == want:
+                break
+        else:
+            return None, None, None
+    else:
+        dir_name, ref_path, _ = max(rows, key=lambda r: r[2])
+
+    wav, rsr = sf.read(str(ref_path), dtype="float32")
+    ref_audio = to_mono_float32(wav)
+    if rsr != sr:
+        import librosa
+
+        ref_audio = librosa.resample(
+            ref_audio, orig_sr=rsr, target_sr=sr
+        ).astype(np.float32)
+    display = dir_name.replace("_", " ").title()
+    return ref_audio, display, dir_name
+
+
+def _run_meanflow_monitor():
+    try:
+        from mftse_infer import MeanFlowTSERunner, fix_length
+
+        config = load_config()
+        audio_cfg = config["audio"]
+        mf = config["meanflow"]
+        enroll_cfg = config["enrollment"]
+        sr = int(audio_cfg["sample_rate"])
+        dev_idx = int(audio_cfg["device_index"])
+        chunk_sec = float(mf["chunk_seconds"])
+        max_chunks = int(mf.get("max_queued_chunks", 4))
+        max_chunks = max(2, max_chunks)
+        min_infer_gap = float(mf.get("min_inference_interval_seconds", 0.0))
+        enroll_sec = float(mf.get("enroll_seconds", 3))
+        euler_steps = int(mf.get("euler_steps", 1))
+
+        chunk_samples = int(chunk_sec * sr)
+        enroll_samples = int(enroll_sec * sr)
+        cap_samples = max_chunks * chunk_samples
+
+        base_cfg = BASE_DIR / mf["base_config"]
+        ckpt = BASE_DIR / mf["checkpoint"]
+        use_tp = bool(mf.get("use_t_predictor", True))
+        tp_ckpt = (BASE_DIR / mf["t_predictor_checkpoint"]) if use_tp else None
+
+        # Training uses dataset.segment (3 s) for mixture tiles; keep chunk_seconds aligned
+        try:
+            seg_ds = int(yaml.safe_load(base_cfg.read_text())["dataset"]["segment"])
+        except Exception:
+            seg_ds = 3
+        if abs(chunk_sec - seg_ds) > 1e-6:
+            monitor.add_event(
+                {
+                    "type": "system",
+                    "time": _now(),
+                    "message": (
+                        f"Warning: chunk_seconds={chunk_sec} but {base_cfg.name} dataset.segment={seg_ds} "
+                        f"(eval pad_and_reshape assumes 3 s frames)."
+                    ),
+                }
+            )
+
+        monitor.add_event(
+            {"type": "system", "time": _now(), "message": "Loading MeanFlow-TSE..."}
+        )
+
+        runner = MeanFlowTSERunner(
+            base_config_path=base_cfg,
+            checkpoint_path=ckpt,
+            device=config.get("device"),
+            use_t_predictor=use_tp,
+            t_predictor_checkpoint=tp_ckpt if use_tp else None,
+        )
+
+        enroll_root = BASE_DIR / enroll_cfg["dir"]
+        cfg_spk = enroll_cfg.get("active_speaker") or None
+        ref_audio, speaker_name, _ = _resolve_enrollment_reference(
+            enroll_root,
+            sr,
+            start_speaker=monitor.start_speaker,
+            config_speaker=cfg_spk,
+        )
+
+        if ref_audio is None and enroll_root.is_dir():
+            want = monitor.start_speaker or _normalize_speaker_slug(
+                cfg_spk if cfg_spk else None
+            )
+            if want:
+                monitor.add_event(
+                    {
+                        "type": "error",
+                        "time": _now(),
+                        "message": f"No reference for speaker '{want}' (folder under {enroll_cfg['dir']}/).",
+                    }
+                )
+                return
+
+        if ref_audio is None:
+            monitor.add_event(
+                {
+                    "type": "error",
+                    "time": _now(),
+                    "message": "No reference.wav — enroll a speaker first.",
+                }
+            )
+            return
+
+        ref_fixed = fix_length(ref_audio, enroll_samples)
+
+        alpha_mode = (
+            f"ECAPA t-predictor ({mf.get('t_predictor_checkpoint', '')})"
+            if use_tp
+            else "alpha=0.5 (HALF)"
+        )
+        monitor.add_event(
+            {
+                "type": "system",
+                "time": _now(),
+                "message": (
+                    f"MeanFlow-TSE on {speaker_name}; {sr} Hz; ref {enroll_sec}s; "
+                    f"FIFO {chunk_sec}s segments (eval-style tiles, no overlap), "
+                    f"max {max_chunks} chunks queued, Euler steps={euler_steps}; {alpha_mode}."
+                ),
+            }
+        )
+
+        audio_buffer = np.zeros(0, dtype=np.float32)
+        buf_lock = threading.Lock()
+        block = max(1024, int(0.05 * sr))
+
+        def mic_cb(indata, frames, tinfo, status):
+            nonlocal audio_buffer
+            if status:
+                print(f"[MIC] {status}", flush=True)
+            mono = indata[:, 0].astype(np.float32)
+            with buf_lock:
+                audio_buffer = np.concatenate([audio_buffer, mono])
+                # Drop oldest *whole* segments if backlog too large (stay near realtime).
+                dropped = 0
+                while len(audio_buffer) > cap_samples:
+                    audio_buffer = audio_buffer[chunk_samples:].copy()
+                    dropped += 1
+                if dropped:
+                    print(f"[MeanFlow] dropped {dropped} queued chunk(s) (catch-up)", flush=True)
+
+        stream = sd.InputStream(
+            samplerate=sr,
+            device=dev_idx,
+            channels=1,
+            dtype="float32",
+            blocksize=block,
+            callback=mic_cb,
+        )
+        stream.start()
+
+        # FIFO: consume consecutive non-overlapping 3 s blocks (same time order as eval tiles).
+        last_infer_end = 0.0
+        step = 0
+        while not monitor.stop_event.is_set():
+            time.sleep(0.02)
+            now = time.monotonic()
+            if min_infer_gap > 0 and (now - last_infer_end) < min_infer_gap:
+                continue
+
+            with buf_lock:
+                if len(audio_buffer) < chunk_samples:
+                    continue
+                # Oldest audio first — same time order as eval tiles on a long mixture.
+                mix = audio_buffer[:chunk_samples].copy()
+                audio_buffer = audio_buffer[chunk_samples:].copy()
+
+            t0 = time.perf_counter()
+            try:
+                out = runner.infer_chunk(mix, ref_fixed, num_steps=euler_steps)
+            except Exception as e:
+                with buf_lock:
+                    audio_buffer = np.concatenate([mix, audio_buffer])
+                monitor.add_event(
+                    {
+                        "type": "error",
+                        "time": _now(),
+                        "message": f"Inference failed: {e}",
+                    }
+                )
+                print(f"[MeanFlow] {e}", flush=True)
+                last_infer_end = time.monotonic()
+                continue
+            dt_ms = (time.perf_counter() - t0) * 1000
+            last_infer_end = time.monotonic()
+            step += 1
+
+            out_play = np.asarray(out, dtype=np.float32).reshape(-1)
+            if out_play.size != chunk_samples:
+                if out_play.size > chunk_samples:
+                    out_play = out_play[:chunk_samples]
+                else:
+                    tmp = np.zeros(chunk_samples, dtype=np.float32)
+                    tmp[: out_play.size] = out_play
+                    out_play = tmp
+
+            peak = float(np.max(np.abs(out_play))) if out_play.size else 0.0
+            if peak < 1e-5:
+                print(
+                    f"[MeanFlow] segment {step}: output peak={peak:.2e} (inaudible? check mic / enrollment / GPU)",
+                    flush=True,
+                )
+            if peak > 1.0:
+                out_play = (out_play / peak).astype(np.float32)
+            pcm = (np.clip(out_play, -1.0, 1.0) * 32767).astype(np.int16)
+            b64 = base64.b64encode(pcm.tobytes()).decode("ascii")
+
+            monitor.send_audio(
+                {
+                    "type": "audio",
+                    "time": _now(),
+                    "chunk_id": str(uuid.uuid4()),
+                    "data": b64,
+                    "sample_rate": sr,
+                    "samples": len(pcm),
+                    "step": step,
+                    "infer_ms": round(dt_ms, 0),
+                }
+            )
+            monitor.add_event(
+                {
+                    "type": "system",
+                    "time": _now(),
+                    "message": f"Segment {step}: {dt_ms:.0f} ms (FIFO {chunk_sec}s)",
+                }
+            )
+
+            if runner.device.type == "cuda" and step % 4 == 0:
+                torch.cuda.empty_cache()
+
+        stream.stop()
+        stream.close()
+    except FileNotFoundError as e:
+        monitor.add_event({"type": "error", "time": _now(), "message": str(e)})
+    except Exception as e:
+        import traceback
+
+        print(traceback.format_exc(), flush=True)
+        monitor.add_event({"type": "error", "time": _now(), "message": str(e)})
+    finally:
+        monitor.running = False
+        monitor.add_event({"type": "system", "time": _now(), "message": "Monitor stopped."})
+
+
+# When a second browser tab/device connects, the previous WebSocket is closed. Otherwise every
+# open tab receives the same PCM and you hear the same chunk repeated N times (not fixable in the queue alone).
+_WS_SUPERSEDED_CODE = 4000
+
+
 @app.websocket("/ws/live")
-async def websocket_live(ws: WebSocket):
+async def ws_live(ws: WebSocket):
     await ws.accept()
-    monitor.ws_clients.append(ws)
+    with monitor.ws_lock:
+        previous = list(monitor.ws_clients)
+        monitor.ws_clients.clear()
+    for other in previous:
+        try:
+            await other.close(code=_WS_SUPERSEDED_CODE)
+        except Exception:
+            pass
+    with monitor.ws_lock:
+        monitor.ws_clients.append(ws)
     try:
         while True:
             await ws.receive_text()
     except WebSocketDisconnect:
         pass
     finally:
-        if ws in monitor.ws_clients:
-            monitor.ws_clients.remove(ws)
+        with monitor.ws_lock:
+            try:
+                monitor.ws_clients.remove(ws)
+            except ValueError:
+                pass
 
 
-# ─── Dashboard ───────────────────────────────────────────────────────
 @app.get("/")
-def serve_dashboard():
-    html_path = BASE_DIR / "dashboard.html"
-    return HTMLResponse(html_path.read_text())
+def dashboard():
+    p = BASE_DIR / "dashboard.html"
+    if not p.exists():
+        return HTMLResponse("<p>dashboard.html missing</p>", status_code=404)
+    return HTMLResponse(p.read_text())
 
 
-# ─── Startup ─────────────────────────────────────────────────────────
 @app.on_event("startup")
 async def startup():
     global loop
     loop = asyncio.get_event_loop()
 
 
+def main():
+    cfg = load_config()
+    h = cfg.get("server", {}).get("host", "0.0.0.0")
+    p = int(cfg.get("server", {}).get("port", 8042))
+    uvicorn.run(app, host=h, port=p)
+
+
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8042)
+    main()
