@@ -84,6 +84,7 @@ class MeanFlowTSERunner:
         device: Optional[str] = None,
         use_t_predictor: bool = True,
         t_predictor_checkpoint: Optional[Path] = None,
+        chunk_seconds: float = 3.0,
     ):
         self.base_config_path = Path(base_config_path)
         self.checkpoint_path = Path(checkpoint_path)
@@ -132,8 +133,10 @@ class MeanFlowTSERunner:
         self.hop_length = int(self.ds["hop_length"])
         self.win_length = int(self.ds["win_length"])
         self.sample_rate = int(self.ds["sample_rate"])
-        # Spectrogram time-chunk size (3 s of frames); eval_steps.py / LibriMix segment=3
-        self._multiple = self.sample_rate * 3 // self.hop_length + 1
+        self.chunk_seconds = float(chunk_seconds)
+        # pad_and_reshape tile width (STFT frames); must match live mixture chunk duration (eval uses segment=3).
+        samples = int(round(self.chunk_seconds * self.sample_rate))
+        self._multiple = samples // self.hop_length + 1
 
     @torch.inference_mode()
     def infer_chunk(

@@ -401,8 +401,8 @@ def _run_meanflow_monitor():
                     "type": "system",
                     "time": _now(),
                     "message": (
-                        f"Warning: chunk_seconds={chunk_sec} but {base_cfg.name} dataset.segment={seg_ds} "
-                        f"(eval pad_and_reshape assumes 3 s frames)."
+                        f"Note: chunk_seconds={chunk_sec} vs training segment={seg_ds}s in yaml — "
+                        f"lower latency if smaller; quality may dip slightly vs 3s training tiles."
                     ),
                 }
             )
@@ -417,6 +417,7 @@ def _run_meanflow_monitor():
             device=config.get("device"),
             use_t_predictor=use_tp,
             t_predictor_checkpoint=tp_ckpt if use_tp else None,
+            chunk_seconds=chunk_sec,
         )
 
         enroll_root = BASE_DIR / enroll_cfg["dir"]
