@@ -80,13 +80,14 @@
           <div class="flex items-center gap-2">
             <span class="text-xs text-gray-500">Volume</span>
             <input type="range" id="volumeSlider" min="0" max="1" step="0.05" value="0.8"
-              class="w-24" oninput="setVolume(this.value)">
+              class="w-24" oninput="onVolumeSliderInput(this.value)">
           </div>
           <span id="chunkInfo" class="text-xs text-gray-500"></span>
         </div>
         <p class="text-xs text-amber-600/90 mt-3 leading-relaxed">
           Use <strong class="font-medium text-amber-500">one tab only</strong> and <strong class="font-medium text-amber-500">headphones</strong>.
           Multiple tabs or speakers→mic pick up the stream and it sounds like stutter/echo/repeats (not the model duplicating packets).
+          <span class="block mt-1 text-amber-500/95"><strong class="font-medium">Safari:</strong> if you hear nothing after a page reload, move the <strong class="font-medium">volume</strong> slider once or press <strong class="font-medium">Stop</strong> then <strong class="font-medium">Start</strong> — WebKit only unlocks audio from a direct tap.</span>
         </p>
       </section>
 
@@ -215,12 +216,59 @@ async function api(path, opts = {}) {
 }
 
 // ─── Audio Playback (Web Audio API) ──────────────────────────────
+/** Server streams 16 kHz mono; graph runs at hardware rate (Safari rejects/breaks forced 16 kHz often). */
+const STREAM_SAMPLE_RATE = 16000;
+
+function resampleLinear(input, inRate, outRate) {
+  if (inRate === outRate || input.length === 0) return input;
+  const outLen = Math.max(1, Math.round((input.length * outRate) / inRate));
+  const out = new Float32Array(outLen);
+  const ratio = inRate / outRate;
+  for (let i = 0; i < outLen; i++) {
+    const x = i * ratio;
+    const j = Math.floor(x);
+    const f = x - j;
+    const a = input[j] ?? 0;
+    const b = input[Math.min(j + 1, input.length - 1)] ?? 0;
+    out[i] = a + f * (b - a);
+  }
+  return out;
+}
+
+/**
+ * Safari/WebKit: AudioContext must be created + resumed + start() a node in the *same synchronous
+ * stack* as the user tap. Any await (e.g. fetch) before first sound breaks that chain — then
+ * resume() from WebSocket callbacks does not produce audible output. Call this with no await
+ * before starting the monitor API request.
+ */
+function unlockWebAudioOnUserGesture() {
+  const AC = window.AudioContext || window.webkitAudioContext;
+  if (!audioCtx) {
+    audioCtx = new AC();
+    gainNode = audioCtx.createGain();
+    gainNode.gain.value = parseFloat(document.getElementById('volumeSlider').value);
+    gainNode.connect(audioCtx.destination);
+    audioQueueEnd = audioCtx.currentTime;
+  }
+  try {
+    void audioCtx.resume();
+  } catch (e) {}
+  try {
+    const silent = audioCtx.createBuffer(1, 1, audioCtx.sampleRate);
+    const src = audioCtx.createBufferSource();
+    src.buffer = silent;
+    src.connect(gainNode);
+    src.start(0);
+  } catch (e) {}
+}
+
 async function initAudio() {
   if (audioCtx) {
     if (audioCtx.state === 'suspended') await audioCtx.resume();
     return;
   }
-  audioCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
+  const AC = window.AudioContext || window.webkitAudioContext;
+  audioCtx = new AC();
   gainNode = audioCtx.createGain();
   gainNode.gain.value = parseFloat(document.getElementById('volumeSlider').value);
   gainNode.connect(audioCtx.destination);
@@ -241,9 +289,14 @@ async function playAudioChunk(b64Data, sampleRate, numSamples) {
   const float32 = new Float32Array(int16.length);
   for (let i = 0; i < int16.length; i++) float32[i] = int16[i] / 32768.0;
 
-  // Create audio buffer and schedule playback
-  const buffer = audioCtx.createBuffer(1, float32.length, sampleRate);
-  buffer.getChannelData(0).set(float32);
+  const ctxRate = audioCtx.sampleRate;
+  const pcm =
+    Math.abs(ctxRate - sampleRate) < 0.5
+      ? float32
+      : resampleLinear(float32, sampleRate, ctxRate);
+
+  const buffer = audioCtx.createBuffer(1, pcm.length, ctxRate);
+  buffer.getChannelData(0).set(pcm);
 
   const source = audioCtx.createBufferSource();
   source.buffer = buffer;
@@ -274,6 +327,7 @@ async function playAudioChunk(b64Data, sampleRate, numSamples) {
 
 function toggleMute() {
   isMuted = !isMuted;
+  if (!isMuted) unlockWebAudioOnUserGesture();
   const icon = document.getElementById('muteIcon');
   if (isMuted) {
     icon.innerHTML = '<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5.586 15H4a1 1 0 01-1-1v-4a1 1 0 011-1h1.586l4.707-4.707A1 1 0 0112 5v14a1 1 0 01-1.707.707L5.586 15z"/><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17 14l2-2m0 0l2-2m-2 2l-2-2m2 2l2 2"/>';
@@ -286,6 +340,11 @@ function toggleMute() {
 
 function setVolume(val) {
   if (gainNode) gainNode.gain.value = parseFloat(val);
+}
+
+function onVolumeSliderInput(val) {
+  unlockWebAudioOnUserGesture();
+  setVolume(val);
 }
 
 // ─── Waveform Visualization ──────────────────────────────────────
@@ -329,6 +388,7 @@ async function toggleMonitor() {
       await api('/api/monitor/stop', { method: 'POST' });
       setMonitorState(false);
     } else {
+      unlockWebAudioOnUserGesture();
       await initAudio();
       await api('/api/monitor/start', { method: 'POST' });
       setMonitorState(true);
