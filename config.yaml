@@ -1,4 +1,4 @@
-# MeanFlow-TSE live mic dashboard (replaces Laura pipeline)
+# MeanFlow-TSE live mic dashboard
 
 audio:
   device_index: 0

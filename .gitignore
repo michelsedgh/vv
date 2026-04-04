@@ -11,4 +11,3 @@ constraints_orin.txt
 
 # Enrollment audio (local only)
 enrolled_speakers/**/*.wav
-meanflow_tse_upstream.git.bak/

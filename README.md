@@ -37,6 +37,10 @@ python server.py
 - **Config:** `config.yaml` — `audio.sample_rate` 16000, `enrollment.record_seconds`, `meanflow.enroll_seconds` / `chunk_seconds` (3), `use_t_predictor`, checkpoint paths.
 - **Mic overflow:** increase mic `block` in `server.py` or reduce GPU load; streaming uses FIFO `chunk_seconds` segments (see `max_queued_chunks` in `config.yaml`).
 
+### Git graph looks empty in Cursor / VS Code?
+
+This repo often has **only a couple of commits** on `main` and **no `origin` remote** until you add one. The branch graph then shows almost nothing. Add your hosting remote and push, e.g. `git remote add origin <url>` then `git push -u origin main`, and the graph will populate as you commit and fetch.
+
 ---
 
 # Voice ID — Real-Time Speaker Diarization + Verification (legacy)
