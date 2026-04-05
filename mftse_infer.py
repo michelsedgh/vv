@@ -169,17 +169,21 @@ class MeanFlowTSERunner:
         print(f"[MeanFlow-TSE] AMP enabled ({dtype}).", flush=True)
 
     def compile_model(self):
-        """Apply torch.compile with CUDA-graph mode for faster inference.
-        Requires PyTorch >= 2.0 and fixed input shapes (always 3s tiles → OK)."""
+        """Apply torch.compile for faster inference.
+        Uses 'default' mode (no triton dependency). Falls back gracefully on error."""
         if self.device.type != "cuda":
             print("[MeanFlow-TSE] torch.compile skipped (CPU device).", flush=True)
             return
         try:
+            # Suppress dynamo errors → falls back to eager if compilation fails at runtime
+            import torch._dynamo
+            torch._dynamo.config.suppress_errors = True
+            # 'default' mode: no triton/CUDA-graph dependency (reduce-overhead needs triton).
             self.pl_module.model = torch.compile(
-                self.pl_module.model, mode="reduce-overhead"
+                self.pl_module.model, mode="default"
             )
             self._compiled = True
-            print("[MeanFlow-TSE] torch.compile applied (reduce-overhead).", flush=True)
+            print("[MeanFlow-TSE] torch.compile applied (default mode, suppress_errors=True).", flush=True)
         except Exception as e:
             print(f"[MeanFlow-TSE] torch.compile failed, continuing without: {e}", flush=True)
 

@@ -570,8 +570,14 @@ def _run_meanflow_monitor():
         #   consume window_samples=48000 from audio_buffer
         #   window[:] = audio[0 : 48000]                   (3.0 s)
         #   model(window) → output[48000]                   (3.0 s)
-        #   send: output[0 : 48000-160] = 47840 samples    (2.99 s)
-        #   hold: prev_tail = output[47840 : 48000]         (160 samples = 10 ms)
+        #
+        #   *** CRITICAL: only send the LAST hop, not the full 3s. ***
+        #   Sending 3s on step 0 creates a 2s Web Audio queue backlog that
+        #   NEVER drains (subsequent 1s chunks pile up), so perceived latency
+        #   stays ~3s even though the server produces hop-sized output.
+        #
+        #   send: output[-16160:-160] = 16000 samples       (1.0 s, the latest hop)
+        #   hold: prev_tail = output[-160:]                  (160 samples = 10 ms)
         #
         # Step 1+:
         #   consume hop_samples=16000 from audio_buffer     (1.0 s of new audio)
@@ -665,15 +671,18 @@ def _run_meanflow_monitor():
                     output = tmp
 
             if step == 1:
-                # ── FIRST OUTPUT: send most of the full window ───────
+                # ── FIRST OUTPUT: only send the last hop (not full window!)─
+                # Sending 3s would create an undrainable Web Audio queue.
+                # We discard the first (window - hop) of extracted audio.
                 if crossfade_samples > 0:
-                    # Hold back last crossfade_samples for blending with next chunk
-                    out_play = output[: window_samples - crossfade_samples]
-                    prev_tail = output[window_samples - crossfade_samples :].copy()
-                    # out_play.size = 48000 - 160 = 47840
-                    # prev_tail.size = 160
+                    extract = output[-(hop_samples + crossfade_samples):]
+                    # No prev_tail yet → no blend needed, just split
+                    out_play = extract[:-crossfade_samples]  # = hop_samples
+                    prev_tail = extract[-crossfade_samples:].copy()
+                    # out_play.size = 16000 (hop_samples)
+                    # prev_tail.size = 160 (crossfade_samples)
                 else:
-                    out_play = output
+                    out_play = output[-hop_samples:]
             else:
                 # ── SUBSEQUENT: extract last (hop + crossfade) from output
                 if crossfade_samples > 0:

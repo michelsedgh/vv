@@ -277,7 +277,7 @@ async function initAudio() {
   document.getElementById('audioStatus').textContent = 'Audio ready';
 }
 
-async function playAudioChunk(b64Data, sampleRate, numSamples) {
+async function playAudioChunk(b64Data, sampleRate, numSamples, inferMs) {
   if (!audioCtx || isMuted) return;
   if (audioCtx.state === 'suspended') await audioCtx.resume();
 
@@ -302,15 +302,16 @@ async function playAudioChunk(b64Data, sampleRate, numSamples) {
   source.buffer = buffer;
   source.connect(gainNode);
 
-  // Strict end-to-end queue: never overlap chunks (overlap = comb filtering / “repeating” / level drops).
+  // Strict end-to-end queue: never overlap chunks.
   const now = audioCtx.currentTime;
   if (audioQueueEnd < now) {
     audioQueueEnd = now;
   }
-  if (audioQueueEnd - now > 10) {
+  // Tight cap: reset if queue grows beyond 2.5s — prevents permanent latency backlog
+  if (audioQueueEnd - now > 2.5) {
     audioQueueEnd = now;
   }
-  const gap = 0.01;
+  const gap = 0.005;
   let startAt = audioQueueEnd + gap;
   if (startAt < now + 0.02) {
     startAt = now + 0.02;
@@ -318,11 +319,13 @@ async function playAudioChunk(b64Data, sampleRate, numSamples) {
   source.start(startAt);
   audioQueueEnd = startAt + buffer.duration;
 
-  // Update waveform
+  // Update waveform + latency display
   updateWaveform(float32);
   const dur = (numSamples / sampleRate).toFixed(2);
+  const queueAhead = ((audioQueueEnd - now) * 1000).toFixed(0);
   document.getElementById('audioStatus').textContent = 'Playing';
-  document.getElementById('chunkInfo').textContent = `${dur}s @ ${sampleRate}Hz`;
+  document.getElementById('chunkInfo').textContent =
+    `${dur}s @ ${sampleRate}Hz | infer ${inferMs ?? '?'}ms | queue ${queueAhead}ms`;
 }
 
 function toggleMute() {
@@ -481,7 +484,7 @@ async function handleEvent(ev) {
   // Play audio chunks
   if (ev.type === 'audio' && ev.data) {
     if (!takeChunkIdOnce(ev.chunk_id)) return;
-    await playAudioChunk(ev.data, ev.sample_rate, ev.samples);
+    await playAudioChunk(ev.data, ev.sample_rate, ev.samples, ev.infer_ms);
     // Don't clutter log with every audio chunk — show message in chunkInfo instead
     return;
   }
