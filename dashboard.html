@@ -641,10 +641,12 @@ async function loadSettings() {
       <p class="text-xs text-gray-500">MeanFlow uses <code class="text-gray-400">config.yaml</code> (no live PATCH API).</p>
       <ul class="text-xs text-gray-400 mt-2 space-y-1 font-mono">
         <li>sample_rate: ${config.audio?.sample_rate ?? '?'} Hz</li>
-        <li>chunk_seconds: ${mf.chunk_seconds ?? '?'}</li>
-        <li>max_queued_chunks: ${mf.max_queued_chunks ?? '?'}</li>
-        <li>min_inference_interval_seconds: ${mf.min_inference_interval_seconds ?? '?'}</li>
+        <li>hop_seconds: ${mf.hop_seconds ?? '?'} <span class="text-gray-600">(latency target)</span></li>
+        <li>crossfade_seconds: ${mf.crossfade_seconds ?? '?'}</li>
         <li>enroll_seconds: ${mf.enroll_seconds ?? '?'}</li>
+        <li>euler_steps: ${mf.euler_steps ?? '?'}</li>
+        <li>use_fp16: ${mf.use_fp16 ?? false}</li>
+        <li>use_torch_compile: ${mf.use_torch_compile ?? false}</li>
         <li>use_t_predictor: ${mf.use_t_predictor ?? '?'}</li>
       </ul>
     `;

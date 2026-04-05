@@ -2,6 +2,11 @@
 """
 MeanFlow-TSE live mic → WebSocket (for STT or headphones).
 Enrollment: per-speaker reference.wav at 16 kHz mono (first enroll_seconds used at inference).
+
+Streaming architecture (overlap-add):
+  The model always processes full 3s windows (matching training segment).
+  A sliding window advances by hop_seconds (default 1s) each step.
+  Steady-state latency ≈ hop_seconds + GPU inference time.
 """
 from __future__ import annotations
 
@@ -374,38 +379,63 @@ def _run_meanflow_monitor():
         enroll_cfg = config["enrollment"]
         sr = int(audio_cfg["sample_rate"])
         dev_idx = int(audio_cfg["device_index"])
-        chunk_sec = float(mf["chunk_seconds"])
-        max_chunks = int(mf.get("max_queued_chunks", 4))
-        max_chunks = max(2, max_chunks)
+        max_chunks = max(2, int(mf.get("max_queued_chunks", 4)))
         min_infer_gap = float(mf.get("min_inference_interval_seconds", 0.0))
         enroll_sec = float(mf.get("enroll_seconds", 3))
         euler_steps = int(mf.get("euler_steps", 1))
 
-        chunk_samples = int(round(float(chunk_sec) * sr))
-        enroll_samples = int(enroll_sec * sr)
-        cap_samples = max_chunks * chunk_samples
-
+        # ── Sliding-window streaming parameters ──────────────────────
+        # Window size = dataset.segment from base config (always 3s for this model).
         base_cfg = BASE_DIR / mf["base_config"]
         ckpt = BASE_DIR / mf["checkpoint"]
         use_tp = bool(mf.get("use_t_predictor", True))
         tp_ckpt = (BASE_DIR / mf["t_predictor_checkpoint"]) if use_tp else None
 
-        # Training uses dataset.segment (3 s) for mixture tiles; keep chunk_seconds aligned
         try:
-            seg_ds = int(yaml.safe_load(base_cfg.read_text())["dataset"]["segment"])
+            seg_ds = float(yaml.safe_load(base_cfg.read_text())["dataset"]["segment"])
         except Exception:
-            seg_ds = 3
-        if abs(chunk_sec - seg_ds) > 1e-6:
-            monitor.add_event(
-                {
-                    "type": "system",
-                    "time": _now(),
-                    "message": (
-                        f"chunk_seconds={chunk_sec} (mic FIFO); STFT/model pad uses dataset.segment={seg_ds}s "
-                        f"from {base_cfg.name} — shorter chunks are zero-padded in the spectrogram to match training."
-                    ),
-                }
-            )
+            seg_ds = 3.0
+        window_sec = seg_ds
+        window_samples = int(round(window_sec * sr))
+        # e.g. window_sec=3.0, sr=16000 → window_samples=48000
+
+        hop_sec = float(mf.get("hop_seconds", 1.0))
+        # Clamp: hop can't be larger than window (no overlap) or tiny (<50 ms)
+        hop_sec = max(0.05, min(hop_sec, window_sec))
+        hop_samples = int(round(hop_sec * sr))
+        # e.g. hop_sec=1.0 → hop_samples=16000
+
+        crossfade_sec = float(mf.get("crossfade_seconds", 0.01))
+        crossfade_samples = int(round(crossfade_sec * sr))
+        # e.g. crossfade_sec=0.01 → crossfade_samples=160
+        # Clamp: crossfade can't exceed half the hop (would eat into output)
+        crossfade_samples = min(crossfade_samples, hop_samples // 2)
+
+        enroll_samples = int(enroll_sec * sr)
+        # e.g. enroll_sec=3 → enroll_samples=48000
+
+        # Max buffered audio before we start dropping to stay near real-time
+        # First step needs window_samples, subsequent steps need hop_samples each.
+        cap_samples = window_samples + max_chunks * hop_samples
+        # e.g. 48000 + 4*16000 = 112000 = 7s
+
+        use_fp16 = bool(mf.get("use_fp16", False))
+        use_compile = bool(mf.get("use_torch_compile", False))
+
+        is_ola = hop_sec < window_sec  # True = overlap-add mode
+        mode_label = (
+            f"overlap-add (window={window_sec}s, hop={hop_sec}s, "
+            f"overlap={window_sec - hop_sec:.1f}s, crossfade={crossfade_sec*1000:.0f}ms)"
+            if is_ola
+            else f"non-overlapping {window_sec}s chunks"
+        )
+        monitor.add_event(
+            {
+                "type": "system",
+                "time": _now(),
+                "message": f"Streaming mode: {mode_label}",
+            }
+        )
 
         monitor.add_event(
             {"type": "system", "time": _now(), "message": "Loading MeanFlow-TSE..."}
@@ -419,6 +449,7 @@ def _run_meanflow_monitor():
             t_predictor_checkpoint=tp_ckpt if use_tp else None,
         )
 
+        # ── Resolve enrollment reference ─────────────────────────────
         enroll_root = BASE_DIR / enroll_cfg["dir"]
         cfg_spk = enroll_cfg.get("active_speaker") or None
         ref_audio, speaker_name, _ = _resolve_enrollment_reference(
@@ -454,26 +485,54 @@ def _run_meanflow_monitor():
 
         ref_fixed = fix_length(ref_audio, enroll_samples)
 
+        # ── Apply optimizations ──────────────────────────────────────
+        if use_fp16:
+            runner.enable_amp(torch.float16)
+        if use_compile:
+            runner.compile_model()
+
+        # Cache enrollment STFT (same reference every chunk — no reason to recompute)
+        runner.cache_enrollment(ref_fixed)
+
         alpha_mode = (
             f"ECAPA t-predictor ({mf.get('t_predictor_checkpoint', '')})"
             if use_tp
             else "alpha=0.5 (HALF)"
         )
+        opt_flags = []
+        if use_fp16:
+            opt_flags.append("FP16")
+        if use_compile:
+            opt_flags.append("torch.compile")
+        opt_label = ", ".join(opt_flags) if opt_flags else "none"
+
         monitor.add_event(
             {
                 "type": "system",
                 "time": _now(),
                 "message": (
                     f"MeanFlow-TSE on {speaker_name}; {sr} Hz; ref {enroll_sec}s; "
-                    f"FIFO {chunk_sec}s segments (eval-style tiles, no overlap), "
-                    f"max {max_chunks} chunks queued, Euler steps={euler_steps}; {alpha_mode}."
+                    f"hop {hop_sec}s; Euler steps={euler_steps}; {alpha_mode}; "
+                    f"optimizations: {opt_label}."
                 ),
             }
         )
 
+        # ── Warmup (triggers torch.compile JIT if enabled) ───────────
+        if use_compile:
+            monitor.add_event(
+                {"type": "system", "time": _now(), "message": "Running warmup inference (torch.compile JIT)..."}
+            )
+        runner.warmup(enroll_samples, num_steps=euler_steps)
+        monitor.add_event(
+            {"type": "system", "time": _now(), "message": "Warmup done. Starting mic capture..."}
+        )
+
+        # ── Mic capture → audio_buffer ───────────────────────────────
         audio_buffer = np.zeros(0, dtype=np.float32)
         buf_lock = threading.Lock()
         block = max(1024, int(0.05 * sr))
+        # e.g. sr=16000 → block=max(1024, 800)=1024
 
         def mic_cb(indata, frames, tinfo, status):
             nonlocal audio_buffer
@@ -482,13 +541,13 @@ def _run_meanflow_monitor():
             mono = indata[:, 0].astype(np.float32)
             with buf_lock:
                 audio_buffer = np.concatenate([audio_buffer, mono])
-                # Drop oldest *whole* segments if backlog too large (stay near realtime).
+                # Drop oldest audio in hop-sized steps if backlog is too large.
                 dropped = 0
                 while len(audio_buffer) > cap_samples:
-                    audio_buffer = audio_buffer[chunk_samples:].copy()
+                    audio_buffer = audio_buffer[hop_samples:].copy()
                     dropped += 1
                 if dropped:
-                    print(f"[MeanFlow] dropped {dropped} queued chunk(s) (catch-up)", flush=True)
+                    print(f"[MeanFlow] dropped {dropped} hop(s) (catch-up)", flush=True)
 
         stream = sd.InputStream(
             samplerate=sr,
@@ -500,28 +559,86 @@ def _run_meanflow_monitor():
         )
         stream.start()
 
-        # FIFO: consume consecutive non-overlapping 3 s blocks (same time order as eval tiles).
+        # ── Main inference loop: sliding-window overlap-add ──────────
+        #
+        # DIMENSION TRACE (sr=16000, window=3s, hop=1s, crossfade=10ms):
+        #   window_samples = 48000
+        #   hop_samples    = 16000
+        #   crossfade_samples = 160
+        #
+        # Step 0 (initial fill):
+        #   consume window_samples=48000 from audio_buffer
+        #   window[:] = audio[0 : 48000]                   (3.0 s)
+        #   model(window) → output[48000]                   (3.0 s)
+        #   send: output[0 : 48000-160] = 47840 samples    (2.99 s)
+        #   hold: prev_tail = output[47840 : 48000]         (160 samples = 10 ms)
+        #
+        # Step 1+:
+        #   consume hop_samples=16000 from audio_buffer     (1.0 s of new audio)
+        #   window = window[16000:] ++ new_audio            (slide forward 1s)
+        #     = audio[16000 : 64000]                        (still 48000 = 3.0 s)
+        #   model(window) → output[48000]
+        #   extract = output[-(16000+160):] = output[31840 : 48000]  (16160 samples)
+        #     extract[:160]  = model's view of boundary region (overlaps with prev window)
+        #     extract[160:]  = model's view of new hop region
+        #   crossfade: blend = fade_out * prev_tail + fade_in * extract[:160]
+        #   send: blend(160) + extract[160 : 16000] = 16000 samples  (1.0 s)
+        #   hold: prev_tail = extract[16000 : 16160]        (160 samples = 10 ms)
+        #
+        # Latency (steady state) = hop_sec + inference_time ≈ 1.0 + 0.1-0.3 s
+
+        window = None  # Will be filled on step 0
+        prev_tail = None  # Held-back samples for crossfade
         last_infer_end = 0.0
         step = 0
+
+        # Pre-compute crossfade ramps (constant, reused every step)
+        if crossfade_samples > 0:
+            fade_in = np.linspace(0.0, 1.0, crossfade_samples, dtype=np.float32)
+            fade_out = 1.0 - fade_in
+        else:
+            fade_in = fade_out = None
+
         while not monitor.stop_event.is_set():
             time.sleep(0.02)
             now = time.monotonic()
             if min_infer_gap > 0 and (now - last_infer_end) < min_infer_gap:
                 continue
 
-            with buf_lock:
-                if len(audio_buffer) < chunk_samples:
-                    continue
-                # Oldest audio first — same time order as eval tiles on a long mixture.
-                mix = audio_buffer[:chunk_samples].copy()
-                audio_buffer = audio_buffer[chunk_samples:].copy()
+            # ── Determine how many new samples we need ───────────────
+            if step == 0:
+                needed = window_samples  # First step: fill entire 3s window
+            else:
+                needed = hop_samples  # Subsequent: just the 1s hop
 
+            with buf_lock:
+                if len(audio_buffer) < needed:
+                    continue
+                new_audio = audio_buffer[:needed].copy()
+                audio_buffer = audio_buffer[needed:].copy()
+
+            # ── Build / slide the window ─────────────────────────────
+            if step == 0:
+                window = new_audio  # shape: (window_samples,) = (48000,)
+            else:
+                # Slide: drop oldest hop, append new audio
+                # window[hop_samples:] has (window_samples - hop_samples) samples = 32000
+                # new_audio has hop_samples = 16000
+                # total = 48000 ✓
+                window = np.concatenate([window[hop_samples:], new_audio])
+
+            assert len(window) == window_samples, (
+                f"Window size mismatch: {len(window)} != {window_samples}"
+            )
+
+            # ── Run model ────────────────────────────────────────────
             t0 = time.perf_counter()
             try:
-                out = runner.infer_chunk(mix, ref_fixed, num_steps=euler_steps)
+                output = runner.infer_chunk(window, ref_fixed, num_steps=euler_steps)
             except Exception as e:
+                # On failure, put audio back so we don't lose it
                 with buf_lock:
-                    audio_buffer = np.concatenate([mix, audio_buffer])
+                    audio_buffer = np.concatenate([new_audio, audio_buffer])
                 monitor.add_event(
                     {
                         "type": "error",
@@ -536,19 +653,61 @@ def _run_meanflow_monitor():
             last_infer_end = time.monotonic()
             step += 1
 
-            out_play = np.asarray(out, dtype=np.float32).reshape(-1)
-            if out_play.size != chunk_samples:
-                if out_play.size > chunk_samples:
-                    out_play = out_play[:chunk_samples]
+            # ── Extract output with crossfade ────────────────────────
+            # Ensure output is exactly window_samples
+            output = np.asarray(output, dtype=np.float32).reshape(-1)
+            if output.size != window_samples:
+                if output.size > window_samples:
+                    output = output[:window_samples]
                 else:
-                    tmp = np.zeros(chunk_samples, dtype=np.float32)
-                    tmp[: out_play.size] = out_play
-                    out_play = tmp
+                    tmp = np.zeros(window_samples, dtype=np.float32)
+                    tmp[: output.size] = output
+                    output = tmp
 
+            if step == 1:
+                # ── FIRST OUTPUT: send most of the full window ───────
+                if crossfade_samples > 0:
+                    # Hold back last crossfade_samples for blending with next chunk
+                    out_play = output[: window_samples - crossfade_samples]
+                    prev_tail = output[window_samples - crossfade_samples :].copy()
+                    # out_play.size = 48000 - 160 = 47840
+                    # prev_tail.size = 160
+                else:
+                    out_play = output
+            else:
+                # ── SUBSEQUENT: extract last (hop + crossfade) from output
+                if crossfade_samples > 0:
+                    extract_len = hop_samples + crossfade_samples
+                    # e.g. 16000 + 160 = 16160
+                    extract = output[-extract_len:]
+                    # extract[:160]  → boundary region (same time as prev_tail)
+                    # extract[160:]  → new hop region (16000 samples)
+
+                    if prev_tail is not None:
+                        # Crossfade: blend prev_tail with start of extract
+                        blend = fade_out * prev_tail + fade_in * extract[:crossfade_samples]
+                        # blend.size = 160
+                    else:
+                        blend = extract[:crossfade_samples]
+
+                    # Output = blend + middle portion (exclude new tail)
+                    # middle = extract[crossfade_samples : -crossfade_samples]
+                    #        = extract[160 : 16000]     (size = 15840)
+                    # total  = 160 + 15840 = 16000 = hop_samples ✓
+                    middle = extract[crossfade_samples : extract_len - crossfade_samples]
+                    out_play = np.concatenate([blend, middle])
+
+                    # Hold back new tail for next crossfade
+                    prev_tail = extract[-crossfade_samples:].copy()
+                    # prev_tail.size = 160
+                else:
+                    out_play = output[-hop_samples:]
+
+            # ── Validate + encode ────────────────────────────────────
             peak = float(np.max(np.abs(out_play))) if out_play.size else 0.0
             if peak < 1e-5:
                 print(
-                    f"[MeanFlow] segment {step}: output peak={peak:.2e} (inaudible? check mic / enrollment / GPU)",
+                    f"[MeanFlow] step {step}: output peak={peak:.2e} (inaudible? check mic / enrollment / GPU)",
                     flush=True,
                 )
             if peak > 1.0:
@@ -556,6 +715,7 @@ def _run_meanflow_monitor():
             pcm = (np.clip(out_play, -1.0, 1.0) * 32767).astype(np.int16)
             b64 = base64.b64encode(pcm.tobytes()).decode("ascii")
 
+            # ── Send to WebSocket ────────────────────────────────────
             monitor.send_audio(
                 {
                     "type": "audio",
@@ -568,19 +728,30 @@ def _run_meanflow_monitor():
                     "infer_ms": round(dt_ms, 0),
                 }
             )
-            monitor.add_event(
-                {
-                    "type": "system",
-                    "time": _now(),
-                    "message": f"Segment {step}: {dt_ms:.0f} ms (FIFO {chunk_sec}s)",
-                }
-            )
+            dur_label = f"{len(pcm)/sr:.2f}s"
+            if step == 1:
+                monitor.add_event(
+                    {
+                        "type": "system",
+                        "time": _now(),
+                        "message": f"Step {step} (initial): {dt_ms:.0f} ms → {dur_label} output",
+                    }
+                )
+            else:
+                monitor.add_event(
+                    {
+                        "type": "system",
+                        "time": _now(),
+                        "message": f"Step {step}: {dt_ms:.0f} ms → {dur_label} output (hop={hop_sec}s)",
+                    }
+                )
 
-            if runner.device.type == "cuda" and step % 4 == 0:
+            if runner.device.type == "cuda" and step % 8 == 0:
                 torch.cuda.empty_cache()
 
         stream.stop()
         stream.close()
+        runner.clear_enrollment_cache()
     except FileNotFoundError as e:
         monitor.add_event({"type": "error", "time": _now(), "message": str(e)})
     except Exception as e:

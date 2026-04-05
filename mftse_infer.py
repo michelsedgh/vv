@@ -6,6 +6,7 @@ Matches eval_steps.py ECAPAMLP path: alpha = t_predicter(mix_wav, enroll_wav) th
 from __future__ import annotations
 
 import sys
+import time
 from pathlib import Path
 from typing import Any, Optional
 
@@ -110,6 +111,12 @@ class MeanFlowTSERunner:
         self.pl_module.eval()
         self.pl_module.to(self.device)
 
+        # Disable gradient checkpointing — only useful during training,
+        # adds overhead at inference and breaks torch.compile.
+        for module in self.pl_module.modules():
+            if hasattr(module, "use_checkpoint"):
+                module.use_checkpoint = False
+
         self.t_predictor: Optional[Any] = None
         if use_t_predictor:
             t_ckpt = Path(t_predictor_checkpoint) if t_predictor_checkpoint else None
@@ -140,6 +147,80 @@ class MeanFlowTSERunner:
         seg_samples = int(round(seg_sec * self.sample_rate))
         self._multiple = seg_samples // self.hop_length + 1
 
+        # ── Optimization state ─────────────────────────────────────
+        self._use_amp = False
+        self._amp_dtype = torch.float16
+        self._compiled = False
+
+        # ── Enrollment cache (STFT + wav tensor, reused every chunk) ──
+        self._cached_enroll_spec: Optional[torch.Tensor] = None
+        self._cached_enroll_wav_t: Optional[torch.Tensor] = None
+
+    # ── Optimization methods ──────────────────────────────────────
+
+    def enable_amp(self, dtype: torch.dtype = torch.float16):
+        """Enable torch.autocast for mixed-precision inference (FP16/BF16).
+        STFT/ISTFT stay float32; only the UDiT + t-predictor run in lower precision."""
+        if self.device.type != "cuda":
+            print("[MeanFlow-TSE] AMP skipped (CPU device).", flush=True)
+            return
+        self._use_amp = True
+        self._amp_dtype = dtype
+        print(f"[MeanFlow-TSE] AMP enabled ({dtype}).", flush=True)
+
+    def compile_model(self):
+        """Apply torch.compile with CUDA-graph mode for faster inference.
+        Requires PyTorch >= 2.0 and fixed input shapes (always 3s tiles → OK)."""
+        if self.device.type != "cuda":
+            print("[MeanFlow-TSE] torch.compile skipped (CPU device).", flush=True)
+            return
+        try:
+            self.pl_module.model = torch.compile(
+                self.pl_module.model, mode="reduce-overhead"
+            )
+            self._compiled = True
+            print("[MeanFlow-TSE] torch.compile applied (reduce-overhead).", flush=True)
+        except Exception as e:
+            print(f"[MeanFlow-TSE] torch.compile failed, continuing without: {e}", flush=True)
+
+    def warmup(self, enroll_samples: int, num_steps: int = 1):
+        """Run one dummy inference to trigger torch.compile JIT and CUDA warm-up.
+        Call AFTER cache_enrollment() and enable_amp()/compile_model()."""
+        seg_samples = int(round(float(self.ds.get("segment", 3)) * self.sample_rate))
+        dummy_mix = np.zeros(seg_samples, dtype=np.float32)
+        dummy_enr = np.zeros(enroll_samples, dtype=np.float32)
+        print("[MeanFlow-TSE] Warmup inference (may be slow if compiled)...", flush=True)
+        t0 = time.perf_counter()
+        self.infer_chunk(dummy_mix, dummy_enr, num_steps=num_steps)
+        dt = (time.perf_counter() - t0) * 1000
+        print(f"[MeanFlow-TSE] Warmup done in {dt:.0f} ms.", flush=True)
+
+    # ── Enrollment caching ────────────────────────────────────────
+
+    def cache_enrollment(self, enroll_wav: np.ndarray):
+        """Pre-compute enrollment STFT and wav tensor.  Called once at monitor start;
+        reused for every subsequent infer_chunk call (saves ~5-10% per chunk)."""
+        enr = to_mono_float32(enroll_wav)
+        enr_t = torch.from_numpy(enr).float().unsqueeze(0).to(self.device)
+        enroll_spec = stft_torch(
+            enr_t,
+            n_fft=self.n_fft,
+            hop_length=self.hop_length,
+            win_length=self.win_length,
+        )
+        self._cached_enroll_wav_t = enr_t
+        self._cached_enroll_spec = enroll_spec
+        print(
+            f"[MeanFlow-TSE] Enrollment cached: wav {enr_t.shape}, spec {enroll_spec.shape}.",
+            flush=True,
+        )
+
+    def clear_enrollment_cache(self):
+        self._cached_enroll_spec = None
+        self._cached_enroll_wav_t = None
+
+    # ── Core inference ────────────────────────────────────────────
+
     @torch.inference_mode()
     def infer_chunk(
         self,
@@ -154,30 +235,42 @@ class MeanFlowTSERunner:
         Returns 1D float32 waveform same length as mixture (after ISTFT trim).
         """
         mix = to_mono_float32(mixture_wav)
-        enr = to_mono_float32(enroll_wav)
         T = len(mix)
         mix_t = torch.from_numpy(mix).float().unsqueeze(0).to(self.device)
-        enr_t = torch.from_numpy(enr).float().unsqueeze(0).to(self.device)
 
-        # eval_steps ECAPAMLP: alpha from raw waveforms (batch, time), before pad_and_reshape
+        # ── Use cached enrollment or compute fresh ──
+        if self._cached_enroll_spec is not None:
+            enroll_spec = self._cached_enroll_spec
+            enr_t = self._cached_enroll_wav_t
+        else:
+            enr = to_mono_float32(enroll_wav)
+            enr_t = torch.from_numpy(enr).float().unsqueeze(0).to(self.device)
+            enroll_spec = stft_torch(
+                enr_t,
+                n_fft=self.n_fft,
+                hop_length=self.hop_length,
+                win_length=self.win_length,
+            )
+
+        # ── t-predictor: alpha from raw waveforms ──
         if self.t_predictor is not None:
-            alpha = self.t_predictor(mix_t, enr_t, aug=False)
+            with torch.autocast(
+                device_type=self.device.type,
+                dtype=self._amp_dtype,
+                enabled=self._use_amp,
+            ):
+                alpha = self.t_predictor(mix_t, enr_t, aug=False)
+            alpha = alpha.float()
             if alpha.ndim == 0:
                 alpha = alpha.unsqueeze(0)
-            alpha = alpha.float().reshape(-1).to(self.device)
-            # dt = 1 - alpha in first Euler step; alpha→1 would skip the flow (silent / stuck at mixture scale edge cases)
+            alpha = alpha.reshape(-1).to(self.device)
             alpha = alpha.clamp(1e-3, 1.0 - 1e-3)
         else:
             alpha = torch.tensor([0.5], device=self.device, dtype=torch.float32)
 
+        # ── STFT (always float32 for numerical stability) ──
         mixture_spec = stft_torch(
             mix_t,
-            n_fft=self.n_fft,
-            hop_length=self.hop_length,
-            win_length=self.win_length,
-        )
-        enroll_spec = stft_torch(
-            enr_t,
             n_fft=self.n_fft,
             hop_length=self.hop_length,
             win_length=self.win_length,
@@ -187,13 +280,22 @@ class MeanFlowTSERunner:
         batch_size = mixture_spec.shape[0]
         enroll_rep = enroll_spec.repeat(batch_size, 1, 1)
 
-        source_hat_spec = sample_euler_multistep(
-            model=self.pl_module.model,
-            mixture_spec=mixture_spec.float(),
-            enrollment_spec=enroll_rep,
-            alpha=alpha,
-            num_steps=num_steps,
-        )
+        # ── UDiT forward (optionally in FP16 via autocast) ──
+        with torch.autocast(
+            device_type=self.device.type,
+            dtype=self._amp_dtype,
+            enabled=self._use_amp,
+        ):
+            source_hat_spec = sample_euler_multistep(
+                model=self.pl_module.model,
+                mixture_spec=mixture_spec.float(),
+                enrollment_spec=enroll_rep,
+                alpha=alpha,
+                num_steps=num_steps,
+            )
+
+        # ── Back to float32 for ISTFT ──
+        source_hat_spec = source_hat_spec.float()
         source_hat_spec = reshape_and_remove_padding(source_hat_spec, original_length)
         source_hat = istft_torch(
             source_hat_spec,
