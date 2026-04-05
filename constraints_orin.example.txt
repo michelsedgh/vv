@@ -1,7 +1,0 @@
-# Copy to constraints_orin.txt and set versions to YOUR Jetson wheels.
-# Generate automatically: ./scripts/mk_constraints_orin.sh
-#
-# Example for many JP6 / torch 2.3 installs (adjust if pip complains):
-torch==2.3.0
-torchvision==0.18.0
-torchaudio==2.3.0

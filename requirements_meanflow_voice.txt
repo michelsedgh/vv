@@ -1,6 +1,0 @@
-# Deprecated filename — use Orin flow with constraints (keeps torch 2.3.x):
-#
-#   ./scripts/mk_constraints_orin.sh
-#   pip install -r requirements_orin_meanflow.txt -c constraints_orin.txt
-#
-# See README.md (MeanFlow quick start).
