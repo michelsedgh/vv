@@ -323,8 +323,10 @@ function updateSpeakerLane(sp, sampleRate, numSamples) {
     // Draw waveform
     drawWaveform(lane);
 
-    // Play audio
-    if (audioCtx && lane.gainNode && !lane.muted && isActive) {
+    // Play every emitted chunk for this mapped speaker. The backend already
+    // decides which speaker streams exist; hard muting on a per-step activity
+    // threshold was chopping off low-confidence onsets and offsets.
+    if (audioCtx && lane.gainNode && !lane.muted) {
       playAudio(f32, sampleRate, lane);
     }
   }

@@ -492,11 +492,10 @@ class RealtimePipeline:
                 # Save this step's tail for next crossfade
                 self._prev_tails[global_idx] = raw[-fade:].copy()
 
-                # Output is the first step_samples of the crossfaded region
-                audio = raw[:self.step_samples]
-                peak = np.max(np.abs(audio))
-                if peak > 1e-6:
-                    audio = audio / peak * 0.707
+                # Preserve the separator's natural level from step to step.
+                # Per-step peak normalization made quiet chunks jump in level and
+                # created audible pumping at chunk boundaries.
+                audio = np.clip(raw[:self.step_samples], -1.0, 1.0)
 
                 results.append(SpeakerResult(
                     global_idx=global_idx,

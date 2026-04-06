@@ -145,6 +145,28 @@ def ws_event(event_type: str, **kwargs):
     ws_broadcast({"type": event_type, **kwargs})
 
 
+def _build_live_chunk(audio_buffer: np.ndarray, chunk_samples: int) -> np.ndarray:
+    """Build a chunk-sized window ending at the newest captured samples."""
+    if len(audio_buffer) >= chunk_samples:
+        return audio_buffer[-chunk_samples:].copy()
+    chunk = np.zeros(chunk_samples, dtype=np.float32)
+    if len(audio_buffer) > 0:
+        chunk[-len(audio_buffer):] = audio_buffer
+    return chunk
+
+
+def _trim_live_buffer(
+    audio_buffer: np.ndarray,
+    chunk_samples: int,
+    step_samples: int,
+) -> np.ndarray:
+    """Keep only the overlap context needed for the next step."""
+    keep = max(0, chunk_samples - step_samples)
+    if len(audio_buffer) <= keep:
+        return audio_buffer
+    return audio_buffer[-keep:].copy()
+
+
 # ─── Diarization monitor ─────────────────────────────────────────
 
 def _run_diarization_monitor():
@@ -211,9 +233,36 @@ def _run_diarization_monitor():
     ws_event("status", message="Live — listening...")
     log.info("Diarization monitor started (duration=%.1fs, step=%.1fs)", duration, step)
 
+    def broadcast_step_result(result):
+        monitor.step_count = result.step_idx
+        monitor.last_infer_ms = result.infer_ms
+
+        speakers_data = []
+        for sp in result.speakers:
+            audio_i16 = np.clip(sp.audio * 32767, -32768, 32767).astype(np.int16)
+            audio_b64 = base64.b64encode(audio_i16.tobytes()).decode("ascii")
+            speakers_data.append({
+                "id": int(sp.global_idx),
+                "label": str(sp.label),
+                "active": bool(sp.activity > cfg["clustering"]["tau_active"]),
+                "activity": round(float(sp.activity), 3),
+                "enrolled": bool(sp.is_enrolled),
+                "audio": audio_b64,
+            })
+
+        ws_broadcast({
+            "type": "diarization",
+            "speakers": speakers_data,
+            "step": result.step_idx,
+            "infer_ms": round(result.infer_ms, 1),
+            "sample_rate": sample_rate,
+            "samples": pipeline.step_samples,
+        })
+
     try:
         while not monitor.stop_event.is_set():
-            # Drain mic queue: denoise each 500ms block and append to buffer
+            # Process one inference step per captured mic block so live playback
+            # starts immediately instead of waiting for a full 5 s buffer.
             drained = False
             while not mic_queue.empty():
                 try:
@@ -221,60 +270,18 @@ def _run_diarization_monitor():
                     block = pipeline.denoise_block(block)  # ~8ms for 500ms
                     with buf_lock:
                         audio_buffer = np.concatenate([audio_buffer, block])
+                        chunk = _build_live_chunk(audio_buffer, chunk_samples)
+                        audio_buffer = _trim_live_buffer(
+                            audio_buffer, chunk_samples, step_samples
+                        )
+                    result = pipeline.step(chunk)
+                    broadcast_step_result(result)
                     drained = True
                 except queue.Empty:
                     break
 
-            # Wait until we have enough audio for a full chunk
-            with buf_lock:
-                buf_len = len(audio_buffer)
-
-            if buf_len < chunk_samples:
-                if not drained:
-                    time.sleep(0.05)
-                continue
-
-            # Extract the latest chunk_samples (already denoised)
-            with buf_lock:
-                chunk = audio_buffer[-chunk_samples:].copy()
-                keep = chunk_samples - step_samples
-                if len(audio_buffer) > chunk_samples:
-                    audio_buffer = audio_buffer[-keep:]
-
-            # Run pipeline step
-            result = pipeline.step(chunk)
-            monitor.step_count = result.step_idx
-            monitor.last_infer_ms = result.infer_ms
-
-            # Build per-speaker data for WebSocket
-            speakers_data = []
-            for sp in result.speakers:
-                # Convert float32 audio to int16 PCM bytes, then base64
-                audio_i16 = np.clip(sp.audio * 32767, -32768, 32767).astype(np.int16)
-                audio_b64 = base64.b64encode(audio_i16.tobytes()).decode("ascii")
-                speakers_data.append({
-                    "id": int(sp.global_idx),
-                    "label": str(sp.label),
-                    "active": bool(sp.activity > cfg["clustering"]["tau_active"]),
-                    "activity": round(float(sp.activity), 3),
-                    "enrolled": bool(sp.is_enrolled),
-                    "audio": audio_b64,
-                })
-
-            ws_broadcast({
-                "type": "diarization",
-                "speakers": speakers_data,
-                "step": result.step_idx,
-                "infer_ms": round(result.infer_ms, 1),
-                "sample_rate": sample_rate,
-                "samples": pipeline.step_samples,
-            })
-
-            # Sleep to align with step timing
-            elapsed = result.infer_ms / 1000.0
-            sleep_time = max(0, step - elapsed)
-            if sleep_time > 0:
-                time.sleep(sleep_time)
+            if not drained:
+                time.sleep(0.05)
 
     except Exception as e:
         log.error("Monitor error: %s", e, exc_info=True)
