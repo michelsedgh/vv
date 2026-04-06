@@ -293,7 +293,11 @@ class EnrolledSpeakerClustering(OnlineSpeakerClustering):
 
         # Periodic debug logging
         self._call_count += 1
-        if self.centers is not None and self._call_count % 10 == 1:
+        if (
+            log.isEnabledFor(logging.DEBUG)
+            and self.centers is not None
+            and self._call_count % 10 == 1
+        ):
             self._log_distances(segmentation, embeddings, speaker_map)
 
         return SlidingWindowFeature(
@@ -325,7 +329,7 @@ class EnrolledSpeakerClustering(OnlineSpeakerClustering):
         assign_str = ", ".join(
             f"L{l}→{self.get_label(g)}" for l, g in zip(l_assigned, g_assigned)
         )
-        log.info(
+        log.debug(
             "ENROLLED-DIST (active=%s, map=[%s]):\n  %s\n  %s",
             valid_local.tolist(),
             assign_str,

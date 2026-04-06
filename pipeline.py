@@ -400,10 +400,10 @@ class RealtimePipeline:
         active_mask = np.max(seg_np, axis=0) >= self.clustering.tau_active
         active_indices = []
 
-        # Compute source peaks for ghost suppression
-        src_peak_vals = []
-        for spk_idx in range(self.n_local_speakers):
-            src_peak_vals.append(float(sources[0, :, spk_idx].abs().max().cpu()))
+        # Compute all source peaks in one GPU reduction + one CPU transfer.
+        src_peak_vals = (
+            sources[0].abs().amax(dim=0).detach().cpu().numpy().astype(np.float32).tolist()
+        )
         max_src_peak = max(src_peak_vals) if src_peak_vals else 0.0
         ghost_floor = max_src_peak * self._ghost_ratio
 
@@ -428,7 +428,7 @@ class RealtimePipeline:
             batch_tensors.append((src / src.abs().max()).unsqueeze(0).unsqueeze(0))  # (1, 1, 80000)
             active_indices.append(spk_idx)
 
-        if suppressed and self._step_idx % 10 == 0:
+        if suppressed and log.isEnabledFor(logging.DEBUG) and self._step_idx % 10 == 0:
             log.debug("Ghost suppressed: %s", "; ".join(f"src-{s}: {r}" for s, r in suppressed))
 
         embeddings = torch.full((self.n_local_speakers, self._emb_dim), float('nan'))
@@ -442,7 +442,7 @@ class RealtimePipeline:
                 embeddings[spk_idx] = embs_cpu[i]
 
         # ── DEBUG: log chunk stats + embedding distances to anchors ──
-        if self._step_idx % 5 == 0 and self.clustering._anchors:
+        if log.isEnabledFor(logging.DEBUG) and self._step_idx % 5 == 0 and self.clustering._anchors:
             from scipy.spatial.distance import cdist as _cdist
             chunk_peak = float(np.max(np.abs(waveform)))
             emb_np = embeddings.numpy()
@@ -457,7 +457,7 @@ class RealtimePipeline:
                     dists = _cdist(e, anchor_mat, metric="cosine")[0]
                     lines.append(f"  src-{si} act={float(np.max(seg_np[:, si])):.3f} → " +
                                  ", ".join(f"{n}={d:.4f}" for n, d in zip(anchor_names, dists)))
-            log.info("\n".join(lines))
+            log.debug("\n".join(lines))
 
         # ── 3. Clustering ──
         permuted_seg = self.clustering(segmentation, embeddings)
@@ -468,20 +468,28 @@ class RealtimePipeline:
         step_frames = max(1, int(n_seg_frames * self.step_duration / self.duration))
         step_seg = permuted_seg.data[-step_frames:]
 
-        # Move sources to CPU once for all speakers
-        sources_np = sources[0].cpu().numpy()            # (80000, 3)
-
         results = []
         if speaker_map is not None:
             local_ids, global_ids = speaker_map.valid_assignments()
-            for local_idx, global_idx in zip(local_ids, global_ids):
+            local_ids = [int(idx) for idx in local_ids]
+            global_ids = [int(idx) for idx in global_ids]
+            fade = self._fade_samples
+            extract_len = self.step_samples + fade
+            tail_sources = None
+            if local_ids:
+                tail_sources = (
+                    sources[0, -extract_len:, local_ids]
+                    .detach()
+                    .cpu()
+                    .numpy()
+                )
+
+            for out_idx, (local_idx, global_idx) in enumerate(zip(local_ids, global_ids)):
                 label = self.clustering.get_label(global_idx)
                 activity = float(np.mean(step_seg[:, global_idx]))
 
                 # Extract step + fade region for overlap-add crossfade
-                fade = self._fade_samples
-                extract_len = self.step_samples + fade
-                raw = sources_np[-extract_len:, local_idx].copy()
+                raw = tail_sources[:, out_idx].copy()
 
                 # Crossfade with previous step's tail
                 prev_tail = self._prev_tails.get(global_idx)

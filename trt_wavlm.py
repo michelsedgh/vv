@@ -106,12 +106,12 @@ class TRTEncoderRunner:
         # Execute on our stream
         with torch.cuda.stream(self.stream):
             self.context.execute_async_v3(self.stream.cuda_stream)
-        self.stream.synchronize()
+        torch.cuda.current_stream(device=self.device).wait_stream(self.stream)
 
         # Return output (cast back to input dtype if needed)
         out_buf = self._buffers[out_name]
         if out_buf.dtype != hidden_states.dtype:
-            return out_buf.to(hidden_states.dtype).clone()
+            return out_buf.to(hidden_states.dtype)
         return out_buf.clone()
 
 

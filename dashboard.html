@@ -137,6 +137,8 @@ const COLORS = [
   '#ef4444', '#3b82f6', '#22c55e', '#f59e0b', '#8b5cf6',
   '#ec4899', '#14b8a6', '#f97316'
 ];
+const AUDIO_LOOKAHEAD_SEC = 0.12;
+const AUDIO_MAX_BUFFER_SEC = 0.75;
 
 // ─── Diarization Timeline State ──────────────────────────────────
 const timeline = {
@@ -283,6 +285,16 @@ function createSpeakerLane(sp) {
   return speakerLanes[id];
 }
 
+function decodePcm16Base64(b64) {
+  const raw = atob(b64);
+  const bytes = new Uint8Array(raw.length);
+  for (let i = 0; i < raw.length; i++) bytes[i] = raw.charCodeAt(i);
+  const i16 = new Int16Array(bytes.buffer);
+  const f32 = new Float32Array(i16.length);
+  for (let i = 0; i < i16.length; i++) f32[i] = i16[i] / 32768;
+  return f32;
+}
+
 function updateSpeakerLane(sp, sampleRate, numSamples) {
   let lane = speakerLanes[sp.id];
   if (!lane) {
@@ -306,10 +318,7 @@ function updateSpeakerLane(sp, sampleRate, numSamples) {
 
   // Decode audio
   if (sp.audio && sp.audio.length > 0) {
-    const raw = atob(sp.audio);
-    const i16 = new Int16Array(new Uint8Array([...raw].map(c => c.charCodeAt(0))).buffer);
-    const f32 = new Float32Array(i16.length);
-    for (let i = 0; i < i16.length; i++) f32[i] = i16[i] / 32768;
+    const f32 = decodePcm16Base64(sp.audio);
 
     // Append to waveform buffer (keep last ~3s)
     const maxSamples = sampleRate * 3;
@@ -373,12 +382,16 @@ function playAudio(f32, sampleRate, lane) {
   src.buffer = buf;
   src.connect(lane.gainNode);
 
-  // Schedule gaplessly: each chunk starts exactly when the previous ends
+  // Keep a modest playback buffer so websocket/JS jitter does not create
+  // audible underruns, but also drop stale backlog if scheduling drifts.
   const now = audioCtx.currentTime;
   const duration = f32.length / sampleRate;
-  if (lane.nextPlayTime < now) {
-    // Fallen behind or first chunk — start with small lookahead
-    lane.nextPlayTime = now + 0.02;
+  const targetStart = now + AUDIO_LOOKAHEAD_SEC;
+  if (
+    lane.nextPlayTime < targetStart ||
+    lane.nextPlayTime > now + AUDIO_MAX_BUFFER_SEC
+  ) {
+    lane.nextPlayTime = targetStart;
   }
   src.start(lane.nextPlayTime);
   lane.nextPlayTime += duration;
