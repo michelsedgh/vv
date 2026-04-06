@@ -277,6 +277,7 @@ function createSpeakerLane(sp) {
     color: color,
     waveformBuf: new Float32Array(0),
     muted: false,
+    nextPlayTime: 0,  // scheduled AudioContext time for gapless playback
   };
 
   return speakerLanes[id];
@@ -324,7 +325,7 @@ function updateSpeakerLane(sp, sampleRate, numSamples) {
 
     // Play audio
     if (audioCtx && lane.gainNode && !lane.muted && isActive) {
-      playAudio(f32, sampleRate, lane.gainNode);
+      playAudio(f32, sampleRate, lane);
     }
   }
 }
@@ -362,14 +363,23 @@ function drawWaveform(lane) {
   ctx.stroke();
 }
 
-function playAudio(f32, sampleRate, gainNode) {
-  if (!audioCtx) return;
+function playAudio(f32, sampleRate, lane) {
+  if (!audioCtx || !lane.gainNode) return;
   const buf = audioCtx.createBuffer(1, f32.length, sampleRate);
   buf.getChannelData(0).set(f32);
   const src = audioCtx.createBufferSource();
   src.buffer = buf;
-  src.connect(gainNode);
-  src.start();
+  src.connect(lane.gainNode);
+
+  // Schedule gaplessly: each chunk starts exactly when the previous ends
+  const now = audioCtx.currentTime;
+  const duration = f32.length / sampleRate;
+  if (lane.nextPlayTime < now) {
+    // Fallen behind or first chunk — start with small lookahead
+    lane.nextPlayTime = now + 0.02;
+  }
+  src.start(lane.nextPlayTime);
+  lane.nextPlayTime += duration;
 }
 
 function setVolume(id, val) {

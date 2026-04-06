@@ -105,6 +105,15 @@ class RealtimePipeline:
         seg_model.eval()
         self._pixit_wrapper = seg_model.model        # PixITWrapper nn.Module (now loaded)
 
+        # ── Optimise: permanent fp16 (286ms → 250ms) ──
+        self._pixit_wrapper.half()
+        log.info("Converted PixIT to permanent fp16.")
+
+        # ── Optimise: TRT encoder (80ms → 29ms for WavLM encoder) ──
+        from trt_wavlm import patch_wavlm_with_trt
+        wavlm = self._pixit_wrapper.totatonet.wavlm
+        self._trt_active = patch_wavlm_with_trt(wavlm, self.device)
+
         # ── Embedding (WeSpeaker, direct from separated sources) ──
         log.info("Loading WeSpeaker embedding model...")
         self._emb_model = PyanModel.from_pretrained(emb_cfg["model"]).to(self.device)
@@ -159,15 +168,22 @@ class RealtimePipeline:
         # ── State ──
         self._step_idx = 0
 
+        # Crossfade between consecutive steps to avoid boundary discontinuities.
+        # We extract (step_samples + fade_samples) from PixIT output, then
+        # crossfade the leading fade_samples with the previous step's tail.
+        self._fade_samples = int(0.010 * self.sample_rate)  # 10ms = 160 samples
+        self._prev_tails: Dict[int, np.ndarray] = {}  # global_idx → tail samples
+
         # Warmup both models + detect embedding dim
         log.info("Warming up PixIT + WeSpeaker...")
-        dummy = torch.randn(1, 1, self.chunk_samples, device=self.device)
+        dummy_fp16 = torch.randn(1, 1, self.chunk_samples, device=self.device, dtype=torch.float16)
+        dummy_fp32 = dummy_fp16.float()
         with torch.inference_mode():
-            self._pixit_wrapper(dummy)
-            d = self._emb_model(dummy)            # also warms up WeSpeaker
+            self._pixit_wrapper(dummy_fp16)       # PixIT is fp16
+            d = self._emb_model(dummy_fp32)       # WeSpeaker stays fp32
             self._emb_dim = d.shape[-1]
             # Batch-warmup (3 sources at once)
-            self._emb_model(dummy.expand(self.n_local_speakers, -1, -1))
+            self._emb_model(dummy_fp32.expand(self.n_local_speakers, -1, -1))
         torch.cuda.synchronize(self.device)
         log.info("Pipeline ready (emb_dim=%d).", self._emb_dim)
 
@@ -274,10 +290,10 @@ class RealtimePipeline:
                 audio = np.pad(audio, (0, self.chunk_samples - len(audio)))
             audio = audio[:self.chunk_samples]
 
-            # Run through PixIT separation (same as live path)
-            wav_gpu = torch.from_numpy(audio).float().to(self.device)
+            # Run through PixIT separation (same as live path — fp16)
+            wav_gpu = torch.from_numpy(audio).to(device=self.device, dtype=torch.float16)
             wav_gpu = wav_gpu.unsqueeze(0).unsqueeze(0)  # (1, 1, samples)
-            with torch.inference_mode(), torch.cuda.amp.autocast():
+            with torch.inference_mode():
                 seg_t = self._pixit_wrapper(wav_gpu)
             seg_np = seg_t[0].float().cpu().numpy()             # (frames, 3)
             sources = self._pixit_wrapper.last_sources.float()  # (1, samples, 3)
@@ -362,10 +378,12 @@ class RealtimePipeline:
         )
 
         # ── 1. PixIT: direct GPU call (bypass SpeakerSegmentation formatter) ──
-        wav_gpu = torch.from_numpy(waveform).float().to(self.device)
+        wav_gpu = torch.from_numpy(waveform).to(
+            device=self.device, dtype=torch.float16     # permanent fp16 model
+        )
         wav_gpu = wav_gpu.unsqueeze(0).unsqueeze(0)    # (1, 1, 80000)
 
-        with torch.inference_mode(), torch.cuda.amp.autocast():
+        with torch.inference_mode():
             diarization_t = self._pixit_wrapper(wav_gpu)  # (1, 624, 3)  fp16
 
         seg_np = diarization_t[0].float().cpu().numpy()   # (624, 3) ensure fp32
@@ -460,7 +478,22 @@ class RealtimePipeline:
                 label = self.clustering.get_label(global_idx)
                 activity = float(np.mean(step_seg[:, global_idx]))
 
-                audio = sources_np[-self.step_samples:, local_idx].copy()
+                # Extract step + fade region for overlap-add crossfade
+                fade = self._fade_samples
+                extract_len = self.step_samples + fade
+                raw = sources_np[-extract_len:, local_idx].copy()
+
+                # Crossfade with previous step's tail
+                prev_tail = self._prev_tails.get(global_idx)
+                if prev_tail is not None and len(prev_tail) == fade:
+                    ramp = np.linspace(0.0, 1.0, fade, dtype=np.float32)
+                    raw[:fade] = prev_tail * (1.0 - ramp) + raw[:fade] * ramp
+
+                # Save this step's tail for next crossfade
+                self._prev_tails[global_idx] = raw[-fade:].copy()
+
+                # Output is the first step_samples of the crossfaded region
+                audio = raw[:self.step_samples]
                 peak = np.max(np.abs(audio))
                 if peak > 1e-6:
                     audio = audio / peak * 0.707
