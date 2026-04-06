@@ -30,6 +30,10 @@ clustering:
   max_speakers: 8          # max global speakers tracked across session
   max_drift: 0.0           # unused (enrolled centroids are frozen)
 
+source_filter:
+  min_peak: 0.05           # absolute minimum source peak to consider (kills near-silent ghosts)
+  ghost_ratio: 0.15        # source must have at least 15% of max source peak (kills leakage ghosts)
+
 denoiser:
   enabled: false             # DISABLED — DF streaming state corrupts embeddings (0.90+ vs 0.40 without)
   model: DeepFilterNet3      # model variant (DeepFilterNet, DeepFilterNet2, DeepFilterNet3)

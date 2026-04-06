@@ -87,6 +87,11 @@ class RealtimePipeline:
         self.step_samples = int(self.step_duration * self.sample_rate)  # 8000
         self.n_local_speakers: int = pixit_cfg["max_speakers"]       # 3
 
+        # Source filtering (ghost suppression)
+        sf_cfg = config.get("source_filter", {})
+        self._min_peak: float = sf_cfg.get("min_peak", 0.05)
+        self._ghost_ratio: float = sf_cfg.get("ghost_ratio", 0.15)
+
         emb_cfg = config["embedding"]
         clust_cfg = config["clustering"]
 
@@ -377,17 +382,36 @@ class RealtimePipeline:
         active_mask = np.max(seg_np, axis=0) >= self.clustering.tau_active
         active_indices = []
 
+        # Compute source peaks for ghost suppression
+        src_peak_vals = []
+        for spk_idx in range(self.n_local_speakers):
+            src_peak_vals.append(float(sources[0, :, spk_idx].abs().max().cpu()))
+        max_src_peak = max(src_peak_vals) if src_peak_vals else 0.0
+        ghost_floor = max_src_peak * self._ghost_ratio
+
         # Collect and normalise active sources on GPU
         batch_tensors = []
+        suppressed = []
         for spk_idx in range(self.n_local_speakers):
             if not active_mask[spk_idx]:
                 continue
-            src = sources[0, :, spk_idx]                 # (80000,) GPU
-            peak = src.abs().max()
-            if peak < 1e-4:
+            peak = src_peak_vals[spk_idx]
+            # Option #4: absolute energy floor
+            if peak < self._min_peak:
+                suppressed.append((spk_idx, f"below min_peak {peak:.4f}<{self._min_peak}"))
+                active_mask[spk_idx] = False
                 continue
-            batch_tensors.append((src / peak).unsqueeze(0).unsqueeze(0))  # (1, 1, 80000)
+            # Option #1: ghost ratio suppression
+            if peak < ghost_floor:
+                suppressed.append((spk_idx, f"ghost {peak:.4f}<{ghost_floor:.4f} ({self._ghost_ratio:.0%} of {max_src_peak:.4f})"))
+                active_mask[spk_idx] = False
+                continue
+            src = sources[0, :, spk_idx]                 # (80000,) GPU
+            batch_tensors.append((src / src.abs().max()).unsqueeze(0).unsqueeze(0))  # (1, 1, 80000)
             active_indices.append(spk_idx)
+
+        if suppressed and self._step_idx % 10 == 0:
+            log.debug("Ghost suppressed: %s", "; ".join(f"src-{s}: {r}" for s, r in suppressed))
 
         embeddings = torch.full((self.n_local_speakers, self._emb_dim), float('nan'))
         if batch_tensors:
@@ -403,12 +427,12 @@ class RealtimePipeline:
         if self._step_idx % 5 == 0 and self.clustering._anchors:
             from scipy.spatial.distance import cdist as _cdist
             chunk_peak = float(np.max(np.abs(waveform)))
-            src_peaks = [float(sources[0, :, i].abs().max().cpu()) for i in range(self.n_local_speakers)]
             emb_np = embeddings.numpy()
             anchor_ids = sorted(self.clustering._anchors.keys())
             anchor_mat = np.array([self.clustering._anchors[a] for a in anchor_ids])
             anchor_names = [self.clustering._labels.get(a, f"g{a}") for a in anchor_ids]
-            lines = [f"STEP-DEBUG #{self._step_idx}: chunk_peak={chunk_peak:.4f} src_peaks={[f'{p:.4f}' for p in src_peaks]}"]
+            n_supp = len(suppressed)
+            lines = [f"STEP-DEBUG #{self._step_idx}: chunk_peak={chunk_peak:.4f} src_peaks={[f'{p:.4f}' for p in src_peak_vals]} active={active_indices} suppressed={n_supp}"]
             for si in active_indices:
                 e = emb_np[si:si+1]
                 if not np.isnan(e).any():

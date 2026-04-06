@@ -19,6 +19,9 @@
   .avatar { width: 40px; height: 40px; border-radius: 50%; display: flex;
             align-items: center; justify-content: center; font-weight: 700;
             font-size: 1rem; flex-shrink: 0; }
+  #timeline-canvas { width: 100%; height: 100%; }
+  .timeline-legend-item { display: flex; align-items: center; gap: 4px; }
+  .timeline-legend-dot { width: 8px; height: 8px; border-radius: 2px; }
 </style>
 </head>
 <body class="min-h-screen p-4">
@@ -46,6 +49,31 @@
   <div id="speaker-lanes" class="space-y-2 mb-6">
     <div class="text-slate-500 text-sm italic" id="no-speakers-msg">
       No speakers detected yet. Click Start to begin.
+    </div>
+  </div>
+
+  <!-- Diarization Timeline -->
+  <div class="mb-6 bg-slate-800/50 rounded-xl p-4 border border-slate-700">
+    <div class="flex items-center justify-between mb-2">
+      <h2 class="text-sm font-semibold text-slate-300">Diarization Timeline</h2>
+      <div class="flex items-center gap-3">
+        <div id="timeline-legend" class="flex items-center gap-3 text-[10px] text-slate-400"></div>
+        <select id="timeline-window" onchange="timelineWindowChanged()"
+                class="bg-slate-900 border border-slate-600 rounded px-2 py-1 text-[10px] text-slate-300">
+          <option value="30">30s</option>
+          <option value="60" selected>60s</option>
+          <option value="120">2min</option>
+          <option value="300">5min</option>
+        </select>
+      </div>
+    </div>
+    <div style="height: 140px; position: relative;">
+      <canvas id="timeline-canvas"></canvas>
+    </div>
+    <div class="flex justify-between text-[9px] text-slate-500 mt-1">
+      <span id="timeline-t-start">0:00</span>
+      <span class="text-slate-600">overlap shown as layered bars</span>
+      <span id="timeline-t-end">0:00</span>
     </div>
   </div>
 
@@ -110,6 +138,16 @@ const COLORS = [
   '#ec4899', '#14b8a6', '#f97316'
 ];
 
+// ─── Diarization Timeline State ──────────────────────────────────
+const timeline = {
+  steps: [],           // [{t, speakers: [{id, label, activity, enrolled}]}]
+  stepDuration: 0.5,   // seconds per step
+  windowSec: 60,       // visible window
+  knownSpeakers: {},   // id -> {label, color, enrolled}
+  canvas: null,
+  ctx: null,
+};
+
 // ─── WebSocket ───────────────────────────────────────────────────
 let wsPingTimer = null;
 
@@ -164,6 +202,9 @@ function handleMessage(msg) {
     // Hide placeholder
     const placeholder = document.getElementById('no-speakers-msg');
     if (msg.speakers.length > 0 && placeholder) placeholder.style.display = 'none';
+
+    // Feed diarization timeline
+    updateTimeline(msg);
 
   } else if (msg.type === 'status') {
     logEvent(msg.message);
@@ -440,6 +481,201 @@ function logEvent(msg, isError = false) {
   log.scrollTop = log.scrollHeight;
 }
 
+// ─── Diarization Timeline ─────────────────────────────────────
+function initTimeline() {
+  const canvas = document.getElementById('timeline-canvas');
+  const container = canvas.parentElement;
+  canvas.width = container.offsetWidth * 2;
+  canvas.height = container.offsetHeight * 2;
+  timeline.canvas = canvas;
+  timeline.ctx = canvas.getContext('2d');
+  timeline.windowSec = parseInt(document.getElementById('timeline-window').value);
+  drawTimeline();
+}
+
+function timelineWindowChanged() {
+  timeline.windowSec = parseInt(document.getElementById('timeline-window').value);
+  drawTimeline();
+}
+
+function updateTimeline(msg) {
+  const t = msg.step * timeline.stepDuration;
+  const activeSpeakers = [];
+  for (const sp of msg.speakers) {
+    if (sp.activity > 0.3) {
+      activeSpeakers.push({
+        id: sp.id, label: sp.label,
+        activity: sp.activity, enrolled: sp.enrolled,
+      });
+      // Track known speakers
+      if (!timeline.knownSpeakers[sp.id]) {
+        timeline.knownSpeakers[sp.id] = {
+          label: sp.label,
+          color: COLORS[sp.id % COLORS.length],
+          enrolled: sp.enrolled,
+        };
+        updateTimelineLegend();
+      }
+    }
+  }
+  timeline.steps.push({ t, speakers: activeSpeakers });
+
+  // Trim old steps beyond 5min max
+  const maxKeep = 300 / timeline.stepDuration;
+  if (timeline.steps.length > maxKeep) {
+    timeline.steps = timeline.steps.slice(timeline.steps.length - maxKeep);
+  }
+
+  drawTimeline();
+}
+
+function updateTimelineLegend() {
+  const el = document.getElementById('timeline-legend');
+  el.innerHTML = '';
+  const sorted = Object.entries(timeline.knownSpeakers).sort((a, b) => a[0] - b[0]);
+  for (const [id, info] of sorted) {
+    const item = document.createElement('div');
+    item.className = 'timeline-legend-item';
+    item.innerHTML = `<div class="timeline-legend-dot" style="background:${info.color}"></div>
+      <span>${info.label}${info.enrolled ? ' ✓' : ''}</span>`;
+    el.appendChild(item);
+  }
+}
+
+function formatTime(sec) {
+  const m = Math.floor(sec / 60);
+  const s = Math.floor(sec % 60);
+  return m + ':' + String(s).padStart(2, '0');
+}
+
+function drawTimeline() {
+  const ctx = timeline.ctx;
+  const canvas = timeline.canvas;
+  if (!ctx || !canvas) return;
+
+  const W = canvas.width;
+  const H = canvas.height;
+  const pad = { top: 8, bottom: 8, left: 4, right: 4 };
+  const drawW = W - pad.left - pad.right;
+  const drawH = H - pad.top - pad.bottom;
+
+  // Clear
+  ctx.fillStyle = '#1e293b';
+  ctx.fillRect(0, 0, W, H);
+
+  if (timeline.steps.length === 0) {
+    ctx.fillStyle = '#475569';
+    ctx.font = `${Math.round(H * 0.12)}px system-ui`;
+    ctx.textAlign = 'center';
+    ctx.fillText('Waiting for diarization data...', W / 2, H / 2);
+    return;
+  }
+
+  // Determine visible time range
+  const lastT = timeline.steps[timeline.steps.length - 1].t;
+  const tEnd = Math.max(lastT, timeline.windowSec);
+  const tStart = tEnd - timeline.windowSec;
+
+  // Update time labels
+  document.getElementById('timeline-t-start').textContent = formatTime(Math.max(0, tStart));
+  document.getElementById('timeline-t-end').textContent = formatTime(tEnd);
+
+  // Build speaker row order (enrolled first, then by first appearance)
+  const speakerOrder = [];
+  const seen = new Set();
+  // Enrolled first
+  for (const [id, info] of Object.entries(timeline.knownSpeakers)) {
+    if (info.enrolled && !seen.has(id)) { speakerOrder.push(id); seen.add(id); }
+  }
+  // Then unknowns
+  for (const [id, info] of Object.entries(timeline.knownSpeakers)) {
+    if (!seen.has(id)) { speakerOrder.push(id); seen.add(id); }
+  }
+
+  if (speakerOrder.length === 0) return;
+
+  const rowH = Math.min(drawH / speakerOrder.length, 28);
+  const rowGap = Math.max(2, Math.round(rowH * 0.15));
+  const barH = rowH - rowGap;
+  const totalH = speakerOrder.length * rowH;
+  const yOffset = pad.top + (drawH - totalH) / 2;
+
+  // Draw speaker labels on left
+  ctx.font = `bold ${Math.round(barH * 0.65)}px system-ui`;
+  ctx.textAlign = 'right';
+  ctx.textBaseline = 'middle';
+
+  // Draw row backgrounds + labels
+  for (let r = 0; r < speakerOrder.length; r++) {
+    const id = speakerOrder[r];
+    const info = timeline.knownSpeakers[id];
+    const y = yOffset + r * rowH;
+
+    // Faint row background
+    ctx.fillStyle = info.color + '10';
+    ctx.fillRect(pad.left, y, drawW, barH);
+
+    // Row label
+    ctx.fillStyle = info.color + '80';
+    ctx.fillText(info.label, pad.left + 50, y + barH / 2);
+  }
+
+  // Draw segments
+  const stepPx = drawW / (timeline.windowSec / timeline.stepDuration);
+  const barLeft = pad.left + 55; // after labels
+  const barW = drawW - 55;
+
+  for (const step of timeline.steps) {
+    if (step.t < tStart || step.t > tEnd) continue;
+
+    const xFrac = (step.t - tStart) / timeline.windowSec;
+    const x = barLeft + xFrac * barW;
+    const segW = Math.max(2, (timeline.stepDuration / timeline.windowSec) * barW);
+
+    for (const sp of step.speakers) {
+      const rowIdx = speakerOrder.indexOf(String(sp.id));
+      if (rowIdx < 0) continue;
+
+      const y = yOffset + rowIdx * rowH;
+      const alpha = Math.min(1, 0.4 + sp.activity * 0.6);
+      const info = timeline.knownSpeakers[sp.id];
+
+      ctx.fillStyle = info.color;
+      ctx.globalAlpha = alpha;
+      ctx.fillRect(Math.round(x), Math.round(y), Math.ceil(segW), barH);
+    }
+  }
+  ctx.globalAlpha = 1.0;
+
+  // Draw overlap indicators (steps with 2+ speakers)
+  for (const step of timeline.steps) {
+    if (step.t < tStart || step.t > tEnd) continue;
+    if (step.speakers.length < 2) continue;
+
+    const xFrac = (step.t - tStart) / timeline.windowSec;
+    const x = barLeft + xFrac * barW;
+    const segW = Math.max(2, (timeline.stepDuration / timeline.windowSec) * barW);
+
+    // Draw thin overlap marker at top
+    ctx.fillStyle = '#fbbf24';
+    ctx.globalAlpha = 0.7;
+    ctx.fillRect(Math.round(x), pad.top, Math.ceil(segW), 3);
+  }
+  ctx.globalAlpha = 1.0;
+
+  // Draw current time marker
+  const nowFrac = (lastT - tStart) / timeline.windowSec;
+  const nowX = barLeft + nowFrac * barW;
+  ctx.strokeStyle = '#f8fafc';
+  ctx.lineWidth = 1.5;
+  ctx.setLineDash([3, 3]);
+  ctx.beginPath();
+  ctx.moveTo(nowX, pad.top);
+  ctx.lineTo(nowX, H - pad.bottom);
+  ctx.stroke();
+  ctx.setLineDash([]);
+}
+
 // ─── Diagnostic Recording ─────────────────────────────────────
 async function diagRecord() {
   const label = document.getElementById('diag-label').value.trim();
@@ -491,6 +727,14 @@ window.addEventListener('load', () => {
   connectWS();
   loadSpeakers();
   loadDiagClips();
+  initTimeline();
+});
+window.addEventListener('resize', () => {
+  initTimeline();
+  // Resize waveform canvases too
+  for (const [id, lane] of Object.entries(speakerLanes)) {
+    lane.canvas.width = lane.canvas.offsetWidth * 2 || 600;
+  }
 });
 </script>
 </body>
