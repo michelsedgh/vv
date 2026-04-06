@@ -1,0 +1,39 @@
+# ─── Voice ID: Real-Time Diarization & Separation ─────────────────
+# PixIT (ToTaToNet) + WeSpeaker + diart clustering components
+
+audio:
+  device_index: 0          # sounddevice input device (IC800 USB mic)
+  sample_rate: 16000       # PixIT native sample rate
+
+device: cuda               # torch device
+
+enrollment:
+  dir: enrolled_speakers   # each sub-dir has embedding.npy + reference.wav
+  record_seconds: 10       # default recording duration for enrollment
+
+pixit:
+  model: pyannote/separation-ami-1.0
+  duration: 5.0            # chunk duration in seconds (model trained on 5s)
+  step: 0.5                # step between chunks in seconds
+  max_speakers: 3          # PixIT max output sources per chunk
+
+embedding:
+  model: pyannote/wespeaker-voxceleb-resnet34-LM
+  gamma: 3                 # overlap speech penalty exponent
+  beta: 10                 # overlap speech penalty temperature
+
+clustering:
+  tau_active: 0.5          # min activation to consider speaker active
+  rho_update: 0.4          # min mean activation to update centroid / create new speaker
+  delta_new: 0.55          # max cosine dist to create new unknown speaker
+  delta_enrolled: 0.70     # enrolled match threshold (mich=0.24, others>0.69; safe margin)
+  max_speakers: 8          # max global speakers tracked across session
+  max_drift: 0.0           # unused (enrolled centroids are frozen)
+
+denoiser:
+  enabled: false             # DISABLED — DF streaming state corrupts embeddings (0.90+ vs 0.40 without)
+  model: DeepFilterNet3      # model variant (DeepFilterNet, DeepFilterNet2, DeepFilterNet3)
+
+server:
+  host: 0.0.0.0
+  port: 8042
