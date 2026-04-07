@@ -38,9 +38,6 @@ Continuity with RealtimePipeline (why this file matters for “choppiness”)
   are treated as duplicate/leakage of that voice on a secondary separation
   channel — they are blocked from general matching so one enrolled speaker does
   not split into two globals or steal unknown slots.
-
-Debug instrumentation in ``identify()`` writes NDJSON (e.g. ENROLLED_DISTS,
-ENROLLED_MATCH, ENROLLED_LEAKAGE) for session analysis; do not log secrets.
 """
 from __future__ import annotations
 
@@ -230,16 +227,6 @@ class EnrolledSpeakerClustering(OnlineSpeakerClustering):
             active_embs = embeddings[active_speakers]
             dists = cdist(active_embs, anchor_mat, metric=self.metric)
 
-            # #region agent log — enrolled matching distances
-            if self._call_count % 2 == 0:
-                import json as _j, time as _t
-                _anchor_names = [self._labels.get(i, f"g{i}") for i in anchor_ids]
-                _all_dists = {}
-                for _li in range(len(active_speakers)):
-                    _all_dists[f"local{int(active_speakers[_li])}"] = {n: round(float(dists[_li, ai]), 4) for ai, n in enumerate(_anchor_names)}
-                open('/home/michel/Documents/Voice/.cursor/debug-21cffc.log','a').write(_j.dumps({"sessionId":"21cffc","hypothesisId":"E","location":"enrolled_clustering.py:identify","message":"ENROLLED_DISTS","data":{"call":self._call_count,"delta_enrolled":self.delta_enrolled,"delta_new":self.delta_new,"active_speakers":active_speakers.tolist(),"dists_to_enrolled":_all_dists},"timestamp":int(_t.time()*1000)})+'\n')
-            # #endregion
-
             used_local: set = set()
             for ai, anchor_idx in enumerate(anchor_ids):
                 if anchor_idx in taken_enrolled:
@@ -280,12 +267,6 @@ class EnrolledSpeakerClustering(OnlineSpeakerClustering):
                 self._last_enrolled_step[anchor_idx] = self._call_count
                 self._last_local_for_enrolled[anchor_idx] = best_local
 
-                # #region agent log — enrolled match details
-                if self._call_count % 2 == 0:
-                    import json as _j, time as _t
-                    open('/home/michel/Documents/Voice/.cursor/debug-21cffc.log','a').write(_j.dumps({"sessionId":"21cffc","hypothesisId":"H3","location":"enrolled_clustering.py:match","message":"ENROLLED_MATCH","data":{"call":self._call_count,"anchor":self._labels.get(anchor_idx,"?"),"local_spk":best_local,"dist":round(float(dists[best_li,ai]),4),"mean_act":round(float(mean_act[best_local]),3),"eff_delta":round(eff_delta,3),"in_grace":in_grace,"n_candidates":len(candidates)},"timestamp":int(_t.time()*1000)})+'\n')
-                # #endregion
-
         # ── 1b. Enrolled leakage suppression ──
         # Remaining active speakers within the effective threshold of any enrolled
         # anchor are the SAME voice leaking through secondary PixIT channels.
@@ -308,12 +289,6 @@ class EnrolledSpeakerClustering(OnlineSpeakerClustering):
 
                 if min_dist < eff_delta:
                     enrolled_leakage.add(int(s))
-
-        # #region agent log — leakage suppression
-        if self._call_count % 2 == 0 and enrolled_leakage:
-            import json as _j, time as _t
-            open('/home/michel/Documents/Voice/.cursor/debug-21cffc.log','a').write(_j.dumps({"sessionId":"21cffc","hypothesisId":"H1","location":"enrolled_clustering.py:leakage","message":"ENROLLED_LEAKAGE","data":{"call":self._call_count,"suppressed":[int(s) for s in enrolled_leakage],"delta_enrolled":self.delta_enrolled},"timestamp":int(_t.time()*1000)})+'\n')
-        # #endregion
 
         # ── 2. General matching for remaining speakers ──
         remaining_active = np.array(

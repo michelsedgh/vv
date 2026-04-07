@@ -28,8 +28,7 @@ PixIT is re-run every step on a sliding buffer, so the separated waveform for
 “the same” speaker **changes** at chunk boundaries.  Short crossfades hide
 that mismatch; they cannot remove model inconsistency entirely.
 
-**What caused audible choppiness / mid-word spectrogram holes (debugged with
-NDJSON logs: XFADE_BOUNDARY, SPK_MAP, EMB_DIST, ENROLLED_HOLDOVER, etc.):**
+**What caused audible choppiness / mid-word spectrogram holes (during tuning):**
 
 1. **Empty speaker map** — Clustering only maps locals whose PixIT frame scores
    pass ``tau_active``.  Scores flicker; valid_assignments() can drop out for a
@@ -39,8 +38,8 @@ NDJSON logs: XFADE_BOUNDARY, SPK_MAP, EMB_DIST, ENROLLED_HOLDOVER, etc.):**
    last PixIT channel when seg peak or tail RMS stays above
    ``holdover_seg_max`` / ``holdover_tail_rms`` even if the map would be empty.
 
-2. **Large sample discontinuity at chunk joins** — Logs showed discontinuities
-   ~0.10–0.22 and big prev_rms vs raw_rms swings at boundaries.  **Mitigations:**
+2. **Large sample discontinuity at chunk joins** — Notable sample jumps and RMS
+   swings at boundaries.  **Mitigations:**
    longer overlap ``audio.output_crossfade_ms`` (default 100 ms vs earlier 15–40
    ms) and a **cosine** crossfade (zero derivative at ends) instead of linear.
 
@@ -600,26 +599,6 @@ class RealtimePipeline:
                 for i, spk_idx in enumerate(active_indices):
                     embeddings[spk_idx] = embs[i].cpu()
 
-        # #region agent log — separated-source embeddings: quality + distances
-        if self.clustering._anchors and self._step_idx % 2 == 0:
-            import json as _j, time as _t
-            from scipy.spatial.distance import cdist as _cdist2
-            _emb_np = embeddings.numpy()
-            _anch_ids = sorted(self.clustering._anchors.keys())
-            _anch_mat = np.array([self.clustering._anchors[a] for a in _anch_ids])
-            _anch_names = [self.clustering._labels.get(a, f"g{a}") for a in _anch_ids]
-            for _si in range(self.n_local_speakers):
-                _seg_act = float(np.mean(seg_np[:, _si]))
-                _seg_max = float(np.max(seg_np[:, _si]))
-                _e = _emb_np[_si:_si+1]
-                _is_nan = bool(np.isnan(_e).any())
-                _dist_info = {}
-                if not _is_nan:
-                    _dists = _cdist2(_e, _anch_mat, metric="cosine")[0]
-                    _dist_info = {n:round(float(d),4) for n,d in zip(_anch_names,_dists)}
-                open('/home/michel/Documents/Voice/.cursor/debug-21cffc.log','a').write(_j.dumps({"sessionId":"21cffc","runId":"sep-src","hypothesisId":"H2","location":"pipeline.py:emb_dist","message":"EMB_DIST","data":{"step":self._step_idx,"local_spk":_si,"seg_mean_act":round(_seg_act,3),"seg_max_act":round(_seg_max,3),"is_nan":_is_nan,"dists":_dist_info},"timestamp":int(_t.time()*1000)})+'\n')
-        # #endregion
-
         # ── 3. Clustering ──
         permuted_seg = self.clustering(segmentation, embeddings)
         speaker_map = self.clustering.last_speaker_map
@@ -633,17 +612,6 @@ class RealtimePipeline:
         n_seg_frames = agg_permuted.data.shape[0]
         step_frames = max(1, int(n_seg_frames * self.step_duration / self.duration))
         step_seg = agg_permuted.data[-step_frames:]
-
-        # #region agent log — DIART-A: raw vs aggregated tail mean (smoothing check)
-        if self._step_idx % 8 == 0:
-            import json as _j, time as _t
-            n_raw = permuted_seg.data.shape[0]
-            sf_raw = max(1, int(n_raw * self.step_duration / self.duration))
-            raw_tail = permuted_seg.data[-sf_raw:]
-            _raw_m = float(np.mean(raw_tail)) if raw_tail.size else 0.0
-            _agg_m = float(np.mean(step_seg)) if step_seg.size else 0.0
-            open('/home/michel/Documents/Voice/.cursor/debug-21cffc.log','a').write(_j.dumps({"sessionId":"21cffc","hypothesisId":"DIART-A","location":"pipeline.py:seg_agg","message":"SEG_AGG","data":{"step":self._step_idx,"n_win":self._pred_aggregation.num_overlapping_windows,"raw_tail_mean":round(_raw_m,4),"agg_tail_mean":round(_agg_m,4)},"timestamp":int(_t.time()*1000)})+'\n')
-        # #endregion
 
         # ── 4. Map sources to global speakers (single window) ──
         # One PixIT forward per step; we only read the current ``sources`` tail.
@@ -685,16 +653,6 @@ class RealtimePipeline:
                     continue
                 pairs.append((loc, g_idx))
                 used_local.add(loc)
-                # #region agent log — holdover fills empty / partial map
-                if self._step_idx % 2 == 0:
-                    import json as _j, time as _t
-                    open('/home/michel/Documents/Voice/.cursor/debug-21cffc.log','a').write(_j.dumps({"sessionId":"21cffc","hypothesisId":"H4","location":"pipeline.py:holdover","message":"ENROLLED_HOLDOVER","data":{"step":self._step_idx,"global":g_idx,"label":self.clustering.get_label(g_idx),"local":loc,"seg_max":round(smax,4),"tail_rms":round(t_rms,5)},"timestamp":int(_t.time()*1000)})+'\n')
-                # #endregion
-
-        if self._step_idx % 2 == 0:
-            import json as _j, time as _t
-            _map_info = {f"L{l}": f"{self.clustering.get_label(g)}(g{g})" for l, g in pairs}
-            open('/home/michel/Documents/Voice/.cursor/debug-21cffc.log','a').write(_j.dumps({"sessionId":"21cffc","hypothesisId":"D","location":"pipeline.py:mapping","message":"SPK_MAP","data":{"step":self._step_idx,"mapping":_map_info,"n_global":len(self.clustering.active_centers),"n_enrolled":len(self.clustering._anchors)},"timestamp":int(_t.time()*1000)})+'\n')
 
         if pairs:
             fade = self._fade_samples
@@ -723,22 +681,8 @@ class RealtimePipeline:
 
                 raw = tail_sources[:, out_idx].copy()
 
-                # #region agent log — single-window extract (post-echo revert)
-                if self._step_idx % 4 == 0:
-                    import json as _j, time as _t
-                    open('/home/michel/Documents/Voice/.cursor/debug-21cffc.log','a').write(_j.dumps({"sessionId":"21cffc","hypothesisId":"H5","location":"pipeline.py:extract","message":"XFADE_CFG","data":{"step":self._step_idx,"extract_len":int(extract_len),"fade_samples":int(fade),"fade_ms":round(1000.0*fade/self.sample_rate,1),"cosine_ramp":True},"timestamp":int(_t.time()*1000)})+'\n')
-                # #endregion
-
                 prev_tail = self._prev_tails.get(global_idx)
                 if prev_tail is not None and len(prev_tail) == fade:
-                    # #region agent log — crossfade boundary
-                    if self._step_idx % 4 == 0:
-                        import json as _j, time as _t
-                        _disc = float(np.abs(prev_tail[-1] - raw[0]))
-                        _prev_rms = float(np.sqrt(np.mean(prev_tail**2)))
-                        _raw_rms = float(np.sqrt(np.mean(raw[:fade]**2)))
-                        open('/home/michel/Documents/Voice/.cursor/debug-21cffc.log','a').write(_j.dumps({"sessionId":"21cffc","hypothesisId":"C","location":"pipeline.py:xfade","message":"XFADE_BOUNDARY","data":{"step":self._step_idx,"global_idx":global_idx,"label":label,"discontinuity":round(_disc,5),"prev_rms":round(_prev_rms,5),"raw_rms":round(_raw_rms,5)},"timestamp":int(_t.time()*1000)})+'\n')
-                    # #endregion
                     # Cosine crossfade: ramp = 0.5 - 0.5*cos(0..pi).  Ends have
                     # zero slope vs linear ramp → less zipper / click at joins
                     # when PixIT’s separated tail jumps between steps.
