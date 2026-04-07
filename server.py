@@ -306,19 +306,28 @@ def _run_diarization_monitor():
             # Process one inference step per captured mic block so live playback
             # starts immediately instead of waiting for a full 5 s buffer.
             drained = False
+            _n_queued = mic_queue.qsize()
             while not mic_queue.empty():
                 try:
                     block = mic_queue.get_nowait()
                     block = pipeline.denoise_block(block)  # ~8ms for 500ms
                     with buf_lock:
                         audio_buffer = np.concatenate([audio_buffer, block])
+                        _buf_len = len(audio_buffer)
                         chunk = _build_live_chunk(audio_buffer, chunk_samples)
                         audio_buffer = _trim_live_buffer(
                             audio_buffer, chunk_samples, step_samples
                         )
+                    _t_step_start = time.perf_counter()
                     result = pipeline.step(chunk)
+                    _t_step_ms = (time.perf_counter() - _t_step_start) * 1000
                     broadcast_step_result(result)
                     drained = True
+                    # #region agent log — timing + buffer health
+                    if monitor.step_count % 4 == 0:
+                        import json as _j
+                        open('/home/michel/Documents/Voice/.cursor/debug-21cffc.log','a').write(_j.dumps({"sessionId":"21cffc","hypothesisId":"TIMING","location":"server.py:loop","message":"STEP_TIMING","data":{"step":monitor.step_count,"queued_blocks":_n_queued,"buf_before_trim":_buf_len,"step_ms":round(_t_step_ms,1),"step_budget_ms":step*1000},"timestamp":int(time.time()*1000)})+'\n')
+                    # #endregion
                 except queue.Empty:
                     break
 

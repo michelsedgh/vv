@@ -1,20 +1,18 @@
 """
 RealtimePipeline — orchestrates DeepFilterNet → PixIT → WeSpeaker → EnrolledClustering.
 
-Uses diart's building blocks (SpeakerSegmentation, OverlapAwareSpeakerEmbedding,
-OnlineSpeakerClustering) but NOT diart's SpeakerDiarization pipeline or
-StreamingInference — those don't support PixIT's dual output (diarization +
-separated sources).
+Uses PixIT's separated sources for embedding extraction (cleaner than mixed
+audio) and diart's OnlineSpeakerClustering (via EnrolledSpeakerClustering)
+for incremental clustering with enrolled-priority matching.
 
 Data flow per step
 ──────────────────
   waveform np.ndarray (80000,) — 5 s at 16 kHz
     → [optional] DeepFilterNet denoise (16k→48k→denoise→16k)
-    → SpeakerSegmentation  → diarization SlidingWindowFeature (624, 3)
-    → PixITWrapper buffers → sources tensor (1, 80000, 3)
-    → WeSpeaker embedding from each separated source (normalized)
-    → EnrolledSpeakerClustering    → permuted_seg SlidingWindowFeature (624, 8)
-                                     + SpeakerMap (local → global)
+    → PixIT                → diarization SlidingWindowFeature (624, 3)
+                           → sources tensor (1, 80000, 3)
+    → WeSpeaker on separated sources → (3, emb_dim) embeddings
+    → EnrolledSpeakerClustering → permuted_seg + SpeakerMap (local → global)
     → source mapping: per-speaker 500 ms audio clips + activity scores
 """
 from __future__ import annotations
@@ -31,6 +29,9 @@ import torchaudio.functional as AF
 import yaml
 from pyannote.audio import Model as PyanModel
 from pyannote.core import SlidingWindow, SlidingWindowFeature
+
+from diart.models import EmbeddingModel
+from diart.blocks.embedding import OverlapAwareSpeakerEmbedding
 
 from enrolled_clustering import EnrolledSpeakerClustering
 from pixit_wrapper import make_pixit_segmentation_model
@@ -109,10 +110,21 @@ class RealtimePipeline:
         wavlm = self._pixit_wrapper.totatonet.wavlm
         self._trt_active = patch_wavlm_with_trt(wavlm, self.device)
 
-        # ── Embedding (WeSpeaker, direct from separated sources) ──
+        # ── Embedding (DIART's OverlapAwareSpeakerEmbedding block) ──
         log.info("Loading WeSpeaker embedding model...")
         self._emb_model = PyanModel.from_pretrained(emb_cfg["model"]).to(self.device)
         self._emb_model.eval()
+
+        # Wrap in DIART's EmbeddingModel so OverlapAwareSpeakerEmbedding can use it
+        diart_emb = EmbeddingModel(loader=lambda: self._emb_model)
+        diart_emb.model = self._emb_model
+        self.osp_embedding = OverlapAwareSpeakerEmbedding(
+            model=diart_emb,
+            gamma=emb_cfg.get("gamma", 3),
+            beta=emb_cfg.get("beta", 10),
+            norm=1,
+            device=self.device,
+        )
 
         # ── DeepFilterNet denoiser (optional) — load BEFORE enrollment ──
         denoiser_cfg = config.get("denoiser", {})
@@ -164,9 +176,7 @@ class RealtimePipeline:
         self._step_idx = 0
 
         # Crossfade between consecutive steps to avoid boundary discontinuities.
-        # We extract (step_samples + fade_samples) from PixIT output, then
-        # crossfade the leading fade_samples with the previous step's tail.
-        self._fade_samples = int(0.010 * self.sample_rate)  # 10ms = 160 samples
+        self._fade_samples = int(0.015 * self.sample_rate)  # 15ms
         self._prev_tails: Dict[int, np.ndarray] = {}  # global_idx → tail samples
 
         # Warmup both models + detect embedding dim
@@ -293,41 +303,37 @@ class RealtimePipeline:
             seg_np = seg_t[0].float().cpu().numpy()             # (frames, 3)
             sources = self._pixit_wrapper.last_sources.float()  # (1, samples, 3)
 
-            # Find the most active source (highest mean activation)
+            # Find the most active local speaker
             mean_acts = np.mean(seg_np, axis=0)
-            best_src = int(np.argmax(mean_acts))
+            best_spk = int(np.argmax(mean_acts))
             log.info(
-                "  '%s' PixIT activations: %s → picking source %d",
-                name, [f"{a:.3f}" for a in mean_acts], best_src,
+                "  '%s' PixIT activations: %s → picking local speaker %d",
+                name, [f"{a:.3f}" for a in mean_acts], best_spk,
             )
 
-            # Extract embedding from the dominant separated source
-            src_audio = sources[0, :, best_src]
-            peak = src_audio.abs().max()
-            if peak < 1e-4:
-                log.warning("  '%s' dominant source is silent, falling back to raw", name)
-                reextracted[name] = self.extract_embedding(audio)
-                continue
-            src_audio = src_audio / peak
-            inp = src_audio.unsqueeze(0).unsqueeze(0)
+            # Extract embedding from the separated source (same as live path)
+            src = sources[0, :, best_spk].float()  # (80000,) GPU
+            peak = src.abs().max()
+            if peak > 1e-4:
+                src = src / peak
+            wav_t = src.unsqueeze(0).unsqueeze(0)  # (1, 1, 80000) GPU
             with torch.inference_mode():
-                emb_t = self._emb_model(inp)
-            emb_t = emb_t / (emb_t.norm(dim=-1, keepdim=True) + 1e-8)
+                emb_t = self._emb_model(wav_t)     # (1, emb_dim)
+            emb_t = emb_t / emb_t.norm(dim=-1, keepdim=True).clamp(min=1e-8)
             emb = emb_t.squeeze(0).cpu().numpy().astype(np.float64)
 
-            # Log comparison
             from scipy.spatial.distance import cosine as cos_dist
             raw_emb = self.extract_embedding(audio)
             raw_d = cos_dist(raw_emb, enrolled_embeddings[name])
             sep_d = cos_dist(emb, enrolled_embeddings[name])
             log.info(
-                "  '%s' enrollment: raw→stored=%.3f, separated→stored=%.3f (DF=%s)",
+                "  '%s' enrollment: raw→stored=%.3f, sep-src→stored=%.3f (DF=%s)",
                 name, raw_d, sep_d,
                 "ON" if self._denoiser_enabled else "OFF",
             )
 
             reextracted[name] = emb
-            log.info("Re-extracted '%s' through %sPixIT→WeSpeaker (dim=%d)",
+            log.info("Re-extracted '%s' through %sPixIT-sep→WeSpeaker (dim=%d)",
                      name, "DF→" if self._denoiser_enabled else "", len(emb))
         return reextracted
 
@@ -391,51 +397,63 @@ class RealtimePipeline:
         sw = SlidingWindow(start=start_time, duration=resolution, step=resolution)
         segmentation = SlidingWindowFeature(seg_np, sw)
 
-        # ── 2. Batch WeSpeaker embeddings (single forward pass) ──
-        active_mask = np.max(seg_np, axis=0) >= self.clustering.tau_active
-        active_indices = []
+        # ── 2. Embeddings from separated sources ──
+        # PixIT already isolates each speaker — use those clean sources for
+        # embedding extraction.  This gives lower cosine distances than the
+        # mixed-audio DIART approach because separation removes cross-talk.
+        active_mask = np.max(seg_np, axis=0) >= self.cfg["clustering"]["tau_active"]
+        embeddings = torch.full(
+            (self.n_local_speakers, self._emb_dim), float("nan"),
+            device="cpu",
+        )
 
-        # Collect and normalise active sources on GPU
         batch_tensors = []
-        for spk_idx in range(self.n_local_speakers):
-            if not active_mask[spk_idx]:
-                continue
-            src = sources[0, :, spk_idx]                 # (80000,) GPU
-            batch_tensors.append((src / src.abs().max()).unsqueeze(0).unsqueeze(0))  # (1, 1, 80000)
-            active_indices.append(spk_idx)
+        active_indices = []
+        with torch.inference_mode():
+            for spk_idx in range(self.n_local_speakers):
+                if not active_mask[spk_idx]:
+                    continue
+                src = sources[0, :, spk_idx]          # (80000,) GPU fp32
+                peak = src.abs().max()
+                if peak < 1e-4:
+                    continue
+                batch_tensors.append((src / peak).unsqueeze(0).unsqueeze(0))
+                active_indices.append(spk_idx)
 
-        embeddings = torch.full((self.n_local_speakers, self._emb_dim), float('nan'))
-        if batch_tensors:
-            batch = torch.cat(batch_tensors, dim=0)      # (N, 1, 80000)
-            with torch.inference_mode():
+            if batch_tensors:
+                batch = torch.cat(batch_tensors, dim=0)  # (N, 1, 80000) GPU
                 embs = self._emb_model(batch)            # (N, emb_dim)
-            embs = embs / (embs.norm(dim=-1, keepdim=True) + 1e-8)
-            embs_cpu = embs.cpu()
-            for i, spk_idx in enumerate(active_indices):
-                embeddings[spk_idx] = embs_cpu[i]
+                embs = embs / embs.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+                for i, spk_idx in enumerate(active_indices):
+                    embeddings[spk_idx] = embs[i].cpu()
 
-        # ── DEBUG: log chunk stats + embedding distances to anchors ──
-        if log.isEnabledFor(logging.DEBUG) and self._step_idx % 5 == 0 and self.clustering._anchors:
-            from scipy.spatial.distance import cdist as _cdist
-            chunk_peak = float(np.max(np.abs(waveform)))
-            emb_np = embeddings.numpy()
-            anchor_ids = sorted(self.clustering._anchors.keys())
-            anchor_mat = np.array([self.clustering._anchors[a] for a in anchor_ids])
-            anchor_names = [self.clustering._labels.get(a, f"g{a}") for a in anchor_ids]
-            lines = [f"STEP-DEBUG #{self._step_idx}: chunk_peak={chunk_peak:.4f} active={active_indices}"]
-            for si in active_indices:
-                e = emb_np[si:si+1]
-                if not np.isnan(e).any():
-                    dists = _cdist(e, anchor_mat, metric="cosine")[0]
-                    lines.append(f"  src-{si} act={float(np.max(seg_np[:, si])):.3f} → " +
-                                 ", ".join(f"{n}={d:.4f}" for n, d in zip(anchor_names, dists)))
-            log.debug("\n".join(lines))
+        # #region agent log — separated-source embeddings: quality + distances
+        if self.clustering._anchors and self._step_idx % 2 == 0:
+            import json as _j, time as _t
+            from scipy.spatial.distance import cdist as _cdist2
+            _emb_np = embeddings.numpy()
+            _anch_ids = sorted(self.clustering._anchors.keys())
+            _anch_mat = np.array([self.clustering._anchors[a] for a in _anch_ids])
+            _anch_names = [self.clustering._labels.get(a, f"g{a}") for a in _anch_ids]
+            for _si in range(self.n_local_speakers):
+                _seg_act = float(np.mean(seg_np[:, _si]))
+                _seg_max = float(np.max(seg_np[:, _si]))
+                _e = _emb_np[_si:_si+1]
+                _is_nan = bool(np.isnan(_e).any())
+                _dist_info = {}
+                if not _is_nan:
+                    _dists = _cdist2(_e, _anch_mat, metric="cosine")[0]
+                    _dist_info = {n:round(float(d),4) for n,d in zip(_anch_names,_dists)}
+                open('/home/michel/Documents/Voice/.cursor/debug-21cffc.log','a').write(_j.dumps({"sessionId":"21cffc","runId":"sep-src","hypothesisId":"H2","location":"pipeline.py:emb_dist","message":"EMB_DIST","data":{"step":self._step_idx,"local_spk":_si,"seg_mean_act":round(_seg_act,3),"seg_max_act":round(_seg_max,3),"is_nan":_is_nan,"dists":_dist_info},"timestamp":int(_t.time()*1000)})+'\n')
+        # #endregion
 
         # ── 3. Clustering ──
         permuted_seg = self.clustering(segmentation, embeddings)
         speaker_map = self.clustering.last_speaker_map
 
-        # ── 4. Map sources to global speakers ──
+        # ── 4. Map sources to global speakers (single window) ──
+        # Multi-window overlap-add was reverted: misaligned buffer indices
+        # summed staggered copies of the same speech → echo / buildup.
         n_seg_frames = permuted_seg.data.shape[0]
         step_frames = max(1, int(n_seg_frames * self.step_duration / self.duration))
         step_seg = permuted_seg.data[-step_frames:]
@@ -445,6 +463,14 @@ class RealtimePipeline:
             local_ids, global_ids = speaker_map.valid_assignments()
             local_ids = [int(idx) for idx in local_ids]
             global_ids = [int(idx) for idx in global_ids]
+
+            # #region agent log — speaker mapping
+            if self._step_idx % 2 == 0:
+                import json as _j, time as _t
+                _map_info = {f"L{l}": f"{self.clustering.get_label(g)}(g{g})" for l, g in zip(local_ids, global_ids)}
+                _n_active_centers = len(self.clustering.active_centers)
+                open('/home/michel/Documents/Voice/.cursor/debug-21cffc.log','a').write(_j.dumps({"sessionId":"21cffc","hypothesisId":"D","location":"pipeline.py:mapping","message":"SPK_MAP","data":{"step":self._step_idx,"mapping":_map_info,"n_global":_n_active_centers,"n_enrolled":len(self.clustering._anchors)},"timestamp":int(_t.time()*1000)})+'\n')
+            # #endregion
             fade = self._fade_samples
             extract_len = self.step_samples + fade
             tail_sources = None
@@ -460,21 +486,28 @@ class RealtimePipeline:
                 label = self.clustering.get_label(global_idx)
                 activity = float(np.mean(step_seg[:, global_idx]))
 
-                # Extract step + fade region for overlap-add crossfade
                 raw = tail_sources[:, out_idx].copy()
 
-                # Crossfade with previous step's tail
+                # #region agent log — single-window extract (post-echo revert)
+                if self._step_idx % 4 == 0:
+                    import json as _j, time as _t
+                    open('/home/michel/Documents/Voice/.cursor/debug-21cffc.log','a').write(_j.dumps({"sessionId":"21cffc","hypothesisId":"R1","location":"pipeline.py:extract","message":"SINGLE_WIN","data":{"step":self._step_idx,"extract_len":int(extract_len),"fade":int(fade)},"timestamp":int(_t.time()*1000)})+'\n')
+                # #endregion
+
                 prev_tail = self._prev_tails.get(global_idx)
                 if prev_tail is not None and len(prev_tail) == fade:
+                    # #region agent log — crossfade boundary
+                    if self._step_idx % 4 == 0:
+                        import json as _j, time as _t
+                        _disc = float(np.abs(prev_tail[-1] - raw[0]))
+                        _prev_rms = float(np.sqrt(np.mean(prev_tail**2)))
+                        _raw_rms = float(np.sqrt(np.mean(raw[:fade]**2)))
+                        open('/home/michel/Documents/Voice/.cursor/debug-21cffc.log','a').write(_j.dumps({"sessionId":"21cffc","hypothesisId":"C","location":"pipeline.py:xfade","message":"XFADE_BOUNDARY","data":{"step":self._step_idx,"global_idx":global_idx,"label":label,"discontinuity":round(_disc,5),"prev_rms":round(_prev_rms,5),"raw_rms":round(_raw_rms,5)},"timestamp":int(_t.time()*1000)})+'\n')
+                    # #endregion
                     ramp = np.linspace(0.0, 1.0, fade, dtype=np.float32)
                     raw[:fade] = prev_tail * (1.0 - ramp) + raw[:fade] * ramp
 
-                # Save this step's tail for next crossfade
                 self._prev_tails[global_idx] = raw[-fade:].copy()
-
-                # Preserve the separator's natural level from step to step.
-                # Per-step peak normalization made quiet chunks jump in level and
-                # created audible pumping at chunk boundaries.
                 audio = np.clip(raw[:self.step_samples], -1.0, 1.0)
 
                 results.append(SpeakerResult(
@@ -497,6 +530,7 @@ class RealtimePipeline:
     def reset(self) -> None:
         """Reset pipeline state for a new session."""
         self._step_idx = 0
+        self._prev_tails.clear()
         # Re-create clustering with same params, re-inject enrolled centroids
         clust_cfg = self.cfg["clustering"]
         old_labels = {

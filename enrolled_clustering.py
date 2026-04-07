@@ -78,6 +78,16 @@ class EnrolledSpeakerClustering(OnlineSpeakerClustering):
         self.last_speaker_map: Optional[SpeakerMap] = None
         self._call_count: int = 0
 
+        # Grace period: track when each enrolled speaker was last matched.
+        # During a grace window after the last match, use a relaxed threshold
+        # so that silence→speech transitions don't lose the enrolled speaker.
+        self._last_enrolled_step: Dict[int, int] = {}   # g_idx → call_count
+        self._grace_steps: int = 20                      # ~10 s at 0.5 s step
+
+        # Channel persistence: prefer the same local speaker as last step to
+        # prevent source switching (which causes audio discontinuities).
+        self._last_local_for_enrolled: Dict[int, int] = {}  # g_idx → local_spk
+
     # ─── Enrollment ──────────────────────────────────────────────
 
     def inject_centroids(self, enrolled: Dict[str, np.ndarray]) -> None:
@@ -99,6 +109,9 @@ class EnrolledSpeakerClustering(OnlineSpeakerClustering):
             idx = self.add_center(emb)
             self._anchors[idx] = emb.copy()
             self._labels[idx] = name
+            # Seed grace period so the first few steps use the relaxed
+            # threshold (live embeddings are always noisier at startup).
+            self._last_enrolled_step[idx] = 0
 
     # ─── Labels ──────────────────────────────────────────────────
 
@@ -177,8 +190,12 @@ class EnrolledSpeakerClustering(OnlineSpeakerClustering):
             )
 
         # ── 1. Enrolled priority pass ──
+        # For each enrolled anchor, find speakers within the effective threshold,
+        # then pick the one with HIGHEST mean activity (most voice content →
+        # best audio quality and most stable assignment across steps).
         enrolled_assignments = {}          # local_spk → global_idx
         taken_enrolled: set = set()
+        mean_act = np.mean(segmentation.data, axis=0)  # (n_local,)
 
         if self._anchors and len(active_speakers) > 0:
             anchor_ids = sorted(self._anchors.keys())
@@ -186,35 +203,95 @@ class EnrolledSpeakerClustering(OnlineSpeakerClustering):
             active_embs = embeddings[active_speakers]
             dists = cdist(active_embs, anchor_mat, metric=self.metric)
 
-            # Greedy: pick closest (speaker, anchor) pair until none < delta
-            used_local = set()
-            while True:
-                best_val, best_li, best_ai = np.inf, -1, -1
+            # #region agent log — enrolled matching distances
+            if self._call_count % 2 == 0:
+                import json as _j, time as _t
+                _anchor_names = [self._labels.get(i, f"g{i}") for i in anchor_ids]
+                _all_dists = {}
+                for _li in range(len(active_speakers)):
+                    _all_dists[f"local{int(active_speakers[_li])}"] = {n: round(float(dists[_li, ai]), 4) for ai, n in enumerate(_anchor_names)}
+                open('/home/michel/Documents/Voice/.cursor/debug-21cffc.log','a').write(_j.dumps({"sessionId":"21cffc","hypothesisId":"E","location":"enrolled_clustering.py:identify","message":"ENROLLED_DISTS","data":{"call":self._call_count,"delta_enrolled":self.delta_enrolled,"delta_new":self.delta_new,"active_speakers":active_speakers.tolist(),"dists_to_enrolled":_all_dists},"timestamp":int(_t.time()*1000)})+'\n')
+            # #endregion
+
+            used_local: set = set()
+            for ai, anchor_idx in enumerate(anchor_ids):
+                if anchor_idx in taken_enrolled:
+                    continue
+
+                # Effective threshold: relaxed during grace period
+                steps_since = self._call_count - self._last_enrolled_step.get(anchor_idx, -999)
+                in_grace = steps_since <= self._grace_steps
+                eff_delta = self.delta_enrolled * 1.4 if in_grace else self.delta_enrolled
+
+                # Collect all candidates within effective threshold
+                candidates = []
                 for li in range(len(active_speakers)):
-                    if active_speakers[li] in used_local:
+                    local_spk = int(active_speakers[li])
+                    if local_spk in used_local:
                         continue
-                    for ai in range(len(anchor_ids)):
-                        if anchor_ids[ai] in taken_enrolled:
-                            continue
-                        if dists[li, ai] < best_val:
-                            best_val = dists[li, ai]
-                            best_li, best_ai = li, ai
-                if best_li < 0 or best_val >= self.delta_enrolled:
-                    break
-                local_spk = int(active_speakers[best_li])
-                global_idx = anchor_ids[best_ai]
-                enrolled_assignments[local_spk] = global_idx
-                taken_enrolled.add(global_idx)
-                used_local.add(local_spk)
-                log.debug(
-                    "ENROLLED-MATCH: local-%d → %s (dist=%.3f)",
-                    local_spk, self._labels.get(global_idx, f"g{global_idx}"),
-                    best_val,
-                )
+                    if dists[li, ai] < eff_delta:
+                        candidates.append((li, local_spk))
+
+                if not candidates:
+                    continue
+
+                # Prefer the previously assigned local speaker (channel
+                # persistence) to avoid source switching.  Fall back to
+                # highest mean activity only when the previous channel is
+                # no longer a valid candidate.
+                prev_local = self._last_local_for_enrolled.get(anchor_idx)
+                prev_match = [c for c in candidates if c[1] == prev_local]
+                if prev_match:
+                    best_li, best_local = prev_match[0]
+                else:
+                    best_li, best_local = max(
+                        candidates, key=lambda x: mean_act[x[1]]
+                    )
+                enrolled_assignments[best_local] = anchor_idx
+                taken_enrolled.add(anchor_idx)
+                used_local.add(best_local)
+                self._last_enrolled_step[anchor_idx] = self._call_count
+                self._last_local_for_enrolled[anchor_idx] = best_local
+
+                # #region agent log — enrolled match details
+                if self._call_count % 2 == 0:
+                    import json as _j, time as _t
+                    open('/home/michel/Documents/Voice/.cursor/debug-21cffc.log','a').write(_j.dumps({"sessionId":"21cffc","hypothesisId":"H3","location":"enrolled_clustering.py:match","message":"ENROLLED_MATCH","data":{"call":self._call_count,"anchor":self._labels.get(anchor_idx,"?"),"local_spk":best_local,"dist":round(float(dists[best_li,ai]),4),"mean_act":round(float(mean_act[best_local]),3),"eff_delta":round(eff_delta,3),"in_grace":in_grace,"n_candidates":len(candidates)},"timestamp":int(_t.time()*1000)})+'\n')
+                # #endregion
+
+        # ── 1b. Enrolled leakage suppression ──
+        # Remaining active speakers within the effective threshold of any enrolled
+        # anchor are the SAME voice leaking through secondary PixIT channels.
+        # Suppress entirely — no centroid, no mapping, no audio.
+        enrolled_leakage: set = set()
+        if self._anchors:
+            for s in active_speakers:
+                if s in enrolled_assignments:
+                    continue
+                if np.isnan(embeddings[s]).any():
+                    continue
+                s_dists = cdist(embeddings[s:s+1], anchor_mat, metric=self.metric)
+                min_dist = float(s_dists.min())
+                min_ai = int(s_dists.argmin())
+                min_anchor_idx = anchor_ids[min_ai]
+
+                steps_since = self._call_count - self._last_enrolled_step.get(min_anchor_idx, -999)
+                in_grace = steps_since <= self._grace_steps
+                eff_delta = self.delta_enrolled * 1.4 if in_grace else self.delta_enrolled
+
+                if min_dist < eff_delta:
+                    enrolled_leakage.add(int(s))
+
+        # #region agent log — leakage suppression
+        if self._call_count % 2 == 0 and enrolled_leakage:
+            import json as _j, time as _t
+            open('/home/michel/Documents/Voice/.cursor/debug-21cffc.log','a').write(_j.dumps({"sessionId":"21cffc","hypothesisId":"H1","location":"enrolled_clustering.py:leakage","message":"ENROLLED_LEAKAGE","data":{"call":self._call_count,"suppressed":[int(s) for s in enrolled_leakage],"delta_enrolled":self.delta_enrolled},"timestamp":int(_t.time()*1000)})+'\n')
+        # #endregion
 
         # ── 2. General matching for remaining speakers ──
         remaining_active = np.array(
-            [s for s in active_speakers if s not in enrolled_assignments],
+            [s for s in active_speakers
+             if s not in enrolled_assignments and s not in enrolled_leakage],
             dtype=int,
         )
 
@@ -242,14 +319,25 @@ class EnrolledSpeakerClustering(OnlineSpeakerClustering):
             if not valid_map.is_source_speaker_mapped(s)
         ]
 
-        # Try to create new centres for missed speakers, or fall back
+        # Try to create new centres for missed speakers, or fall back.
+        # During a grace period (enrolled speaker was recently seen), suppress
+        # new-centroid creation for speakers whose embedding is within a generous
+        # distance of an enrolled anchor — they're likely the same person with
+        # a degraded embedding (silence→speech transition).
         new_center_speakers = []
         for spk in missed:
+            if self._anchors and not np.isnan(embeddings[spk]).any():
+                sp_dists = cdist(embeddings[spk:spk+1], anchor_mat, metric=self.metric)
+                min_dist = float(sp_dists.min())
+                min_anchor = anchor_ids[int(sp_dists.argmin())]
+                steps_since = self._call_count - self._last_enrolled_step.get(min_anchor, -999)
+                if steps_since <= self._grace_steps and min_dist < self.delta_enrolled * 1.6:
+                    continue
+
             has_space = len(new_center_speakers) < self.num_free_centers
             if has_space and spk in long_speakers:
                 new_center_speakers.append(spk)
             else:
-                # Fall back: closest free non-enrolled global slot
                 prefs = np.argsort(dist_map.mapping_matrix[spk, :])
                 prefs = [
                     g for g in prefs
@@ -288,11 +376,9 @@ class EnrolledSpeakerClustering(OnlineSpeakerClustering):
         # Always reset enrolled centroids to clean anchors
         self._freeze_enrolled()
 
+        self._call_count += 1
         speaker_map = self.identify(segmentation, embeddings)
         self.last_speaker_map = speaker_map
-
-        # Periodic debug logging
-        self._call_count += 1
         if (
             log.isEnabledFor(logging.DEBUG)
             and self.centers is not None
