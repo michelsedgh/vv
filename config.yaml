@@ -29,6 +29,14 @@ device: cuda               # torch device
 enrollment:
   dir: enrolled_speakers   # each sub-dir has embedding.npy + reference.wav
   record_seconds: 10       # default recording duration for enrollment
+  # Distance / room: enrollment saves reference.wav; on server start the pipeline
+  # re-extracts your centroid via PixIT→WeSpeaker (same path as live). If you enroll
+  # nose-to-mic but use the app from across the room, separated audio and embeddings
+  # differ (level, reverb, separation leakage) → lower "ID %" on the dashboard while
+  # "diar %" still tracks how loud PixIT marks the slot. Fix: re-enroll at your usual
+  # seating distance (or mid-room), speak naturally for ~10s, restart the server.
+  # Optional: record a second take from another position and we can add multi-anchor
+  # enrollment later; for now one good far-field reference beats one near-field clip.
 
 pixit:
   model: pyannote/separation-ami-1.0
@@ -45,6 +53,9 @@ embedding:
   beta: 10                 # overlap speech penalty temperature
 
 clustering:
+  # Quiet / far-field: if the right person is rejected, check dashboard "ID %" (WeSpeaker).
+  # If ID stays high but audio drops, tune tau_active / holdover. If ID drops, loosen
+  # delta_enrolled slightly (e.g. 0.75) or re-enroll from typical distance — not both blindly.
   tau_active: 0.28         # below 0.4: fewer empty maps + less holdover-only steps (smoother diarization path)
   rho_update: 0.3          # slightly lower so speaker tracking updates on less sustained speech
   delta_new: 0.55          # max cosine dist to create new unknown speaker

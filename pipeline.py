@@ -93,6 +93,10 @@ class SpeakerResult:
     audio: np.ndarray          # float32, 16 kHz, mono — last step_samples
     activity: float            # mean diarization score over the step window
     is_enrolled: bool
+    # WeSpeaker: cosine similarity (dot product) of this step's separated-source
+    # embedding vs frozen enrollment anchor — only for enrolled; None otherwise.
+    # Orthogonal to ``activity`` (which is PixIT/diarization strength).
+    identity_similarity: Optional[float] = None
 
 
 @dataclass
@@ -708,6 +712,15 @@ class RealtimePipeline:
                 label = self.clustering.get_label(global_idx)
                 activity = float(np.mean(step_seg[:, global_idx]))
 
+                id_sim: Optional[float] = None
+                if global_idx in self.clustering._anchors:
+                    _row = embeddings[local_idx].numpy()
+                    if not np.isnan(_row).any():
+                        _a = self.clustering._anchors[global_idx]
+                        id_sim = float(
+                            np.clip(np.dot(_row.astype(np.float64), _a), -1.0, 1.0)
+                        )
+
                 raw = tail_sources[:, out_idx].copy()
 
                 # #region agent log — single-window extract (post-echo revert)
@@ -746,6 +759,7 @@ class RealtimePipeline:
                     audio=audio,
                     activity=activity,
                     is_enrolled=self.clustering.is_enrolled(global_idx),
+                    identity_similarity=id_sim,
                 ))
 
         self._step_idx += 1

@@ -253,7 +253,10 @@ function createSpeakerLane(sp) {
       <div class="flex items-center gap-2 mb-1">
         <span class="font-semibold text-sm text-white truncate">${sp.label}</span>
         ${sp.enrolled ? '<span class="speaker-badge text-[10px] px-1.5 py-0.5 rounded bg-emerald-900 text-emerald-400">enrolled</span>' : '<span class="speaker-badge text-[10px] px-1.5 py-0.5 rounded bg-slate-700 text-slate-400">unknown</span>'}
-        <span class="activity-pct text-[10px] text-slate-500 ml-auto">0%</span>
+        <span class="lane-metrics text-[10px] text-slate-500 ml-auto text-right leading-tight"
+              title="Diar % = PixIT/diarization strength (volume &amp; distance affect this). ID % = WeSpeaker match vs enrollment (same model as enroll).">
+          <span class="activity-pct block">0%</span>
+        </span>
       </div>
       <canvas class="waveform w-full rounded" height="40" style="background:#1e293b"></canvas>
     </div>
@@ -344,8 +347,14 @@ function updateSpeakerLane(sp) {
     lane.element.querySelector('.glow-dot').classList.add('off');
   }
 
-  // Activity percentage
-  lane.element.querySelector('.activity-pct').textContent = Math.round(sp.activity * 100) + '%';
+  // Diarization vs identity: activity is NOT embedding quality (see title on .lane-metrics).
+  const diarPct = Math.round(sp.activity * 100);
+  let line = diarPct + '% diar';
+  if (sp.enrolled && sp.identity_similarity != null && !Number.isNaN(sp.identity_similarity)) {
+    const idPct = Math.max(0, Math.min(100, Math.round(sp.identity_similarity * 100)));
+    line += ' · ' + idPct + '% ID';
+  }
+  lane.element.querySelector('.activity-pct').textContent = line;
 }
 
 function appendSpeakerAudio(speakerId, f32, sampleRate) {

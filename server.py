@@ -285,13 +285,16 @@ def _run_diarization_monitor():
         for sp in result.speakers:
             audio_i16 = np.clip(sp.audio * 32767, -32768, 32767).astype(np.int16)
             speaker_id = int(sp.global_idx)
-            speakers_data.append({
+            _sd = {
                 "id": speaker_id,
                 "label": str(sp.label),
                 "active": bool(sp.activity > cfg["clustering"]["tau_active"]),
                 "activity": round(float(sp.activity), 3),
                 "enrolled": bool(sp.is_enrolled),
-            })
+            }
+            if sp.identity_similarity is not None:
+                _sd["identity_similarity"] = round(float(sp.identity_similarity), 4)
+            speakers_data.append(_sd)
             audio_packets.append(
                 _pack_audio_packet(result.step_idx, speaker_id, sample_rate, audio_i16)
             )
