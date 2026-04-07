@@ -13,7 +13,11 @@ Data flow per step
                            → sources tensor (1, 80000, 3)
     → WeSpeaker on separated sources → (3, emb_dim) embeddings
     → EnrolledSpeakerClustering → permuted_seg + SpeakerMap (local → global)
-    → source mapping: per-speaker 500 ms audio clips + activity scores
+    → DIART DelayedAggregation (Hamming) on permuted_seg → smoother activity
+      (same idea as diart SpeakerDiarization.pred_aggregation; clustering still
+      runs on the instantaneous permuted chunk like DIART)
+    → source mapping: per-speaker step audio + activity from aggregated seg
+    → [optional] DeepFilterNet on separated audio for enrolled speakers only
 """
 from __future__ import annotations
 
@@ -21,7 +25,7 @@ import logging
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 import torch
@@ -30,8 +34,9 @@ import yaml
 from pyannote.audio import Model as PyanModel
 from pyannote.core import SlidingWindow, SlidingWindowFeature
 
-from diart.models import EmbeddingModel
+from diart.blocks.aggregation import DelayedAggregation
 from diart.blocks.embedding import OverlapAwareSpeakerEmbedding
+from diart.models import EmbeddingModel
 
 from enrolled_clustering import EnrolledSpeakerClustering
 from pixit_wrapper import make_pixit_segmentation_model
@@ -88,6 +93,26 @@ class RealtimePipeline:
         self.step_samples = int(self.step_duration * self.sample_rate)  # 8000
         self.n_local_speakers: int = pixit_cfg["max_speakers"]       # 3
 
+        # DIART SpeakerDiarization.pred_aggregation: Hamming-weighted fusion of
+        # overlapping permuted segmentations.  Reduces frame-to-frame jitter in
+        # activity (and stabilizes UI); latency_sec >= step (default 2 s ⇒ 4×0.5 s windows).
+        _agg_lat = float(pixit_cfg.get("aggregation_latency_sec", 2.0))
+        if _agg_lat < self.step_duration:
+            _agg_lat = self.step_duration
+        self._pred_aggregation = DelayedAggregation(
+            self.step_duration,
+            latency=_agg_lat,
+            strategy="hamming",
+            cropping_mode="loose",
+        )
+        self._pred_seg_buffer: List[SlidingWindowFeature] = []
+        log.info(
+            "Diarization aggregation (DIART): step=%.3fs latency=%.3fs → %d windows",
+            self.step_duration,
+            _agg_lat,
+            self._pred_aggregation.num_overlapping_windows,
+        )
+
         emb_cfg = config["embedding"]
         clust_cfg = config["clustering"]
 
@@ -126,28 +151,44 @@ class RealtimePipeline:
             device=self.device,
         )
 
-        # ── DeepFilterNet denoiser (optional) — load BEFORE enrollment ──
+        # ── DeepFilterNet (optional) — load BEFORE enrollment ──
+        # Mic path (`enabled`) and enrolled-output path (`enhance_enrolled_output`)
+        # are independent: output enhancement does not touch the buffer fed to PixIT.
         denoiser_cfg = config.get("denoiser", {})
         self._denoiser_enabled = denoiser_cfg.get("enabled", False)
+        self._df_output_enrolled = denoiser_cfg.get("enhance_enrolled_output", False)
         self._df_model = None
-        self._df_state = None
-        if self._denoiser_enabled:
+        self._df_state_mic = None
+        self._df_enhance = None
+        self._df_sr = 48_000
+        self._df_output_states: Dict[int, Any] = {}
+
+        _load_df = self._denoiser_enabled or self._df_output_enrolled
+        if _load_df:
             try:
                 from df import enhance, init_df
                 model_name = denoiser_cfg.get("model", "DeepFilterNet3")
-                log.info("Loading DeepFilterNet (%s)...", model_name)
-                self._df_model, self._df_state, _ = init_df(
-                    model_base_dir=model_name
+                log.info(
+                    "Loading DeepFilterNet (%s) [mic=%s, enrolled_output=%s]...",
+                    model_name,
+                    self._denoiser_enabled,
+                    self._df_output_enrolled,
                 )
+                self._df_model, df_state, _ = init_df(model_base_dir=model_name)
                 self._df_enhance = enhance
-                self._df_sr = self._df_state.sr()  # 48000
+                self._df_sr = df_state.sr()
+                if self._denoiser_enabled:
+                    self._df_state_mic = df_state
                 log.info("DeepFilterNet ready (native %d Hz).", self._df_sr)
             except Exception as e:
                 log.warning("DeepFilterNet failed to load, disabling: %s", e)
                 self._denoiser_enabled = False
+                self._df_output_enrolled = False
+                self._df_model = None
+                self._df_state_mic = None
+                self._df_enhance = None
 
-        # Pre-compute resample transforms for DF (cached kernels)
-        if self._denoiser_enabled:
+        if self._df_model is not None:
             from torchaudio.transforms import Resample
             self._df_resample_up = Resample(self.sample_rate, self._df_sr)
             self._df_resample_down = Resample(self._df_sr, self.sample_rate)
@@ -175,9 +216,22 @@ class RealtimePipeline:
         # ── State ──
         self._step_idx = 0
 
-        # Crossfade between consecutive steps to avoid boundary discontinuities.
-        self._fade_samples = int(0.015 * self.sample_rate)  # 15ms
+        # Crossfade between consecutive separated chunks (PixIT tail changes each step).
+        acfg = config.get("audio", {})
+        _fade_ms = float(acfg.get("output_crossfade_ms", 100.0))
+        if self._df_output_enrolled:
+            _fade_ms = max(_fade_ms, 50.0)
+        self._fade_samples = min(
+            int((_fade_ms / 1000.0) * self.sample_rate),
+            self.step_samples - 400,  # keep a floor of usable new audio per step
+        )
+        self._fade_samples = max(self._fade_samples, 160)  # at least ~10 ms
         self._prev_tails: Dict[int, np.ndarray] = {}  # global_idx → tail samples
+        log.info(
+            "Separated-audio crossfade: %d samples (%.1f ms), cosine ramp",
+            self._fade_samples,
+            1000.0 * self._fade_samples / self.sample_rate,
+        )
 
         # Warmup both models + detect embedding dim
         log.info("Warming up PixIT + WeSpeaker...")
@@ -194,6 +248,15 @@ class RealtimePipeline:
 
     # ─── DeepFilterNet streaming denoise ─────────────────────────
 
+    def _df_enhance_block(self, block: np.ndarray, df_state: Any) -> np.ndarray:
+        """Run one DeepFilterNet enhancement block (16 kHz → 48 kHz → DF → 16 kHz)."""
+        n = len(block)
+        wav_t = torch.from_numpy(np.asarray(block, dtype=np.float32)).unsqueeze(0)
+        wav_48 = self._df_resample_up(wav_t)
+        wav_48 = self._df_enhance(self._df_model, df_state, wav_48)
+        wav_16 = self._df_resample_down(wav_48)
+        return wav_16.squeeze(0).numpy()[:n]
+
     def denoise_block(self, block: np.ndarray) -> np.ndarray:
         """Denoise a short audio block (e.g. 500 ms) using DeepFilterNet.
 
@@ -209,14 +272,50 @@ class RealtimePipeline:
         -------
         np.ndarray, shape (samples,), float32, 16 kHz, denoised
         """
-        if not self._denoiser_enabled or self._df_model is None:
+        if not self._denoiser_enabled or self._df_model is None or self._df_state_mic is None:
             return block
-        n = len(block)
-        wav_t = torch.from_numpy(block).unsqueeze(0)          # (1, samples) CPU
-        wav_48 = self._df_resample_up(wav_t)                   # CPU, cached kernel
-        wav_48 = self._df_enhance(self._df_model, self._df_state, wav_48)
-        wav_16 = self._df_resample_down(wav_48)                # CPU, cached kernel
-        return wav_16.squeeze(0).numpy()[:n]
+        return self._df_enhance_block(block, self._df_state_mic)
+
+    def _df_output_state(self, global_idx: int) -> Any:
+        """Streaming DF state per global speaker (enrolled output path only)."""
+        if global_idx not in self._df_output_states:
+            from df.model import ModelParams
+            from libdf import DF as LibdfDF
+
+            p = ModelParams()
+            self._df_output_states[global_idx] = LibdfDF(
+                sr=p.sr,
+                fft_size=p.fft_size,
+                hop_size=p.hop_size,
+                nb_bands=p.nb_erb,
+                min_nb_erb_freqs=p.min_nb_freqs,
+            )
+        return self._df_output_states[global_idx]
+
+    def _enhance_enrolled_audio(self, samples: np.ndarray, global_idx: int) -> np.ndarray:
+        """DeepFilterNet on separated track; chunked like mic path for stable streaming."""
+        if (
+            not self._df_output_enrolled
+            or self._df_model is None
+            or self._df_enhance is None
+        ):
+            return samples
+        samples = np.asarray(samples, dtype=np.float32).flatten()
+        state = self._df_output_state(global_idx)
+        block_size = int(0.5 * self.sample_rate)
+        n = len(samples)
+        if n == 0:
+            return samples
+        out_parts: List[np.ndarray] = []
+        for start in range(0, n, block_size):
+            chunk = samples[start : start + block_size]
+            take = len(chunk)
+            if len(chunk) < block_size:
+                chunk = np.pad(chunk, (0, block_size - len(chunk)))
+            enhanced = self._df_enhance_block(chunk, state)
+            out_parts.append(enhanced[:take])
+        merged = np.concatenate(out_parts)
+        return np.clip(merged, -1.0, 1.0).astype(np.float32)
 
     # ─── Embedding helpers ────────────────────────────────────────
 
@@ -451,36 +550,87 @@ class RealtimePipeline:
         permuted_seg = self.clustering(segmentation, embeddings)
         speaker_map = self.clustering.last_speaker_map
 
-        # ── 4. Map sources to global speakers (single window) ──
-        # Multi-window overlap-add was reverted: misaligned buffer indices
-        # summed staggered copies of the same speech → echo / buildup.
-        n_seg_frames = permuted_seg.data.shape[0]
+        # ── 3b. DIART-style delayed aggregation on permuted segmentation ──
+        self._pred_seg_buffer.append(permuted_seg)
+        agg_permuted = self._pred_aggregation(self._pred_seg_buffer)
+        if len(self._pred_seg_buffer) == self._pred_aggregation.num_overlapping_windows:
+            self._pred_seg_buffer = self._pred_seg_buffer[1:]
+
+        n_seg_frames = agg_permuted.data.shape[0]
         step_frames = max(1, int(n_seg_frames * self.step_duration / self.duration))
-        step_seg = permuted_seg.data[-step_frames:]
+        step_seg = agg_permuted.data[-step_frames:]
+
+        # #region agent log — DIART-A: raw vs aggregated tail mean (smoothing check)
+        if self._step_idx % 8 == 0:
+            import json as _j, time as _t
+            n_raw = permuted_seg.data.shape[0]
+            sf_raw = max(1, int(n_raw * self.step_duration / self.duration))
+            raw_tail = permuted_seg.data[-sf_raw:]
+            _raw_m = float(np.mean(raw_tail)) if raw_tail.size else 0.0
+            _agg_m = float(np.mean(step_seg)) if step_seg.size else 0.0
+            open('/home/michel/Documents/Voice/.cursor/debug-21cffc.log','a').write(_j.dumps({"sessionId":"21cffc","hypothesisId":"DIART-A","location":"pipeline.py:seg_agg","message":"SEG_AGG","data":{"step":self._step_idx,"n_win":self._pred_aggregation.num_overlapping_windows,"raw_tail_mean":round(_raw_m,4),"agg_tail_mean":round(_agg_m,4)},"timestamp":int(_t.time()*1000)})+'\n')
+        # #endregion
+
+        # ── 4. Map sources to global speakers (single window) ──
+        # Multi-window overlap-add on waveforms was reverted (misaligned indices
+        # caused echo).  DIART aggregates scores, not separated waveforms here.
 
         results = []
+        clust_cfg = self.cfg["clustering"]
+        pairs: List[tuple[int, int]] = []
+        used_local: set[int] = set()
         if speaker_map is not None:
-            local_ids, global_ids = speaker_map.valid_assignments()
-            local_ids = [int(idx) for idx in local_ids]
-            global_ids = [int(idx) for idx in global_ids]
+            li, gi = speaker_map.valid_assignments()
+            for l, g in zip(li, gi):
+                l_i, g_i = int(l), int(g)
+                if l_i in used_local:
+                    continue
+                pairs.append((l_i, g_i))
+                used_local.add(l_i)
 
-            # #region agent log — speaker mapping
-            if self._step_idx % 2 == 0:
-                import json as _j, time as _t
-                _map_info = {f"L{l}": f"{self.clustering.get_label(g)}(g{g})" for l, g in zip(local_ids, global_ids)}
-                _n_active_centers = len(self.clustering.active_centers)
-                open('/home/michel/Documents/Voice/.cursor/debug-21cffc.log','a').write(_j.dumps({"sessionId":"21cffc","hypothesisId":"D","location":"pipeline.py:mapping","message":"SPK_MAP","data":{"step":self._step_idx,"mapping":_map_info,"n_global":_n_active_centers,"n_enrolled":len(self.clustering._anchors)},"timestamp":int(_t.time()*1000)})+'\n')
-            # #endregion
+        # Enrolled holdover: clustering uses max(seg)>=tau_active; PixIT scores flicker
+        # frame-to-frame so the map can be empty while the separated channel still has
+        # speech → 500 ms audio gaps.  Re-attach enrolled globals to their persisted
+        # local channel when seg peak or tail RMS says energy is still there.
+        ho_max = float(clust_cfg.get("holdover_seg_max", 0.12))
+        ho_rms = float(clust_cfg.get("holdover_tail_rms", 0.002))
+        if self.clustering._anchors:
+            for g_idx in sorted(self.clustering._anchors.keys()):
+                if any(g == g_idx for _, g in pairs):
+                    continue
+                loc = self.clustering._last_local_for_enrolled.get(g_idx)
+                if loc is None or loc in used_local:
+                    continue
+                smax = float(np.max(seg_np[:, loc]))
+                t_rms = float(
+                    sources[0, -self.step_samples :, loc].float().pow(2).mean().sqrt().cpu()
+                )
+                if smax < ho_max and t_rms < ho_rms:
+                    continue
+                pairs.append((loc, g_idx))
+                used_local.add(loc)
+                # #region agent log — holdover fills empty / partial map
+                if self._step_idx % 2 == 0:
+                    import json as _j, time as _t
+                    open('/home/michel/Documents/Voice/.cursor/debug-21cffc.log','a').write(_j.dumps({"sessionId":"21cffc","hypothesisId":"H4","location":"pipeline.py:holdover","message":"ENROLLED_HOLDOVER","data":{"step":self._step_idx,"global":g_idx,"label":self.clustering.get_label(g_idx),"local":loc,"seg_max":round(smax,4),"tail_rms":round(t_rms,5)},"timestamp":int(_t.time()*1000)})+'\n')
+                # #endregion
+
+        if self._step_idx % 2 == 0:
+            import json as _j, time as _t
+            _map_info = {f"L{l}": f"{self.clustering.get_label(g)}(g{g})" for l, g in pairs}
+            open('/home/michel/Documents/Voice/.cursor/debug-21cffc.log','a').write(_j.dumps({"sessionId":"21cffc","hypothesisId":"D","location":"pipeline.py:mapping","message":"SPK_MAP","data":{"step":self._step_idx,"mapping":_map_info,"n_global":len(self.clustering.active_centers),"n_enrolled":len(self.clustering._anchors)},"timestamp":int(_t.time()*1000)})+'\n')
+
+        if pairs:
             fade = self._fade_samples
             extract_len = self.step_samples + fade
-            tail_sources = None
-            if local_ids:
-                tail_sources = (
-                    sources[0, -extract_len:, local_ids]
-                    .detach()
-                    .cpu()
-                    .numpy()
-                )
+            local_ids = [p[0] for p in pairs]
+            global_ids = [p[1] for p in pairs]
+            tail_sources = (
+                sources[0, -extract_len:, local_ids]
+                .detach()
+                .cpu()
+                .numpy()
+            )
 
             for out_idx, (local_idx, global_idx) in enumerate(zip(local_ids, global_ids)):
                 label = self.clustering.get_label(global_idx)
@@ -491,7 +641,7 @@ class RealtimePipeline:
                 # #region agent log — single-window extract (post-echo revert)
                 if self._step_idx % 4 == 0:
                     import json as _j, time as _t
-                    open('/home/michel/Documents/Voice/.cursor/debug-21cffc.log','a').write(_j.dumps({"sessionId":"21cffc","hypothesisId":"R1","location":"pipeline.py:extract","message":"SINGLE_WIN","data":{"step":self._step_idx,"extract_len":int(extract_len),"fade":int(fade)},"timestamp":int(_t.time()*1000)})+'\n')
+                    open('/home/michel/Documents/Voice/.cursor/debug-21cffc.log','a').write(_j.dumps({"sessionId":"21cffc","hypothesisId":"H5","location":"pipeline.py:extract","message":"XFADE_CFG","data":{"step":self._step_idx,"extract_len":int(extract_len),"fade_samples":int(fade),"fade_ms":round(1000.0*fade/self.sample_rate,1),"cosine_ramp":True},"timestamp":int(_t.time()*1000)})+'\n')
                 # #endregion
 
                 prev_tail = self._prev_tails.get(global_idx)
@@ -504,8 +654,13 @@ class RealtimePipeline:
                         _raw_rms = float(np.sqrt(np.mean(raw[:fade]**2)))
                         open('/home/michel/Documents/Voice/.cursor/debug-21cffc.log','a').write(_j.dumps({"sessionId":"21cffc","hypothesisId":"C","location":"pipeline.py:xfade","message":"XFADE_BOUNDARY","data":{"step":self._step_idx,"global_idx":global_idx,"label":label,"discontinuity":round(_disc,5),"prev_rms":round(_prev_rms,5),"raw_rms":round(_raw_rms,5)},"timestamp":int(_t.time()*1000)})+'\n')
                     # #endregion
-                    ramp = np.linspace(0.0, 1.0, fade, dtype=np.float32)
+                    # Cosine ramp (equal-power-ish): softer than linear at ends → less zipper noise
+                    t = np.linspace(0.0, np.pi, fade, dtype=np.float32)
+                    ramp = 0.5 - 0.5 * np.cos(t)
                     raw[:fade] = prev_tail * (1.0 - ramp) + raw[:fade] * ramp
+
+                if self.clustering.is_enrolled(global_idx) and self._df_output_enrolled:
+                    raw = self._enhance_enrolled_audio(raw, global_idx)
 
                 self._prev_tails[global_idx] = raw[-fade:].copy()
                 audio = np.clip(raw[:self.step_samples], -1.0, 1.0)
@@ -531,6 +686,8 @@ class RealtimePipeline:
         """Reset pipeline state for a new session."""
         self._step_idx = 0
         self._prev_tails.clear()
+        self._pred_seg_buffer.clear()
+        self._df_output_states.clear()
         # Re-create clustering with same params, re-inject enrolled centroids
         clust_cfg = self.cfg["clustering"]
         old_labels = {

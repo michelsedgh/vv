@@ -4,6 +4,8 @@
 audio:
   device_index: 0          # sounddevice input device (IC800 USB mic)
   sample_rate: 16000       # PixIT native sample rate
+  # Longer fade masks PixIT tail changing every step (logs showed 0.1–0.22 sample jumps).
+  output_crossfade_ms: 100
 
 device: cuda               # torch device
 
@@ -16,6 +18,9 @@ pixit:
   duration: 5.0            # chunk duration in seconds (model trained on 5s)
   step: 0.5                # step between chunks in seconds
   max_speakers: 3          # PixIT max output sources per chunk
+  # DIART-style Hamming aggregation of permuted diarization (see diart SpeakerDiarization.pred_aggregation).
+  # Must be >= step. 2.0 s ≈ four 0.5 s windows — smoother activity; set equal to step to disable.
+  aggregation_latency_sec: 2.0
 
 embedding:
   model: pyannote/wespeaker-voxceleb-resnet34-LM
@@ -23,15 +28,22 @@ embedding:
   beta: 10                 # overlap speech penalty temperature
 
 clustering:
-  tau_active: 0.4          # slightly lower so weaker/faster words still count as active
+  tau_active: 0.28         # below 0.4: fewer empty maps + less holdover-only steps (smoother diarization path)
   rho_update: 0.3          # slightly lower so speaker tracking updates on less sustained speech
   delta_new: 0.55          # max cosine dist to create new unknown speaker
   delta_enrolled: 0.70     # enrolled match threshold (mich=0.24, others>0.69; safe margin)
   max_speakers: 8          # max global speakers tracked across session
   max_drift: 0.0           # unused (enrolled centroids are frozen)
+  # When max PixIT seg for a channel dips below tau_active, clustering can emit an empty map
+  # → no audio for 500 ms (spectrogram holes). Holdover keeps streaming enrolled speakers
+  # on their last PixIT channel if seg OR separated-tail energy is still above these floors.
+  holdover_seg_max: 0.12
+  holdover_tail_rms: 0.002
 
 denoiser:
-  enabled: false             # DISABLED — DF streaming state corrupts embeddings (0.90+ vs 0.40 without)
+  enabled: false             # mic → buffer: can shift embeddings vs enrollment; keep off unless you re-enroll
+  # Output DF caused strong block-wise pumping in logs (raw_rms swings); keep off unless you need denoised playback.
+  enhance_enrolled_output: false
   model: DeepFilterNet3      # model variant (DeepFilterNet, DeepFilterNet2, DeepFilterNet3)
 
 server:
