@@ -8,6 +8,10 @@ FastAPI backend that:
   - Runs a rolling-buffer diarization loop in a background thread
   - Broadcasts per-speaker audio + metadata over WebSocket
   - Handles speaker enrollment (record → extract WeSpeaker embedding → save)
+
+Playback continuity (crossfade, holdover, tau_active tuning) is implemented
+inside ``RealtimePipeline.step()`` — this server only feeds fixed-size chunks
+and forwards ``StepResult`` frames; see ``pipeline.py`` module docstring.
 """
 from __future__ import annotations
 

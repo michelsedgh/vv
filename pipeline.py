@@ -18,6 +18,45 @@ Data flow per step
       runs on the instantaneous permuted chunk like DIART)
     → source mapping: per-speaker step audio + activity from aggregated seg
     → [optional] DeepFilterNet on separated audio for enrolled speakers only
+
+Playback quality, “choppiness”, and spectrogram gaps (design notes)
+──────────────────────────────────────────────────────────────────
+Realtime output is one **new 500 ms slice** per global speaker per step, taken
+from the **tail** of the current PixIT separated sources (single 5 s window).
+That slice is **not** the same physical audio as the previous step’s tail:
+PixIT is re-run every step on a sliding buffer, so the separated waveform for
+“the same” speaker **changes** at chunk boundaries.  Short crossfades hide
+that mismatch; they cannot remove model inconsistency entirely.
+
+**What caused audible choppiness / mid-word spectrogram holes (debugged with
+NDJSON logs: XFADE_BOUNDARY, SPK_MAP, EMB_DIST, ENROLLED_HOLDOVER, etc.):**
+
+1. **Empty speaker map** — Clustering only maps locals whose PixIT frame scores
+   pass ``tau_active``.  Scores flicker; valid_assignments() can drop out for a
+   step → **no audio packet** for ~500 ms → spectrogram gaps.  **Mitigations:**
+   slightly lower ``clustering.tau_active`` so “active” is declared more often;
+   **enrolled holdover** in ``step()`` re-attaches enrolled globals to their
+   last PixIT channel when seg peak or tail RMS stays above
+   ``holdover_seg_max`` / ``holdover_tail_rms`` even if the map would be empty.
+
+2. **Large sample discontinuity at chunk joins** — Logs showed discontinuities
+   ~0.10–0.22 and big prev_rms vs raw_rms swings at boundaries.  **Mitigations:**
+   longer overlap ``audio.output_crossfade_ms`` (default 100 ms vs earlier 15–40
+   ms) and a **cosine** crossfade (zero derivative at ends) instead of linear.
+
+3. **DeepFilterNet on separated output** — 500 ms sub-blocks with per-speaker
+   streaming state add **gain/level steps** at block edges (pumping).  Default
+   ``denoiser.enhance_enrolled_output: false`` keeps playback smooth; turn on
+   only if denoised headphones output matters more than continuity.
+
+**What we deliberately do *not* do:** overlap-add of separated waveforms across
+multiple PixIT windows was tried and **reverted** — time alignment between
+windows is not the same as STFT overlap-add; summed tails produced **echo /
+buildup**.  DIART-style aggregation applies to **diarization scores**
+(``DelayedAggregation`` on permuted_seg), not to separated waveforms.
+
+See also: module docstring in ``enrolled_clustering.py`` and comments in
+``config.yaml`` for tunables.
 """
 from __future__ import annotations
 
@@ -68,6 +107,18 @@ class StepResult:
 
 class RealtimePipeline:
     """Real-time speaker diarization + separation pipeline.
+
+    End-to-end responsibilities:
+
+    - Run PixIT on each 5 s chunk; read ``last_sources`` (separated tracks).
+    - Extract WeSpeaker embeddings from **separated** channels (not the mix).
+    - Feed ``EnrolledSpeakerClustering`` for local→global IDs.
+    - Smooth **display / activity** with ``DelayedAggregation`` (Hamming), same
+      role as diar's ``pred_aggregation`` — does not fuse waveforms.
+    - Build per-step **playback audio**: last ``step_samples + fade`` from each
+      mapped source, **cosine crossfade** with previous tail per global speaker.
+    - Optional **enrolled holdover** when clustering drops the map but energy
+      on the persisted channel suggests speech still present.
 
     Parameters
     ----------
@@ -216,17 +267,21 @@ class RealtimePipeline:
         # ── State ──
         self._step_idx = 0
 
-        # Crossfade between consecutive separated chunks (PixIT tail changes each step).
+        # Per-global-speaker crossfade (see module docstring: “Playback quality…”).
+        # Each step we emit step_samples of audio; the first fade_samples overlap
+        # with the previous step’s tail so chunk boundaries are not hard cuts.
+        # Config: audio.output_crossfade_ms (default 100). Capped so we still
+        # advance mostly “new” audio each step; floored ~10 ms for stability.
         acfg = config.get("audio", {})
         _fade_ms = float(acfg.get("output_crossfade_ms", 100.0))
         if self._df_output_enrolled:
-            _fade_ms = max(_fade_ms, 50.0)
+            _fade_ms = max(_fade_ms, 50.0)  # DF on output adds edge dynamics; keep min overlap
         self._fade_samples = min(
             int((_fade_ms / 1000.0) * self.sample_rate),
             self.step_samples - 400,  # keep a floor of usable new audio per step
         )
         self._fade_samples = max(self._fade_samples, 160)  # at least ~10 ms
-        self._prev_tails: Dict[int, np.ndarray] = {}  # global_idx → tail samples
+        self._prev_tails: Dict[int, np.ndarray] = {}  # global_idx → last fade_samples after processing
         log.info(
             "Separated-audio crossfade: %d samples (%.1f ms), cosine ramp",
             self._fade_samples,
@@ -293,7 +348,12 @@ class RealtimePipeline:
         return self._df_output_states[global_idx]
 
     def _enhance_enrolled_audio(self, samples: np.ndarray, global_idx: int) -> np.ndarray:
-        """DeepFilterNet on separated track; chunked like mic path for stable streaming."""
+        """DeepFilterNet on separated track; chunked like mic path for stable streaming.
+
+        Note: 500 ms internal blocks can introduce audible level steps at block
+        edges when this path is enabled — prefer ``enhance_enrolled_output: false``
+        unless denoised playback is required (see module docstring).
+        """
         if (
             not self._df_output_enrolled
             or self._df_model is None
@@ -457,6 +517,16 @@ class RealtimePipeline:
     def step(self, waveform: np.ndarray) -> StepResult:
         """Run one pipeline step on a 5 s audio chunk.
 
+        Output audio path (continuity): ``valid_assignments()`` gives (local,
+        global) pairs.  Enrolled **holdover** may append pairs if an enrolled
+        speaker disappeared from the map but PixIT still shows energy on the
+        last channel we used for them — avoids 500 ms silence holes.
+
+        For each pair we take the last ``step_samples + fade`` samples from
+        ``sources`` for that local index, crossfade the first ``fade`` with
+        ``_prev_tails[global]`` (cosine ramp), optionally run output DF, store
+        new tail, then clip to ``step_samples`` for the client.
+
         Parameters
         ----------
         waveform : np.ndarray, shape (chunk_samples,) or (chunk_samples, 1)
@@ -572,8 +642,10 @@ class RealtimePipeline:
         # #endregion
 
         # ── 4. Map sources to global speakers (single window) ──
-        # Multi-window overlap-add on waveforms was reverted (misaligned indices
-        # caused echo).  DIART aggregates scores, not separated waveforms here.
+        # One PixIT forward per step; we only read the current ``sources`` tail.
+        # Multi-window overlap-add on *waveforms* was reverted: misaligned
+        # windows summed wrong phases → echo/buildup.  DelayedAggregation above
+        # only smooths *segmentation* for activity/UI, not separated audio.
 
         results = []
         clust_cfg = self.cfg["clustering"]
@@ -654,11 +726,14 @@ class RealtimePipeline:
                         _raw_rms = float(np.sqrt(np.mean(raw[:fade]**2)))
                         open('/home/michel/Documents/Voice/.cursor/debug-21cffc.log','a').write(_j.dumps({"sessionId":"21cffc","hypothesisId":"C","location":"pipeline.py:xfade","message":"XFADE_BOUNDARY","data":{"step":self._step_idx,"global_idx":global_idx,"label":label,"discontinuity":round(_disc,5),"prev_rms":round(_prev_rms,5),"raw_rms":round(_raw_rms,5)},"timestamp":int(_t.time()*1000)})+'\n')
                     # #endregion
-                    # Cosine ramp (equal-power-ish): softer than linear at ends → less zipper noise
+                    # Cosine crossfade: ramp = 0.5 - 0.5*cos(0..pi).  Ends have
+                    # zero slope vs linear ramp → less zipper / click at joins
+                    # when PixIT’s separated tail jumps between steps.
                     t = np.linspace(0.0, np.pi, fade, dtype=np.float32)
                     ramp = 0.5 - 0.5 * np.cos(t)
                     raw[:fade] = prev_tail * (1.0 - ramp) + raw[:fade] * ramp
 
+                # DF after crossfade so block boundaries are not misaligned with fade region
                 if self.clustering.is_enrolled(global_idx) and self._df_output_enrolled:
                     raw = self._enhance_enrolled_audio(raw, global_idx)
 

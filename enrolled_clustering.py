@@ -14,6 +14,33 @@ EnrolledSpeakerClustering — extends diart's OnlineSpeakerClustering with:
 5. **Exposed SpeakerMap**: ``last_speaker_map`` is stored after every
    ``__call__`` so the pipeline can map PixIT source channels to global
    speakers.
+
+Continuity with RealtimePipeline (why this file matters for “choppiness”)
+────────────────────────────────────────────────────────────────────────
+- **tau_active** (config ``clustering.tau_active``): a local PixIT channel is
+  “active” only if max frame score ≥ tau.  If tau is high, channels drop in and
+  out → ``valid_assignments()`` shrinks → pipeline may emit no audio for a step.
+  Lower tau (e.g. 0.28 vs 0.4) reduces empty-map steps; pipeline **holdover**
+  (see ``pipeline.py``) covers the remaining flicker for enrolled speakers only.
+
+- **Grace period** (``_grace_steps``, ``_last_enrolled_step``): for a window
+  after an enrolled match, ``delta_enrolled`` is multiplied by **1.4** so brief
+  silence→speech transitions do not lose the enrolled ID.
+
+- **Channel persistence** (``_last_local_for_enrolled``): when several locals
+  are within threshold of the same enrolled anchor, we prefer the **same**
+  PixIT channel as last step.  Switching channels every 500 ms caused audible
+  discontinuities and unstable maps; persistence aligns with the pipeline’s
+  per-global crossfade state.
+
+- **Enrolled leakage suppression**: active locals that are still within
+  ``delta_enrolled`` of an enrolled anchor but **lost** the greedy enrolled pass
+  are treated as duplicate/leakage of that voice on a secondary separation
+  channel — they are blocked from general matching so one enrolled speaker does
+  not split into two globals or steal unknown slots.
+
+Debug instrumentation in ``identify()`` writes NDJSON (e.g. ENROLLED_DISTS,
+ENROLLED_MATCH, ENROLLED_LEAKAGE) for session analysis; do not log secrets.
 """
 from __future__ import annotations
 

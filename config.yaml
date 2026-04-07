@@ -1,5 +1,22 @@
 # ─── Voice ID: Real-Time Diarization & Separation ─────────────────
-# PixIT (ToTaToNet) + WeSpeaker + diart clustering components
+# Stack: [optional mic DF] → PixIT (5 s chunk, 0.5 s step) → WeSpeaker on
+# separated sources → EnrolledSpeakerClustering → DelayedAggregation on
+# permuted diarization → per-speaker tail extract + crossfade → [optional DF on output].
+#
+# Smooth playback / fewer spectrogram holes (tune in this order):
+#   • audio.output_crossfade_ms — overlap at step boundaries; longer (e.g. 100)
+#     reduces zipper when PixIT tails disagree between steps (see pipeline.py).
+#   • clustering.tau_active — lower ⇒ more “active” locals ⇒ fewer empty maps;
+#     too low adds noise; ~0.28 was a good tradeoff vs 0.4.
+#   • clustering.holdover_* — keep enrolled audio on last PixIT channel when
+#     seg flickers below tau but tail energy remains (pipeline holdover block).
+#   • denoiser.enhance_enrolled_output — default false; true can add 500 ms
+#     block pumping on separated playback.
+#   • pixit.aggregation_latency_sec — Hamming fusion of diarization frames for
+#     activity smoothing (not waveform OA); must be >= step.
+#
+# Implementation details and log-backed root-cause notes: pipeline.py module
+# docstring; clustering behavior: enrolled_clustering.py module docstring.
 
 audio:
   device_index: 0          # sounddevice input device (IC800 USB mic)
