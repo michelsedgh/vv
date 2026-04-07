@@ -12,7 +12,6 @@ FastAPI backend that:
 from __future__ import annotations
 
 import asyncio
-import base64
 import json
 import logging
 import struct
@@ -84,6 +83,7 @@ class MonitorState:
 
 monitor = MonitorState()
 ws_clients: Set[WebSocket] = set()
+AUDIO_PACKET_MAGIC = b"VAUD"
 
 
 # ─── Enrollment helpers ───────────────────────────────────────────
@@ -140,6 +140,27 @@ def ws_broadcast(data: dict):
         asyncio.run_coroutine_threadsafe(_ws_broadcast(msg), loop)
 
 
+async def _ws_broadcast_diarization(message: str, audio_packets: list[bytes]):
+    dead = set()
+    for ws in ws_clients:
+        try:
+            await ws.send_text(message)
+            for packet in audio_packets:
+                await ws.send_bytes(packet)
+        except Exception:
+            dead.add(ws)
+    ws_clients.difference_update(dead)
+
+
+def ws_broadcast_diarization(data: dict, audio_packets: list[bytes]):
+    """Broadcast diarization metadata followed by binary audio packets."""
+    if loop is not None:
+        asyncio.run_coroutine_threadsafe(
+            _ws_broadcast_diarization(json.dumps(data), audio_packets),
+            loop,
+        )
+
+
 def ws_event(event_type: str, **kwargs):
     """Send a system event to all WebSocket clients."""
     ws_broadcast({"type": event_type, **kwargs})
@@ -165,6 +186,24 @@ def _trim_live_buffer(
     if len(audio_buffer) <= keep:
         return audio_buffer
     return audio_buffer[-keep:].copy()
+
+
+def _pack_audio_packet(
+    step_idx: int,
+    speaker_id: int,
+    sample_rate: int,
+    audio_i16: np.ndarray,
+) -> bytes:
+    """Pack a speaker audio chunk into a binary websocket frame."""
+    header = struct.pack(
+        "<4sIIII",
+        AUDIO_PACKET_MAGIC,
+        int(step_idx),
+        int(speaker_id),
+        int(sample_rate),
+        int(len(audio_i16)),
+    )
+    return header + audio_i16.tobytes()
 
 
 # ─── Diarization monitor ─────────────────────────────────────────
@@ -238,26 +277,29 @@ def _run_diarization_monitor():
         monitor.last_infer_ms = result.infer_ms
 
         speakers_data = []
+        audio_packets = []
         for sp in result.speakers:
             audio_i16 = np.clip(sp.audio * 32767, -32768, 32767).astype(np.int16)
-            audio_b64 = base64.b64encode(audio_i16.tobytes()).decode("ascii")
+            speaker_id = int(sp.global_idx)
             speakers_data.append({
-                "id": int(sp.global_idx),
+                "id": speaker_id,
                 "label": str(sp.label),
                 "active": bool(sp.activity > cfg["clustering"]["tau_active"]),
                 "activity": round(float(sp.activity), 3),
                 "enrolled": bool(sp.is_enrolled),
-                "audio": audio_b64,
             })
+            audio_packets.append(
+                _pack_audio_packet(result.step_idx, speaker_id, sample_rate, audio_i16)
+            )
 
-        ws_broadcast({
+        ws_broadcast_diarization({
             "type": "diarization",
             "speakers": speakers_data,
             "step": result.step_idx,
             "infer_ms": round(result.infer_ms, 1),
             "sample_rate": sample_rate,
             "samples": pipeline.step_samples,
-        })
+        }, audio_packets)
 
     try:
         while not monitor.stop_event.is_set():

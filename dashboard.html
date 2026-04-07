@@ -139,6 +139,8 @@ const COLORS = [
 ];
 const AUDIO_LOOKAHEAD_SEC = 0.12;
 const AUDIO_MAX_BUFFER_SEC = 0.75;
+const AUDIO_PACKET_HEADER_BYTES = 20;
+const AUDIO_PACKET_MAGIC = 'VAUD';
 
 // ─── Diarization Timeline State ──────────────────────────────────
 const timeline = {
@@ -156,6 +158,7 @@ let wsPingTimer = null;
 function connectWS() {
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
   ws = new WebSocket(`${proto}://${location.host}/ws/live`);
+  ws.binaryType = 'arraybuffer';
 
   ws.onopen = () => {
     logEvent('WebSocket connected');
@@ -177,8 +180,12 @@ function connectWS() {
   };
 
   ws.onmessage = (e) => {
-    try { handleMessage(JSON.parse(e.data)); }
-    catch (err) { console.error('WS parse error:', err); }
+    if (typeof e.data === 'string') {
+      try { handleMessage(JSON.parse(e.data)); }
+      catch (err) { console.error('WS parse error:', err); }
+      return;
+    }
+    handleAudioPacket(e.data);
   };
 }
 
@@ -191,7 +198,7 @@ function handleMessage(msg) {
     const activeIds = new Set();
     for (const sp of msg.speakers) {
       activeIds.add(sp.id);
-      updateSpeakerLane(sp, msg.sample_rate, msg.samples);
+      updateSpeakerLane(sp);
     }
     // Mark inactive lanes
     for (const [id, lane] of Object.entries(speakerLanes)) {
@@ -234,6 +241,7 @@ function createSpeakerLane(sp) {
   const id = sp.id;
   const color = COLORS[id % COLORS.length];
   const initial = sp.label.charAt(0).toUpperCase();
+  const defaultMuted = !sp.enrolled;
 
   const div = document.createElement('div');
   div.className = 'speaker-lane bg-slate-800/70 rounded-xl p-3 border border-slate-700 flex items-center gap-3';
@@ -244,7 +252,7 @@ function createSpeakerLane(sp) {
     <div class="flex-1 min-w-0">
       <div class="flex items-center gap-2 mb-1">
         <span class="font-semibold text-sm text-white truncate">${sp.label}</span>
-        ${sp.enrolled ? '<span class="text-[10px] px-1.5 py-0.5 rounded bg-emerald-900 text-emerald-400">enrolled</span>' : '<span class="text-[10px] px-1.5 py-0.5 rounded bg-slate-700 text-slate-400">unknown</span>'}
+        ${sp.enrolled ? '<span class="speaker-badge text-[10px] px-1.5 py-0.5 rounded bg-emerald-900 text-emerald-400">enrolled</span>' : '<span class="speaker-badge text-[10px] px-1.5 py-0.5 rounded bg-slate-700 text-slate-400">unknown</span>'}
         <span class="activity-pct text-[10px] text-slate-500 ml-auto">0%</span>
       </div>
       <canvas class="waveform w-full rounded" height="40" style="background:#1e293b"></canvas>
@@ -252,7 +260,7 @@ function createSpeakerLane(sp) {
     <div class="flex flex-col items-center gap-1" style="min-width:60px">
       <input type="range" min="0" max="100" value="80" class="vol-slider w-14 h-1 accent-slate-400"
              oninput="setVolume(${id}, this.value)">
-      <button class="text-[10px] text-slate-500 hover:text-white mute-btn" onclick="toggleMute(${id})">mute</button>
+      <button class="text-[10px] text-slate-500 hover:text-white mute-btn" onclick="toggleMute(${id})">${defaultMuted ? 'unmute' : 'mute'}</button>
     </div>
   `;
 
@@ -267,7 +275,7 @@ function createSpeakerLane(sp) {
   let gainNode = null;
   if (audioCtx) {
     gainNode = audioCtx.createGain();
-    gainNode.gain.value = 0.8;
+    gainNode.gain.value = defaultMuted ? 0 : 0.8;
     gainNode.connect(audioCtx.destination);
   }
 
@@ -278,27 +286,50 @@ function createSpeakerLane(sp) {
     gainNode: gainNode,
     color: color,
     waveformBuf: new Float32Array(0),
-    muted: false,
+    muted: defaultMuted,
+    autoMuted: defaultMuted,
+    enrolled: !!sp.enrolled,
     nextPlayTime: 0,  // scheduled AudioContext time for gapless playback
   };
 
+  refreshLaneMuteUI(speakerLanes[id]);
   return speakerLanes[id];
 }
 
-function decodePcm16Base64(b64) {
-  const raw = atob(b64);
-  const bytes = new Uint8Array(raw.length);
-  for (let i = 0; i < raw.length; i++) bytes[i] = raw.charCodeAt(i);
-  const i16 = new Int16Array(bytes.buffer);
+function refreshLaneMuteUI(lane) {
+  const btn = lane.element.querySelector('.mute-btn');
+  btn.textContent = lane.muted ? 'unmute' : 'mute';
+  btn.classList.toggle('text-red-400', lane.muted);
+  if (lane.gainNode) {
+    const slider = lane.element.querySelector('.vol-slider');
+    lane.gainNode.gain.value = lane.muted ? 0 : (slider.value / 100);
+  }
+}
+
+function decodePcm16(i16) {
   const f32 = new Float32Array(i16.length);
   for (let i = 0; i < i16.length; i++) f32[i] = i16[i] / 32768;
   return f32;
 }
 
-function updateSpeakerLane(sp, sampleRate, numSamples) {
+function updateSpeakerLane(sp) {
   let lane = speakerLanes[sp.id];
   if (!lane) {
     lane = createSpeakerLane(sp);
+  }
+
+  lane.enrolled = !!sp.enrolled;
+  const badge = lane.element.querySelector('.speaker-badge');
+  if (badge) {
+    badge.textContent = sp.enrolled ? 'enrolled' : 'unknown';
+    badge.className = sp.enrolled
+      ? 'speaker-badge text-[10px] px-1.5 py-0.5 rounded bg-emerald-900 text-emerald-400'
+      : 'speaker-badge text-[10px] px-1.5 py-0.5 rounded bg-slate-700 text-slate-400';
+  }
+  if (sp.enrolled && lane.autoMuted) {
+    lane.muted = false;
+    lane.autoMuted = false;
+    refreshLaneMuteUI(lane);
   }
 
   // Active state
@@ -315,30 +346,50 @@ function updateSpeakerLane(sp, sampleRate, numSamples) {
 
   // Activity percentage
   lane.element.querySelector('.activity-pct').textContent = Math.round(sp.activity * 100) + '%';
+}
 
-  // Decode audio
-  if (sp.audio && sp.audio.length > 0) {
-    const f32 = decodePcm16Base64(sp.audio);
+function appendSpeakerAudio(speakerId, f32, sampleRate) {
+  const lane = speakerLanes[speakerId];
+  if (!lane) return;
 
-    // Append to waveform buffer (keep last ~3s)
-    const maxSamples = sampleRate * 3;
-    const combined = new Float32Array(lane.waveformBuf.length + f32.length);
-    combined.set(lane.waveformBuf);
-    combined.set(f32, lane.waveformBuf.length);
-    lane.waveformBuf = combined.length > maxSamples
-      ? combined.slice(combined.length - maxSamples)
-      : combined;
+  const maxSamples = sampleRate * 3;
+  const combined = new Float32Array(lane.waveformBuf.length + f32.length);
+  combined.set(lane.waveformBuf);
+  combined.set(f32, lane.waveformBuf.length);
+  lane.waveformBuf = combined.length > maxSamples
+    ? combined.slice(combined.length - maxSamples)
+    : combined;
 
-    // Draw waveform
-    drawWaveform(lane);
+  drawWaveform(lane);
 
-    // Play every emitted chunk for this mapped speaker. The backend already
-    // decides which speaker streams exist; hard muting on a per-step activity
-    // threshold was chopping off low-confidence onsets and offsets.
-    if (audioCtx && lane.gainNode && !lane.muted) {
-      playAudio(f32, sampleRate, lane);
-    }
+  if (audioCtx && lane.gainNode && !lane.muted) {
+    playAudio(f32, sampleRate, lane);
   }
+}
+
+function handleAudioPacket(buffer) {
+  if (!(buffer instanceof ArrayBuffer) || buffer.byteLength < AUDIO_PACKET_HEADER_BYTES) {
+    return;
+  }
+  const view = new DataView(buffer);
+  const magic = String.fromCharCode(
+    view.getUint8(0), view.getUint8(1), view.getUint8(2), view.getUint8(3)
+  );
+  if (magic !== AUDIO_PACKET_MAGIC) {
+    return;
+  }
+
+  const speakerId = view.getUint32(8, true);
+  const sampleRate = view.getUint32(12, true);
+  const numSamples = view.getUint32(16, true);
+  const pcmBytes = numSamples * 2;
+  if (buffer.byteLength < AUDIO_PACKET_HEADER_BYTES + pcmBytes) {
+    return;
+  }
+
+  const i16 = new Int16Array(buffer, AUDIO_PACKET_HEADER_BYTES, numSamples);
+  const f32 = decodePcm16(i16);
+  appendSpeakerAudio(speakerId, f32, sampleRate);
 }
 
 function drawWaveform(lane) {
@@ -400,20 +451,16 @@ function playAudio(f32, sampleRate, lane) {
 function setVolume(id, val) {
   const lane = speakerLanes[id];
   if (lane && lane.gainNode) {
-    lane.gainNode.gain.value = val / 100;
+    lane.gainNode.gain.value = lane.muted ? 0 : val / 100;
   }
 }
 
 function toggleMute(id) {
   const lane = speakerLanes[id];
   if (!lane) return;
+  lane.autoMuted = false;
   lane.muted = !lane.muted;
-  const btn = lane.element.querySelector('.mute-btn');
-  btn.textContent = lane.muted ? 'unmute' : 'mute';
-  btn.classList.toggle('text-red-400', lane.muted);
-  if (lane.gainNode) {
-    lane.gainNode.gain.value = lane.muted ? 0 : (lane.element.querySelector('.vol-slider').value / 100);
-  }
+  refreshLaneMuteUI(lane);
 }
 
 // ─── Controls ────────────────────────────────────────────────────
