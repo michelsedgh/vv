@@ -60,9 +60,9 @@ See also: module docstring in ``enrolled_clustering.py`` and comments in
 """
 from __future__ import annotations
 
-import json
 import logging
 import time
+from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -141,11 +141,7 @@ class RealtimePipeline:
     ):
         self.cfg = config
         _dbg = config.get("debug", {})
-        self._agent_ndjson = bool(_dbg.get("session_ndjson", True))
-        self._step_perf_log = bool(_dbg.get("step_perf_log", True))
-        self._agent_ndjson_path = (
-            "/home/michel/Documents/Voice/.cursor/debug-21cffc.log"
-        )
+        self._step_perf_log = bool(_dbg.get("step_perf_log", False))
         self.device = torch.device(config["device"])
         self.sample_rate: int = config["audio"]["sample_rate"]
 
@@ -667,36 +663,6 @@ class RealtimePipeline:
                      name, "DF→" if self._denoiser_enabled else "", len(emb))
         return reextracted
 
-    def _agent_ndjson_append(
-        self, hypothesis_id: str, location: str, message: str, data: dict
-    ) -> None:
-        if not self._agent_ndjson:
-            return
-        rec = {
-            "sessionId": "21cffc",
-            "hypothesisId": hypothesis_id,
-            "location": location,
-            "message": message,
-            "data": data,
-            "timestamp": int(time.time() * 1000),
-        }
-        with open(self._agent_ndjson_path, "a", encoding="utf-8") as _f:
-            _f.write(json.dumps(rec) + "\n")
-
-    def _perf_log_append(self, data: dict) -> None:
-        if not self._step_perf_log:
-            return
-        rec = {
-            "sessionId": "21cffc",
-            "hypothesisId": "H9",
-            "location": "pipeline.py:step",
-            "message": "STEP_PERF",
-            "data": data,
-            "timestamp": int(time.time() * 1000),
-        }
-        with open(self._agent_ndjson_path, "a", encoding="utf-8") as _f:
-            _f.write(json.dumps(rec) + "\n")
-
     def step(self, waveform: np.ndarray) -> StepResult:
         """Run one pipeline step on a 5 s audio chunk.
 
@@ -814,10 +780,20 @@ class RealtimePipeline:
                 source_stats[spk_idx]["has_embedding"] = True
                 prepared_sources.append((spk_idx, prepared))
 
-            for spk_idx, prepared in prepared_sources:
-                emb = self._emb_model(prepared)  # (1, emb_dim)
-                emb = emb / emb.norm(dim=-1, keepdim=True).clamp(min=1e-8)
-                embeddings[spk_idx] = emb.squeeze(0).cpu()
+        # One WeSpeaker forward per unique prepared length (avoids padding short lanes
+        # to 5 s when another local uses full-buffer fallback).
+        by_len: Dict[int, List[tuple[int, torch.Tensor]]] = defaultdict(list)
+        for spk_idx, prepared in prepared_sources:
+            by_len[int(prepared.shape[-1])].append((spk_idx, prepared))
+
+        with torch.inference_mode():
+            for _L in sorted(by_len.keys()):
+                items = by_len[_L]
+                batch = torch.cat([p for _, p in items], dim=0)
+                embs = self._emb_model(batch)
+                embs = embs / embs.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+                for i, (spk_idx, _) in enumerate(items):
+                    embeddings[spk_idx] = embs[i].cpu()
 
         t3 = tc()
         # ── 3. Clustering ──
@@ -864,7 +840,6 @@ class RealtimePipeline:
         # radius to the anchor, then keep one stream per enrolled global (loudest tail).
         if self.clustering._anchors:
             emb_np = embeddings.detach().cpu().numpy()
-            _remap_meta: List[dict] = []
 
             def _tail_rms(lc: int) -> float:
                 return float(step_tail_rms_np[int(lc)])
@@ -898,14 +873,6 @@ class RealtimePipeline:
                         continue
                     if g_cur is not None:
                         pair_list = [(l, g) for l, g in pair_list if l != loc]
-                        _remap_meta.append(
-                            {
-                                "loc": int(loc),
-                                "from_g": int(g_cur),
-                                "to_g": int(g_anchor),
-                                "d": round(d, 4),
-                            }
-                        )
                     pair_list.append((loc, g_anchor))
                     loc_to_g[loc] = g_anchor
 
@@ -913,42 +880,18 @@ class RealtimePipeline:
             for l, g in pair_list:
                 by_g.setdefault(int(g), []).append(int(l))
             deduped: List[tuple[int, int]] = []
-            _drop_meta: List[dict] = []
             for g, locs in by_g.items():
                 if len(locs) == 1:
                     deduped.append((locs[0], g))
                     continue
                 if self.clustering.is_enrolled(g):
                     best = max(locs, key=_tail_rms)
-                    for lc in locs:
-                        if lc != best:
-                            _drop_meta.append(
-                                {
-                                    "loc": int(lc),
-                                    "g": int(g),
-                                    "kept": int(best),
-                                }
-                            )
                     deduped.append((best, g))
                 else:
                     for lc in locs:
                         deduped.append((lc, g))
             pairs = deduped
             used_local = {l for l, _ in pairs}
-
-            # #region agent log
-            if _remap_meta or _drop_meta:
-                self._agent_ndjson_append(
-                    "H6",
-                    "pipeline.py:enroll_reconcile",
-                    "ENROLL_REMAP",
-                    {
-                        "step": self._step_idx,
-                        "remaps": _remap_meta,
-                        "enrolled_dedup_drops": _drop_meta,
-                    },
-                )
-            # #endregion
 
         # Enrolled holdover: clustering uses max(seg)>=tau_active; PixIT scores flicker
         # frame-to-frame so the map can be empty while the separated channel still has
@@ -966,42 +909,11 @@ class RealtimePipeline:
                 if loc is None or loc in used_local:
                     continue
                 if source_stats[loc]["has_embedding"]:
-                    # #region agent log
-                    if self._agent_ndjson and self._step_idx % 4 == 0:
-                        self._agent_ndjson_append(
-                            "H5",
-                            "pipeline.py:holdover",
-                            "HOLDOVER_SKIP_HAS_EMB",
-                            {
-                                "step": self._step_idx,
-                                "global": int(g_idx),
-                                "loc": int(loc),
-                                "in_pairs_already": any(
-                                    g == g_idx for _, g in pairs
-                                ),
-                            },
-                        )
-                    # #endregion
                     continue
                 if (
                     self._holdover_no_emb_max_steps > 0
                     and gap > self._holdover_no_emb_max_steps
                 ):
-                    # #region agent log
-                    if self._agent_ndjson and self._step_idx % 4 == 0:
-                        self._agent_ndjson_append(
-                            "H4",
-                            "pipeline.py:holdover",
-                            "HOLDOVER_BLOCKED_IDLE",
-                            {
-                                "step": self._step_idx,
-                                "global": int(g_idx),
-                                "steps_since_match": gap,
-                                "hmax": int(self._holdover_no_emb_max_steps),
-                                "path": "no_embedding_cap",
-                            },
-                        )
-                    # #endregion
                     continue
                 smax = float(np.max(seg_np[:, loc]))
                 t_rms = float(step_tail_rms_np[int(loc)])
@@ -1009,32 +921,10 @@ class RealtimePipeline:
                     continue
                 pairs.append((loc, g_idx))
                 used_local.add(loc)
-                # #region agent log
-                if self._agent_ndjson and self._step_idx % 2 == 0:
-                    self._agent_ndjson_append(
-                        "H2",
-                        "pipeline.py:holdover",
-                        "HOLDOVER_ADD",
-                        {
-                            "step": self._step_idx,
-                            "global": int(g_idx),
-                            "loc": int(loc),
-                            "smax": round(smax, 4),
-                            "tail_rms": round(t_rms, 5),
-                            "steps_since_enrolled_match": int(
-                                self.clustering._call_count
-                                - self.clustering._last_enrolled_step.get(
-                                    g_idx, -999
-                                )
-                            ),
-                        },
-                    )
-                # #endregion
 
         # Drop weak Unknown-* streams: logs showed [[2,1]] with smx≈0.29 right at
         # tau_active (0.28) — phantom lanes before real speech. Enrolled unaffected.
         if self._unknown_emit_min_seg_max > 0:
-            _pairs_before = len(pairs)
             pairs = [
                 (l, g)
                 for l, g in pairs
@@ -1043,67 +933,8 @@ class RealtimePipeline:
                 >= self._unknown_emit_min_seg_max
             ]
             used_local = {l for l, _ in pairs}
-            if _pairs_before > len(pairs):
-                # #region agent log
-                self._agent_ndjson_append(
-                    "H8",
-                    "pipeline.py:unknown_filter",
-                    "UNKNOWN_PAIR_DROP",
-                    {
-                        "step": self._step_idx,
-                        "before": int(_pairs_before),
-                        "after": int(len(pairs)),
-                        "min_smx": float(self._unknown_emit_min_seg_max),
-                    },
-                )
-                # #endregion
 
         t5 = tc()
-        # #region agent log
-        if self._agent_ndjson and (
-            self._step_idx % 2 == 0 or len(pairs) == 0
-        ):
-            _locals = []
-            for i in range(self.n_local_speakers):
-                _locals.append(
-                    {
-                        "loc": i,
-                        "emb": bool(source_stats[i]["has_embedding"]),
-                        "vs": round(float(source_stats[i]["voiced_sec"]), 4),
-                        "smx": round(float(np.max(seg_np[:, i])), 4),
-                        "act": bool(active_mask[i]),
-                    }
-                )
-            _ho_meta = []
-            if self.clustering._anchors:
-                for _g in sorted(self.clustering._anchors.keys()):
-                    _ls = self.clustering._last_enrolled_step.get(_g, -999)
-                    _ho_meta.append(
-                        {
-                            "g": int(_g),
-                            "call_at_last_match": int(_ls),
-                            "steps_since": int(self.clustering._call_count - _ls),
-                            "prev_loc": self.clustering._last_local_for_enrolled.get(_g),
-                        }
-                    )
-            self._agent_ndjson_append(
-                "H1",
-                "pipeline.py:step",
-                "STEP_PAIRS",
-                {
-                    "step": self._step_idx,
-                    "call": self.clustering._call_count,
-                    "n_pairs": len(pairs),
-                    "pairs": [[int(a), int(b)] for a, b in pairs],
-                    "locals": _locals,
-                    "holdover": _ho_meta,
-                    "hmax_steps": int(self._holdover_max_steps),
-                    "holdover_no_emb_cap": int(self._holdover_no_emb_max_steps),
-                },
-            )
-        # #endregion
-
-        t6 = tc()
         if pairs:
             fade = self._fade_samples
             extract_len = self.step_samples + fade
@@ -1151,20 +982,6 @@ class RealtimePipeline:
                         prev_e < self._xfade_onset_prev_rms
                         and new_e > self._xfade_onset_new_rms
                     ):
-                        # #region agent log
-                        if self._agent_ndjson and self._step_idx % 4 == 0:
-                            self._agent_ndjson_append(
-                                "H7",
-                                "pipeline.py:xfade",
-                                "XFADE_SKIP_ONSET",
-                                {
-                                    "step": self._step_idx,
-                                    "g": int(global_idx),
-                                    "prev_rms": round(prev_e, 5),
-                                    "new_rms": round(new_e, 5),
-                                },
-                            )
-                        # #endregion
                         prev_tail = None
                     else:
                         do_xfade = True
@@ -1193,23 +1010,22 @@ class RealtimePipeline:
                     identity_similarity=id_sim,
                 ))
 
-        t7 = tc()
+        t6 = tc()
         self._step_idx += 1
         infer_ms = (time.perf_counter() - t0) * 1000
         if self._step_perf_log and (_si % 6 == 0 or infer_ms > 300.0):
-            self._perf_log_append(
-                {
-                    "step": int(_si),
-                    "infer_ms": round(infer_ms, 1),
-                    "ms_pixit": round((t1 - t0) * 1000, 1),
-                    "ms_h2d_seg_tail": round((t2 - t1) * 1000, 1),
-                    "ms_embed": round((t3 - t2) * 1000, 1),
-                    "ms_cluster_agg": round((t4 - t3) * 1000, 1),
-                    "ms_map": round((t5 - t4) * 1000, 1),
-                    "ms_dbglog": round((t6 - t5) * 1000, 1),
-                    "ms_extract": round((t7 - t6) * 1000, 1),
-                    "n_pairs": int(len(pairs)),
-                }
+            log.info(
+                "STEP_PERF step=%d infer_ms=%.1fms pixit=%.1f h2d_seg_tail=%.1f "
+                "embed=%.1f cluster_agg=%.1f map=%.1f extract=%.1f n_pairs=%d",
+                _si,
+                infer_ms,
+                (t1 - t0) * 1000,
+                (t2 - t1) * 1000,
+                (t3 - t2) * 1000,
+                (t4 - t3) * 1000,
+                (t5 - t4) * 1000,
+                (t6 - t5) * 1000,
+                len(pairs),
             )
 
         return StepResult(
