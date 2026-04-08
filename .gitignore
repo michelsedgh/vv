@@ -11,3 +11,10 @@ constraints_orin.txt
 
 # Enrollment audio (local only)
 enrolled_speakers/**/*.wav
+
+# Editor / IDE (machine-local)
+.cursor/
+
+# TensorRT / ONNX engines built locally (large binaries)
+engines/**/*.onnx
+engines/**/*.engine
