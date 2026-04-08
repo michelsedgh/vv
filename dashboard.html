@@ -141,6 +141,8 @@ const AUDIO_LOOKAHEAD_SEC = 0.12;
 const AUDIO_MAX_BUFFER_SEC = 0.75;
 const AUDIO_PACKET_HEADER_BYTES = 20;
 const AUDIO_PACKET_MAGIC = 'VAUD';
+const UNKNOWN_LANE_STALE_STEPS = 8;
+let currentStep = 0;
 
 // ─── Diarization Timeline State ──────────────────────────────────
 const timeline = {
@@ -191,6 +193,7 @@ function connectWS() {
 
 function handleMessage(msg) {
   if (msg.type === 'diarization') {
+    currentStep = msg.step || 0;
     document.getElementById('stat-step').textContent = msg.step;
     document.getElementById('stat-infer').textContent = msg.infer_ms;
 
@@ -208,6 +211,7 @@ function handleMessage(msg) {
         lane.element.querySelector('.glow-dot').classList.add('off');
       }
     }
+    pruneStaleUnknownLanes(currentStep);
     // Hide placeholder
     const placeholder = document.getElementById('no-speakers-msg');
     if (msg.speakers.length > 0 && placeholder) placeholder.style.display = 'none';
@@ -293,6 +297,7 @@ function createSpeakerLane(sp) {
     autoMuted: defaultMuted,
     enrolled: !!sp.enrolled,
     nextPlayTime: 0,  // scheduled AudioContext time for gapless playback
+    lastSeenStep: currentStep,
   };
 
   refreshLaneMuteUI(speakerLanes[id]);
@@ -322,6 +327,7 @@ function updateSpeakerLane(sp) {
   }
 
   lane.enrolled = !!sp.enrolled;
+  lane.lastSeenStep = currentStep;
   const badge = lane.element.querySelector('.speaker-badge');
   if (badge) {
     badge.textContent = sp.enrolled ? 'enrolled' : 'unknown';
@@ -355,6 +361,16 @@ function updateSpeakerLane(sp) {
     line += ' · ' + idPct + '% ID';
   }
   lane.element.querySelector('.activity-pct').textContent = line;
+}
+
+function pruneStaleUnknownLanes(step) {
+  for (const [id, lane] of Object.entries(speakerLanes)) {
+    if (lane.enrolled) continue;
+    if (step - (lane.lastSeenStep || 0) < UNKNOWN_LANE_STALE_STEPS) continue;
+    if (lane.gainNode) lane.gainNode.disconnect();
+    lane.element.remove();
+    delete speakerLanes[id];
+  }
 }
 
 function appendSpeakerAudio(speakerId, f32, sampleRate) {

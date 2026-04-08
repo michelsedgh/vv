@@ -6,7 +6,7 @@ EnrolledSpeakerClustering — extends diart's OnlineSpeakerClustering with:
 2. **Frozen enrolled centroids**: enrolled centroids are NEVER updated — they
    always stay at their enrollment anchor.
 3. **Enrolled-priority identify()**: enrolled speakers are matched FIRST using
-   a lenient ``delta_enrolled`` threshold *before* the general distance map
+   ``delta_enrolled`` *before* the general distance map
    is computed for remaining speakers.  This prevents unknown centroids from
    stealing enrolled identities.
 4. **Label mapping**: ``get_label(global_idx)`` returns the enrolled speaker
@@ -23,21 +23,23 @@ Continuity with RealtimePipeline (why this file matters for “choppiness”)
   Lower tau (e.g. 0.28 vs 0.4) reduces empty-map steps; pipeline **holdover**
   (see ``pipeline.py``) covers the remaining flicker for enrolled speakers only.
 
-- **Grace period** (``_grace_steps``, ``_last_enrolled_step``): for a window
-  after an enrolled match, ``delta_enrolled`` is multiplied by **1.4** so brief
-  silence→speech transitions do not lose the enrolled ID.
+- **Grace period** (``_grace_steps``, ``_last_enrolled_step``): for a short
+  window after an enrolled match, only the **previously used local channel**
+  gets a small extra distance margin so brief silence→speech transitions do not
+  lose the enrolled ID.
 
 - **Channel persistence** (``_last_local_for_enrolled``): when several locals
   are within threshold of the same enrolled anchor, we prefer the **same**
-  PixIT channel as last step.  Switching channels every 500 ms caused audible
+  PixIT channel as last step.  Otherwise we choose the **closest** candidate,
+  not merely the loudest one.  Switching channels every 500 ms caused audible
   discontinuities and unstable maps; persistence aligns with the pipeline’s
   per-global crossfade state.
 
-- **Enrolled leakage suppression**: active locals that are still within
-  ``delta_enrolled`` of an enrolled anchor but **lost** the greedy enrolled pass
-  are treated as duplicate/leakage of that voice on a secondary separation
-  channel — they are blocked from general matching so one enrolled speaker does
-  not split into two globals or steal unknown slots.
+- **Enrolled leakage suppression**: active locals that are still within a
+  **stricter duplicate threshold** of an enrolled anchor but **lost** the
+  greedy enrolled pass are treated as duplicate/leakage of that voice on a
+  secondary separation channel — they are blocked from general matching so one
+  enrolled speaker does not split into two globals or steal unknown slots.
 """
 from __future__ import annotations
 
@@ -89,22 +91,39 @@ class EnrolledSpeakerClustering(OnlineSpeakerClustering):
         max_speakers: int = 8,
         max_drift: float = 0.0,   # kept for config compat, unused
         delta_enrolled: float = 0.80,
+        enrolled_grace_margin: float = 0.05,
+        leakage_delta: Optional[float] = None,
+        new_center_grace_margin: float = 0.05,
+        unknown_reuse_delta: Optional[float] = None,
+        unknown_min_voiced_sec: float = 0.18,
     ):
         super().__init__(tau_active, rho_update, delta_new, metric, max_speakers)
         self.delta_enrolled = delta_enrolled
+        self.enrolled_grace_margin = enrolled_grace_margin
+        self.leakage_delta = (
+            leakage_delta if leakage_delta is not None
+            else min(delta_enrolled, delta_new)
+        )
+        self.new_center_grace_margin = new_center_grace_margin
+        self.unknown_reuse_delta = (
+            unknown_reuse_delta if unknown_reuse_delta is not None
+            else max(delta_new, min(delta_enrolled, delta_new + 0.10))
+        )
+        self.unknown_min_voiced_sec = unknown_min_voiced_sec
 
         # Enrollment state
         self._anchors: Dict[int, np.ndarray] = {}      # global_idx → L2-normed anchor
         self._labels: Dict[int, str] = {}               # global_idx → speaker name
         self._unknown_counter: int = 0
+        self._current_source_stats: Optional[list[dict]] = None
 
         # Populated after every __call__
         self.last_speaker_map: Optional[SpeakerMap] = None
         self._call_count: int = 0
 
         # Grace period: track when each enrolled speaker was last matched.
-        # During a grace window after the last match, use a relaxed threshold
-        # so that silence→speech transitions don't lose the enrolled speaker.
+        # During a grace window after the last match, only the previously used
+        # local channel gets a small extra distance margin.
         self._last_enrolled_step: Dict[int, int] = {}   # g_idx → call_count
         self._grace_steps: int = 20                      # ~10 s at 0.5 s step
 
@@ -133,8 +152,8 @@ class EnrolledSpeakerClustering(OnlineSpeakerClustering):
             idx = self.add_center(emb)
             self._anchors[idx] = emb.copy()
             self._labels[idx] = name
-            # Seed grace period so the first few steps use the relaxed
-            # threshold (live embeddings are always noisier at startup).
+            # Seed grace period so the first few steps can reuse the initial
+            # local channel with a small extra margin.
             self._last_enrolled_step[idx] = 0
 
     # ─── Labels ──────────────────────────────────────────────────
@@ -172,6 +191,18 @@ class EnrolledSpeakerClustering(OnlineSpeakerClustering):
             if g_spk in self._anchors:
                 continue   # never update enrolled centroids
             self.centers[g_spk] += embeddings[l_spk]
+
+    def _in_grace(self, anchor_idx: int) -> bool:
+        steps_since = self._call_count - self._last_enrolled_step.get(anchor_idx, -999)
+        return steps_since <= self._grace_steps
+
+    def _effective_enrolled_delta(self, anchor_idx: int, local_spk: int) -> float:
+        """Relax matching only for the previously used local channel."""
+        eff = self.delta_enrolled
+        prev_local = self._last_local_for_enrolled.get(anchor_idx)
+        if prev_local == local_spk and self._in_grace(anchor_idx):
+            eff += self.enrolled_grace_margin
+        return eff
 
     # ─── Core override: enrolled-priority identify ───────────────
 
@@ -214,9 +245,8 @@ class EnrolledSpeakerClustering(OnlineSpeakerClustering):
             )
 
         # ── 1. Enrolled priority pass ──
-        # For each enrolled anchor, find speakers within the effective threshold,
-        # then pick the one with HIGHEST mean activity (most voice content →
-        # best audio quality and most stable assignment across steps).
+        # For each enrolled anchor, find speakers within the effective
+        # threshold, then pick the closest one. Activity is only a tie-breaker.
         enrolled_assignments = {}          # local_spk → global_idx
         taken_enrolled: set = set()
         mean_act = np.mean(segmentation.data, axis=0)  # (n_local,)
@@ -232,34 +262,32 @@ class EnrolledSpeakerClustering(OnlineSpeakerClustering):
                 if anchor_idx in taken_enrolled:
                     continue
 
-                # Effective threshold: relaxed during grace period
-                steps_since = self._call_count - self._last_enrolled_step.get(anchor_idx, -999)
-                in_grace = steps_since <= self._grace_steps
-                eff_delta = self.delta_enrolled * 1.4 if in_grace else self.delta_enrolled
-
                 # Collect all candidates within effective threshold
                 candidates = []
                 for li in range(len(active_speakers)):
                     local_spk = int(active_speakers[li])
                     if local_spk in used_local:
                         continue
-                    if dists[li, ai] < eff_delta:
-                        candidates.append((li, local_spk))
+                    dist = float(dists[li, ai])
+                    eff_delta = self._effective_enrolled_delta(anchor_idx, local_spk)
+                    if dist < eff_delta:
+                        candidates.append((li, local_spk, dist))
 
                 if not candidates:
                     continue
 
                 # Prefer the previously assigned local speaker (channel
-                # persistence) to avoid source switching.  Fall back to
-                # highest mean activity only when the previous channel is
-                # no longer a valid candidate.
+                # persistence) to avoid source switching when it is still
+                # close enough. Otherwise choose the CLOSEST candidate first,
+                # using activity only as a tie-breaker.
                 prev_local = self._last_local_for_enrolled.get(anchor_idx)
                 prev_match = [c for c in candidates if c[1] == prev_local]
                 if prev_match:
-                    best_li, best_local = prev_match[0]
+                    best_li, best_local, _ = min(prev_match, key=lambda x: x[2])
                 else:
-                    best_li, best_local = max(
-                        candidates, key=lambda x: mean_act[x[1]]
+                    best_li, best_local, _ = min(
+                        candidates,
+                        key=lambda x: (x[2], -mean_act[x[1]]),
                     )
                 enrolled_assignments[best_local] = anchor_idx
                 taken_enrolled.add(anchor_idx)
@@ -268,8 +296,8 @@ class EnrolledSpeakerClustering(OnlineSpeakerClustering):
                 self._last_local_for_enrolled[anchor_idx] = best_local
 
         # ── 1b. Enrolled leakage suppression ──
-        # Remaining active speakers within the effective threshold of any enrolled
-        # anchor are the SAME voice leaking through secondary PixIT channels.
+        # Remaining active speakers extremely close to an enrolled anchor are
+        # most likely the SAME voice leaking through a secondary PixIT channel.
         # Suppress entirely — no centroid, no mapping, no audio.
         enrolled_leakage: set = set()
         if self._anchors:
@@ -280,14 +308,7 @@ class EnrolledSpeakerClustering(OnlineSpeakerClustering):
                     continue
                 s_dists = cdist(embeddings[s:s+1], anchor_mat, metric=self.metric)
                 min_dist = float(s_dists.min())
-                min_ai = int(s_dists.argmin())
-                min_anchor_idx = anchor_ids[min_ai]
-
-                steps_since = self._call_count - self._last_enrolled_step.get(min_anchor_idx, -999)
-                in_grace = steps_since <= self._grace_steps
-                eff_delta = self.delta_enrolled * 1.4 if in_grace else self.delta_enrolled
-
-                if min_dist < eff_delta:
+                if min_dist < self.leakage_delta:
                     enrolled_leakage.add(int(s))
 
         # ── 2. General matching for remaining speakers ──
@@ -322,19 +343,50 @@ class EnrolledSpeakerClustering(OnlineSpeakerClustering):
         ]
 
         # Try to create new centres for missed speakers, or fall back.
-        # During a grace period (enrolled speaker was recently seen), suppress
-        # new-centroid creation for speakers whose embedding is within a generous
-        # distance of an enrolled anchor — they're likely the same person with
-        # a degraded embedding (silence→speech transition).
+        # During a grace period, suppress new-centroid creation only when the
+        # SAME local channel that was just mapped to an enrolled speaker
+        # flickers into a slightly worse embedding.
         new_center_speakers = []
         for spk in missed:
+            src_stats = None
+            if self._current_source_stats is not None and spk < len(self._current_source_stats):
+                src_stats = self._current_source_stats[spk]
+
             if self._anchors and not np.isnan(embeddings[spk]).any():
                 sp_dists = cdist(embeddings[spk:spk+1], anchor_mat, metric=self.metric)
                 min_dist = float(sp_dists.min())
                 min_anchor = anchor_ids[int(sp_dists.argmin())]
-                steps_since = self._call_count - self._last_enrolled_step.get(min_anchor, -999)
-                if steps_since <= self._grace_steps and min_dist < self.delta_enrolled * 1.6:
+                prev_local = self._last_local_for_enrolled.get(min_anchor)
+                grace_delta = self.delta_enrolled + self.new_center_grace_margin
+                if (
+                    prev_local == spk
+                    and self._in_grace(min_anchor)
+                    and min_dist < grace_delta
+                ):
                     continue
+
+            # Unknown speakers are much less stable than enrolled anchors.
+            # Reuse the nearest existing unknown centroid with a slightly more
+            # permissive threshold before spawning another Unknown-* lane.
+            unknown_globals = [
+                g for g in self.active_centers
+                if g not in self._anchors and g not in taken_enrolled
+            ]
+            if unknown_globals:
+                best_unknown = min(
+                    unknown_globals,
+                    key=lambda g: float(dist_map.mapping_matrix[spk, g]),
+                )
+                best_unknown_dist = float(dist_map.mapping_matrix[spk, best_unknown])
+                if best_unknown_dist < self.unknown_reuse_delta:
+                    valid_map = valid_map.set_source_speaker(spk, best_unknown)
+                    continue
+
+            if (
+                src_stats is not None
+                and float(src_stats.get("voiced_sec", 0.0)) < self.unknown_min_voiced_sec
+            ):
+                continue
 
             has_space = len(new_center_speakers) < self.num_free_centers
             if has_space and spk in long_speakers:
@@ -367,6 +419,56 @@ class EnrolledSpeakerClustering(OnlineSpeakerClustering):
         # ── 3. Merge enrolled assignments into the map ──
         for local_spk, global_idx in enrolled_assignments.items():
             valid_map = valid_map.set_source_speaker(local_spk, global_idx)
+
+        # #region agent log
+        if self._call_count % 2 == 0:
+            import json as _j
+            import time as _t
+
+            _dmin: Dict[str, float] = {}
+            if self._anchors and num_local > 0:
+                _aids = sorted(self._anchors.keys())
+                _amat = np.array([self._anchors[i] for i in _aids])
+                for li in range(num_local):
+                    if np.isnan(embeddings[li]).any():
+                        continue
+                    _dmin[str(li)] = round(
+                        float(
+                            np.min(
+                                cdist(
+                                    embeddings[li : li + 1],
+                                    _amat,
+                                    metric=self.metric,
+                                )
+                            )
+                        ),
+                        4,
+                    )
+            open(
+                "/home/michel/Documents/Voice/.cursor/debug-21cffc.log", "a"
+            ).write(
+                _j.dumps(
+                    {
+                        "sessionId": "21cffc",
+                        "hypothesisId": "H3",
+                        "location": "enrolled_clustering.py:identify",
+                        "message": "IDENTIFY_SUM",
+                        "data": {
+                            "call": self._call_count,
+                            "enrolled": {str(k): int(v) for k, v in enrolled_assignments.items()},
+                            "leakage": sorted(enrolled_leakage),
+                            "missed_n": len(missed),
+                            "new_c": len(new_center_speakers),
+                            "dist_min": _dmin,
+                            "leak_th": float(self.leakage_delta),
+                            "d_enr": float(self.delta_enrolled),
+                        },
+                        "timestamp": int(_t.time() * 1000),
+                    }
+                )
+                + "\n"
+            )
+        # #endregion
 
         return valid_map
 
