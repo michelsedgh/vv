@@ -94,8 +94,10 @@ class EnrolledSpeakerClustering(OnlineSpeakerClustering):
         enrolled_grace_margin: float = 0.05,
         leakage_delta: Optional[float] = None,
         new_center_grace_margin: float = 0.05,
+        enrolled_preference_margin: float = 0.03,
         unknown_reuse_delta: Optional[float] = None,
         unknown_min_voiced_sec: float = 0.18,
+        unknown_min_tail_rms: float = 0.0,
     ):
         super().__init__(tau_active, rho_update, delta_new, metric, max_speakers)
         self.delta_enrolled = delta_enrolled
@@ -105,11 +107,13 @@ class EnrolledSpeakerClustering(OnlineSpeakerClustering):
             else min(delta_enrolled, delta_new)
         )
         self.new_center_grace_margin = new_center_grace_margin
+        self.enrolled_preference_margin = enrolled_preference_margin
         self.unknown_reuse_delta = (
             unknown_reuse_delta if unknown_reuse_delta is not None
             else max(delta_new, min(delta_enrolled, delta_new + 0.10))
         )
         self.unknown_min_voiced_sec = unknown_min_voiced_sec
+        self.unknown_min_tail_rms = unknown_min_tail_rms
 
         # Enrollment state
         self._anchors: Dict[int, np.ndarray] = {}      # global_idx → L2-normed anchor
@@ -336,10 +340,13 @@ class EnrolledSpeakerClustering(OnlineSpeakerClustering):
         # Threshold at delta_new
         valid_map = dist_map.unmap_threshold(self.delta_new)
 
+        strict_local, strict_global = valid_map.valid_assignments(strict=True)
+        strict_local_set = {int(s) for s in strict_local}
+
         # Missed: active remaining speakers still unmatched
         missed = [
             s for s in remaining_active
-            if not valid_map.is_source_speaker_mapped(s)
+            if int(s) not in strict_local_set
         ]
 
         # Try to create new centres for missed speakers, or fall back.
@@ -352,18 +359,50 @@ class EnrolledSpeakerClustering(OnlineSpeakerClustering):
             if self._current_source_stats is not None and spk < len(self._current_source_stats):
                 src_stats = self._current_source_stats[spk]
 
+            min_dist = None
+            min_anchor = None
+            prev_local = None
+            grace_delta = None
+            assigned_globals = {int(g) for g in valid_map.valid_assignments(strict=True)[1]}
             if self._anchors and not np.isnan(embeddings[spk]).any():
                 sp_dists = cdist(embeddings[spk:spk+1], anchor_mat, metric=self.metric)
                 min_dist = float(sp_dists.min())
                 min_anchor = anchor_ids[int(sp_dists.argmin())]
                 prev_local = self._last_local_for_enrolled.get(min_anchor)
-                grace_delta = self.delta_enrolled + self.new_center_grace_margin
+                grace_delta = (
+                    self._effective_enrolled_delta(min_anchor, spk)
+                    + self.new_center_grace_margin
+                )
+                anchor_available = (
+                    min_anchor not in taken_enrolled and min_anchor not in assigned_globals
+                )
                 if (
+                    anchor_available
+                    and
                     prev_local == spk
                     and self._in_grace(min_anchor)
                     and min_dist < grace_delta
                 ):
+                    valid_map = valid_map.set_source_speaker(spk, min_anchor)
+                    taken_enrolled.add(min_anchor)
+                    self._last_enrolled_step[min_anchor] = self._call_count
+                    self._last_local_for_enrolled[min_anchor] = int(spk)
                     continue
+
+                # If the enrolled anchor is already claimed this step and this
+                # local is still reasonably close to it, treat the local as
+                # separation leakage rather than spawning/reusing Unknown-*.
+                if (
+                    min_anchor in taken_enrolled
+                    and min_dist < max(self.leakage_delta, self.delta_new)
+                ):
+                    continue
+
+            if (
+                src_stats is not None
+                and float(src_stats.get("tail_rms", 0.0)) < self.unknown_min_tail_rms
+            ):
+                continue
 
             # Unknown speakers are much less stable than enrolled anchors.
             # Reuse the nearest existing unknown centroid with a slightly more
@@ -378,9 +417,37 @@ class EnrolledSpeakerClustering(OnlineSpeakerClustering):
                     key=lambda g: float(dist_map.mapping_matrix[spk, g]),
                 )
                 best_unknown_dist = float(dist_map.mapping_matrix[spk, best_unknown])
+                if (
+                    self._anchors
+                    and min_anchor is not None
+                    and min_dist is not None
+                    and min_anchor not in taken_enrolled
+                    and min_anchor not in assigned_globals
+                    and min_dist < (self.delta_enrolled + self.enrolled_preference_margin)
+                    and min_dist <= (best_unknown_dist + self.enrolled_preference_margin)
+                ):
+                    valid_map = valid_map.set_source_speaker(spk, min_anchor)
+                    taken_enrolled.add(min_anchor)
+                    self._last_enrolled_step[min_anchor] = self._call_count
+                    self._last_local_for_enrolled[min_anchor] = int(spk)
+                    continue
                 if best_unknown_dist < self.unknown_reuse_delta:
                     valid_map = valid_map.set_source_speaker(spk, best_unknown)
                     continue
+
+            if (
+                self._anchors
+                and min_anchor is not None
+                and min_dist is not None
+                and min_anchor not in taken_enrolled
+                and min_anchor not in assigned_globals
+                and min_dist < (self.delta_enrolled + self.enrolled_preference_margin)
+            ):
+                valid_map = valid_map.set_source_speaker(spk, min_anchor)
+                taken_enrolled.add(min_anchor)
+                self._last_enrolled_step[min_anchor] = self._call_count
+                self._last_local_for_enrolled[min_anchor] = int(spk)
+                continue
 
             if (
                 src_stats is not None
@@ -397,7 +464,7 @@ class EnrolledSpeakerClustering(OnlineSpeakerClustering):
                     g for g in prefs
                     if g not in self.active_centers and g not in taken_enrolled
                 ]
-                _, g_assigned = valid_map.valid_assignments()
+                _, g_assigned = valid_map.valid_assignments(strict=True)
                 free = [g for g in prefs if g not in g_assigned]
                 if free:
                     valid_map = valid_map.set_source_speaker(spk, free[0])
@@ -405,7 +472,7 @@ class EnrolledSpeakerClustering(OnlineSpeakerClustering):
         # Update non-enrolled centroids (only long, non-missed speakers)
         to_update = [
             (ls, gs)
-            for ls, gs in zip(*valid_map.valid_assignments())
+            for ls, gs in zip(*valid_map.valid_assignments(strict=True))
             if ls not in missed and ls in long_speakers
         ]
         self.update(to_update, embeddings)
@@ -441,9 +508,18 @@ class EnrolledSpeakerClustering(OnlineSpeakerClustering):
             self._log_distances(segmentation, embeddings, speaker_map)
 
         return SlidingWindowFeature(
-            speaker_map.apply(segmentation.data),
+            self._apply_strict_map(speaker_map, segmentation.data),
             segmentation.sliding_window,
         )
+
+    @staticmethod
+    def _apply_strict_map(speaker_map: SpeakerMap, source_scores: np.ndarray) -> np.ndarray:
+        """Project local scores to globals using only strict valid assignments."""
+        num_frames = source_scores.shape[0]
+        projected_scores = np.zeros((num_frames, speaker_map.num_target_speakers))
+        for src_speaker, tgt_speaker in zip(*speaker_map.valid_assignments(strict=True)):
+            projected_scores[:, tgt_speaker] = source_scores[:, src_speaker]
+        return projected_scores
 
     def _log_distances(
         self,
@@ -465,7 +541,7 @@ class EnrolledSpeakerClustering(OnlineSpeakerClustering):
         anchor_mat = np.array([self._anchors[i] for i in anchor_ids])
         dists = cdist(emb_np[valid_local], anchor_mat, metric="cosine")
         anchor_labels = [self._labels.get(i, f"g{i}") for i in anchor_ids]
-        l_assigned, g_assigned = speaker_map.valid_assignments()
+        l_assigned, g_assigned = speaker_map.valid_assignments(strict=True)
         assign_str = ", ".join(
             f"L{l}→{self.get_label(g)}" for l, g in zip(l_assigned, g_assigned)
         )

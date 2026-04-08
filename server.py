@@ -285,10 +285,11 @@ def _run_diarization_monitor():
         for sp in result.speakers:
             audio_i16 = np.clip(sp.audio * 32767, -32768, 32767).astype(np.int16)
             speaker_id = int(sp.global_idx)
+            audio_active = bool(np.max(np.abs(audio_i16)) > 32)
             _sd = {
                 "id": speaker_id,
                 "label": str(sp.label),
-                "active": bool(sp.activity > cfg["clustering"]["tau_active"]),
+                "active": bool(audio_active or sp.activity > cfg["clustering"]["tau_active"]),
                 "activity": round(float(sp.activity), 3),
                 "enrolled": bool(sp.is_enrolled),
             }
