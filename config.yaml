@@ -33,9 +33,9 @@ debug:
 audio:
   device_index: 0          # sounddevice input device (IC800 USB mic)
   sample_rate: 16000       # PixIT native sample rate
-  # Emit audio with the same 2.0 s latency used by diarization aggregation so
-  # every speaker packet is built from multiple overlapping PixIT windows.
-  output_latency_sec: 2.0
+  # Emit audio with a small delay so the packet comes from a better-supported
+  # region of the latest PixIT chunk without adding a very noticeable lag.
+  output_latency_sec: 1.0
 
 device: cuda               # torch device
 

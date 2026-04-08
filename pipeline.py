@@ -49,7 +49,6 @@ import numpy as np
 import torch
 import torchaudio.functional as AF
 import yaml
-from pyannote.audio import Inference as PyanInference
 from pyannote.audio import Model as PyanModel
 from pyannote.core import SlidingWindow, SlidingWindowFeature
 
@@ -571,51 +570,52 @@ class RealtimePipeline:
         step_idx: int,
         candidate_globals: List[int],
     ) -> Dict[int, np.ndarray]:
-        """Overlap-add recent global-aligned separated chunks for one emitted step."""
+        """Reconstruct one emitted step using the most recent valid source samples.
+
+        Averaging overlapping separated chunks attenuates onsets because older
+        windows often contain weaker or leakage-heavy versions of the same
+        region. For separated audio, the newest chunk that still covers the
+        emitted region is usually the best estimate, so we let newer valid
+        samples overwrite older ones.
+        """
         if not candidate_globals or not self._source_chunk_buffer:
             return {}
 
-        cols = np.asarray(sorted({int(g) for g in candidate_globals}), dtype=np.int32)
-        data = np.stack(
-            [chunk[:, cols] for _, chunk in self._source_chunk_buffer],
-            axis=0,
-        )
-        first_step = self._source_chunk_buffer[0][0]
-        chunk_sw = SlidingWindow(
-            start=self._chunk_start_time(first_step),
-            duration=self.duration,
-            step=self.step_duration,
-        )
-        chunk_sources = SlidingWindowFeature(data, chunk_sw)
-        sample_duration = self.duration / float(self.chunk_samples)
-        sample_frames = SlidingWindow(
-            start=chunk_sw.start,
-            step=sample_duration,
-            duration=2.0 * sample_duration,
-        )
-        aggregated = PyanInference.aggregate(
-            chunk_sources,
-            frames=sample_frames,
-            hamming=True,
-            missing=0.0,
-            skip_average=False,
-        )
         step_start_time = step_idx * self.step_duration
-        start_sample = int(
-            round((step_start_time - aggregated.sliding_window.start) * self.sample_rate)
-        )
-        end_sample = start_sample + self.step_samples
+        cols = sorted({int(g) for g in candidate_globals})
+        slices: Dict[int, np.ndarray] = {
+            int(global_idx): np.zeros(self.step_samples, dtype=np.float32)
+            for global_idx in cols
+        }
+        filled: Dict[int, np.ndarray] = {
+            int(global_idx): np.zeros(self.step_samples, dtype=bool)
+            for global_idx in cols
+        }
 
-        slices: Dict[int, np.ndarray] = {}
-        for col_idx, global_idx in enumerate(cols):
-            out = np.zeros(self.step_samples, dtype=np.float32)
+        for chunk_step, chunk in self._source_chunk_buffer:
+            chunk_start = self._chunk_start_time(chunk_step)
+            start_sample = int(round((step_start_time - chunk_start) * self.sample_rate))
+            end_sample = start_sample + self.step_samples
             src_lo = max(0, start_sample)
-            src_hi = min(aggregated.data.shape[0], end_sample)
-            if src_hi > src_lo:
-                dst_lo = max(0, -start_sample)
-                dst_hi = dst_lo + (src_hi - src_lo)
-                out[dst_lo:dst_hi] = aggregated.data[src_lo:src_hi, col_idx]
-            slices[int(global_idx)] = out
+            src_hi = min(chunk.shape[0], end_sample)
+            if src_hi <= src_lo:
+                continue
+            dst_lo = max(0, -start_sample)
+            dst_hi = dst_lo + (src_hi - src_lo)
+            for global_idx in cols:
+                seg = chunk[src_lo:src_hi, int(global_idx)]
+                valid = ~np.isnan(seg)
+                if not np.any(valid):
+                    continue
+                out_view = slices[int(global_idx)][dst_lo:dst_hi]
+                fill_view = filled[int(global_idx)][dst_lo:dst_hi]
+                out_view[valid] = seg[valid]
+                fill_view[valid] = True
+                slices[int(global_idx)][dst_lo:dst_hi] = out_view
+                filled[int(global_idx)][dst_lo:dst_hi] = fill_view
+
+        for global_idx in cols:
+            np.nan_to_num(slices[int(global_idx)], copy=False)
         return slices
 
     def _reextract_enrollments(
