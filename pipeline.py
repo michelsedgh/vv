@@ -60,6 +60,7 @@ See also: module docstring in ``enrolled_clustering.py`` and comments in
 """
 from __future__ import annotations
 
+import json
 import logging
 import time
 from dataclasses import dataclass, field
@@ -68,6 +69,7 @@ from typing import Any, Dict, List, Optional
 
 import numpy as np
 import torch
+from scipy.spatial.distance import cdist
 import torch.nn.functional as F
 import torchaudio.functional as AF
 import yaml
@@ -138,6 +140,12 @@ class RealtimePipeline:
         enrolled_embeddings: Optional[Dict[str, np.ndarray]] = None,
     ):
         self.cfg = config
+        _dbg = config.get("debug", {})
+        self._agent_ndjson = bool(_dbg.get("session_ndjson", True))
+        self._step_perf_log = bool(_dbg.get("step_perf_log", True))
+        self._agent_ndjson_path = (
+            "/home/michel/Documents/Voice/.cursor/debug-21cffc.log"
+        )
         self.device = torch.device(config["device"])
         self.sample_rate: int = config["audio"]["sample_rate"]
 
@@ -659,6 +667,36 @@ class RealtimePipeline:
                      name, "DF→" if self._denoiser_enabled else "", len(emb))
         return reextracted
 
+    def _agent_ndjson_append(
+        self, hypothesis_id: str, location: str, message: str, data: dict
+    ) -> None:
+        if not self._agent_ndjson:
+            return
+        rec = {
+            "sessionId": "21cffc",
+            "hypothesisId": hypothesis_id,
+            "location": location,
+            "message": message,
+            "data": data,
+            "timestamp": int(time.time() * 1000),
+        }
+        with open(self._agent_ndjson_path, "a", encoding="utf-8") as _f:
+            _f.write(json.dumps(rec) + "\n")
+
+    def _perf_log_append(self, data: dict) -> None:
+        if not self._step_perf_log:
+            return
+        rec = {
+            "sessionId": "21cffc",
+            "hypothesisId": "H9",
+            "location": "pipeline.py:step",
+            "message": "STEP_PERF",
+            "data": data,
+            "timestamp": int(time.time() * 1000),
+        }
+        with open(self._agent_ndjson_path, "a", encoding="utf-8") as _f:
+            _f.write(json.dumps(rec) + "\n")
+
     def step(self, waveform: np.ndarray) -> StepResult:
         """Run one pipeline step on a 5 s audio chunk.
 
@@ -683,6 +721,8 @@ class RealtimePipeline:
             Per-speaker audio, activity scores, and timing info.
         """
         t0 = time.perf_counter()
+        tc = time.perf_counter
+        _si = self._step_idx
 
         # ── Prepare waveform ──
         waveform = np.asarray(waveform, dtype=np.float32)
@@ -701,9 +741,24 @@ class RealtimePipeline:
         with torch.inference_mode():
             diarization_t = self._pixit_wrapper(wav_gpu)  # (1, 624, 3)  fp16
 
+        t1 = tc()
         seg_np = diarization_t[0].float().cpu().numpy()   # (624, 3) ensure fp32
         sources = self._pixit_wrapper.last_sources.float()  # (1, 80000, 3) GPU fp32
 
+        # One GPU→CPU sync for per-local tail RMS (reconcile dedupe + holdover used to
+        # slice each lane and call .cpu() separately → several syncs per step when
+        # multiple locals talk → large infer_ms spikes on Jetson).
+        with torch.inference_mode():
+            step_tail_rms_np = (
+                sources[0, -self.step_samples :, :]
+                .pow(2)
+                .mean(dim=0)
+                .sqrt()
+                .cpu()
+                .numpy()
+            )
+
+        t2 = tc()
         # Build SlidingWindowFeature for clustering
         start_time = self._step_idx * self.step_duration
         n_frames = seg_np.shape[0]
@@ -764,6 +819,7 @@ class RealtimePipeline:
                 emb = emb / emb.norm(dim=-1, keepdim=True).clamp(min=1e-8)
                 embeddings[spk_idx] = emb.squeeze(0).cpu()
 
+        t3 = tc()
         # ── 3. Clustering ──
         self.clustering._current_source_stats = source_stats
         permuted_seg = self.clustering(segmentation, embeddings)
@@ -780,6 +836,7 @@ class RealtimePipeline:
         step_frames = max(1, int(n_seg_frames * self.step_duration / self.duration))
         step_seg = agg_permuted.data[-step_frames:]
 
+        t4 = tc()
         # ── 4. Map sources to global speakers (single window) ──
         # One PixIT forward per step; we only read the current ``sources`` tail.
         # Multi-window overlap-add on *waveforms* was reverted: misaligned
@@ -806,20 +863,11 @@ class RealtimePipeline:
         # for the “winner” only).  Re-attach any embedded local within the enrolled
         # radius to the anchor, then keep one stream per enrolled global (loudest tail).
         if self.clustering._anchors:
-            from scipy.spatial.distance import cdist
-
             emb_np = embeddings.detach().cpu().numpy()
             _remap_meta: List[dict] = []
 
             def _tail_rms(lc: int) -> float:
-                return float(
-                    sources[0, -self.step_samples :, lc]
-                    .float()
-                    .pow(2)
-                    .mean()
-                    .sqrt()
-                    .cpu()
-                )
+                return float(step_tail_rms_np[int(lc)])
 
             pair_list = list(pairs)
             loc_to_g = {l: g for l, g in pair_list}
@@ -890,27 +938,15 @@ class RealtimePipeline:
 
             # #region agent log
             if _remap_meta or _drop_meta:
-                import json as _j
-                import time as _t
-
-                open(
-                    "/home/michel/Documents/Voice/.cursor/debug-21cffc.log", "a"
-                ).write(
-                    _j.dumps(
-                        {
-                            "sessionId": "21cffc",
-                            "hypothesisId": "H6",
-                            "location": "pipeline.py:enroll_reconcile",
-                            "message": "ENROLL_REMAP",
-                            "data": {
-                                "step": self._step_idx,
-                                "remaps": _remap_meta,
-                                "enrolled_dedup_drops": _drop_meta,
-                            },
-                            "timestamp": int(_t.time() * 1000),
-                        }
-                    )
-                    + "\n"
+                self._agent_ndjson_append(
+                    "H6",
+                    "pipeline.py:enroll_reconcile",
+                    "ENROLL_REMAP",
+                    {
+                        "step": self._step_idx,
+                        "remaps": _remap_meta,
+                        "enrolled_dedup_drops": _drop_meta,
+                    },
                 )
             # #endregion
 
@@ -931,32 +967,19 @@ class RealtimePipeline:
                     continue
                 if source_stats[loc]["has_embedding"]:
                     # #region agent log
-                    if self._step_idx % 4 == 0:
-                        import json as _j
-                        import time as _t
-
-                        open(
-                            "/home/michel/Documents/Voice/.cursor/debug-21cffc.log",
-                            "a",
-                        ).write(
-                            _j.dumps(
-                                {
-                                    "sessionId": "21cffc",
-                                    "hypothesisId": "H5",
-                                    "location": "pipeline.py:holdover",
-                                    "message": "HOLDOVER_SKIP_HAS_EMB",
-                                    "data": {
-                                        "step": self._step_idx,
-                                        "global": int(g_idx),
-                                        "loc": int(loc),
-                                        "in_pairs_already": any(
-                                            g == g_idx for _, g in pairs
-                                        ),
-                                    },
-                                    "timestamp": int(_t.time() * 1000),
-                                }
-                            )
-                            + "\n"
+                    if self._agent_ndjson and self._step_idx % 4 == 0:
+                        self._agent_ndjson_append(
+                            "H5",
+                            "pipeline.py:holdover",
+                            "HOLDOVER_SKIP_HAS_EMB",
+                            {
+                                "step": self._step_idx,
+                                "global": int(g_idx),
+                                "loc": int(loc),
+                                "in_pairs_already": any(
+                                    g == g_idx for _, g in pairs
+                                ),
+                            },
                         )
                     # #endregion
                     continue
@@ -965,73 +988,46 @@ class RealtimePipeline:
                     and gap > self._holdover_no_emb_max_steps
                 ):
                     # #region agent log
-                    if self._step_idx % 4 == 0:
-                        import json as _j
-                        import time as _t
-
-                        open(
-                            "/home/michel/Documents/Voice/.cursor/debug-21cffc.log",
-                            "a",
-                        ).write(
-                            _j.dumps(
-                                {
-                                    "sessionId": "21cffc",
-                                    "hypothesisId": "H4",
-                                    "location": "pipeline.py:holdover",
-                                    "message": "HOLDOVER_BLOCKED_IDLE",
-                                    "data": {
-                                        "step": self._step_idx,
-                                        "global": int(g_idx),
-                                        "steps_since_match": gap,
-                                        "hmax": int(self._holdover_no_emb_max_steps),
-                                        "path": "no_embedding_cap",
-                                    },
-                                    "timestamp": int(_t.time() * 1000),
-                                }
-                            )
-                            + "\n"
+                    if self._agent_ndjson and self._step_idx % 4 == 0:
+                        self._agent_ndjson_append(
+                            "H4",
+                            "pipeline.py:holdover",
+                            "HOLDOVER_BLOCKED_IDLE",
+                            {
+                                "step": self._step_idx,
+                                "global": int(g_idx),
+                                "steps_since_match": gap,
+                                "hmax": int(self._holdover_no_emb_max_steps),
+                                "path": "no_embedding_cap",
+                            },
                         )
                     # #endregion
                     continue
                 smax = float(np.max(seg_np[:, loc]))
-                t_rms = float(
-                    sources[0, -self.step_samples :, loc].float().pow(2).mean().sqrt().cpu()
-                )
+                t_rms = float(step_tail_rms_np[int(loc)])
                 if smax < ho_max and t_rms < ho_rms:
                     continue
                 pairs.append((loc, g_idx))
                 used_local.add(loc)
                 # #region agent log
-                if self._step_idx % 2 == 0:
-                    import json as _j
-                    import time as _t
-
-                    open(
-                        "/home/michel/Documents/Voice/.cursor/debug-21cffc.log", "a"
-                    ).write(
-                        _j.dumps(
-                            {
-                                "sessionId": "21cffc",
-                                "hypothesisId": "H2",
-                                "location": "pipeline.py:holdover",
-                                "message": "HOLDOVER_ADD",
-                                "data": {
-                                    "step": self._step_idx,
-                                    "global": int(g_idx),
-                                    "loc": int(loc),
-                                    "smax": round(smax, 4),
-                                    "tail_rms": round(t_rms, 5),
-                                    "steps_since_enrolled_match": int(
-                                        self.clustering._call_count
-                                        - self.clustering._last_enrolled_step.get(
-                                            g_idx, -999
-                                        )
-                                    ),
-                                },
-                                "timestamp": int(_t.time() * 1000),
-                            }
-                        )
-                        + "\n"
+                if self._agent_ndjson and self._step_idx % 2 == 0:
+                    self._agent_ndjson_append(
+                        "H2",
+                        "pipeline.py:holdover",
+                        "HOLDOVER_ADD",
+                        {
+                            "step": self._step_idx,
+                            "global": int(g_idx),
+                            "loc": int(loc),
+                            "smax": round(smax, 4),
+                            "tail_rms": round(t_rms, 5),
+                            "steps_since_enrolled_match": int(
+                                self.clustering._call_count
+                                - self.clustering._last_enrolled_step.get(
+                                    g_idx, -999
+                                )
+                            ),
+                        },
                     )
                 # #endregion
 
@@ -1049,36 +1045,24 @@ class RealtimePipeline:
             used_local = {l for l, _ in pairs}
             if _pairs_before > len(pairs):
                 # #region agent log
-                import json as _j
-                import time as _t
-
-                open(
-                    "/home/michel/Documents/Voice/.cursor/debug-21cffc.log", "a"
-                ).write(
-                    _j.dumps(
-                        {
-                            "sessionId": "21cffc",
-                            "hypothesisId": "H8",
-                            "location": "pipeline.py:unknown_filter",
-                            "message": "UNKNOWN_PAIR_DROP",
-                            "data": {
-                                "step": self._step_idx,
-                                "before": int(_pairs_before),
-                                "after": int(len(pairs)),
-                                "min_smx": float(self._unknown_emit_min_seg_max),
-                            },
-                            "timestamp": int(_t.time() * 1000),
-                        }
-                    )
-                    + "\n"
+                self._agent_ndjson_append(
+                    "H8",
+                    "pipeline.py:unknown_filter",
+                    "UNKNOWN_PAIR_DROP",
+                    {
+                        "step": self._step_idx,
+                        "before": int(_pairs_before),
+                        "after": int(len(pairs)),
+                        "min_smx": float(self._unknown_emit_min_seg_max),
+                    },
                 )
                 # #endregion
 
+        t5 = tc()
         # #region agent log
-        if self._step_idx % 2 == 0 or len(pairs) == 0:
-            import json as _j
-            import time as _t
-
+        if self._agent_ndjson and (
+            self._step_idx % 2 == 0 or len(pairs) == 0
+        ):
             _locals = []
             for i in range(self.n_local_speakers):
                 _locals.append(
@@ -1102,32 +1086,24 @@ class RealtimePipeline:
                             "prev_loc": self.clustering._last_local_for_enrolled.get(_g),
                         }
                     )
-            open(
-                "/home/michel/Documents/Voice/.cursor/debug-21cffc.log", "a"
-            ).write(
-                _j.dumps(
-                    {
-                        "sessionId": "21cffc",
-                        "hypothesisId": "H1",
-                        "location": "pipeline.py:step",
-                        "message": "STEP_PAIRS",
-                        "data": {
-                            "step": self._step_idx,
-                            "call": self.clustering._call_count,
-                            "n_pairs": len(pairs),
-                            "pairs": [[int(a), int(b)] for a, b in pairs],
-                            "locals": _locals,
-                            "holdover": _ho_meta,
-                            "hmax_steps": int(self._holdover_max_steps),
-                            "holdover_no_emb_cap": int(self._holdover_no_emb_max_steps),
-                        },
-                        "timestamp": int(_t.time() * 1000),
-                    }
-                )
-                + "\n"
+            self._agent_ndjson_append(
+                "H1",
+                "pipeline.py:step",
+                "STEP_PAIRS",
+                {
+                    "step": self._step_idx,
+                    "call": self.clustering._call_count,
+                    "n_pairs": len(pairs),
+                    "pairs": [[int(a), int(b)] for a, b in pairs],
+                    "locals": _locals,
+                    "holdover": _ho_meta,
+                    "hmax_steps": int(self._holdover_max_steps),
+                    "holdover_no_emb_cap": int(self._holdover_no_emb_max_steps),
+                },
             )
         # #endregion
 
+        t6 = tc()
         if pairs:
             fade = self._fade_samples
             extract_len = self.step_samples + fade
@@ -1176,30 +1152,17 @@ class RealtimePipeline:
                         and new_e > self._xfade_onset_new_rms
                     ):
                         # #region agent log
-                        if self._step_idx % 4 == 0:
-                            import json as _j
-                            import time as _t
-
-                            open(
-                                "/home/michel/Documents/Voice/.cursor/debug-21cffc.log",
-                                "a",
-                            ).write(
-                                _j.dumps(
-                                    {
-                                        "sessionId": "21cffc",
-                                        "hypothesisId": "H7",
-                                        "location": "pipeline.py:xfade",
-                                        "message": "XFADE_SKIP_ONSET",
-                                        "data": {
-                                            "step": self._step_idx,
-                                            "g": int(global_idx),
-                                            "prev_rms": round(prev_e, 5),
-                                            "new_rms": round(new_e, 5),
-                                        },
-                                        "timestamp": int(_t.time() * 1000),
-                                    }
-                                )
-                                + "\n"
+                        if self._agent_ndjson and self._step_idx % 4 == 0:
+                            self._agent_ndjson_append(
+                                "H7",
+                                "pipeline.py:xfade",
+                                "XFADE_SKIP_ONSET",
+                                {
+                                    "step": self._step_idx,
+                                    "g": int(global_idx),
+                                    "prev_rms": round(prev_e, 5),
+                                    "new_rms": round(new_e, 5),
+                                },
                             )
                         # #endregion
                         prev_tail = None
@@ -1230,8 +1193,24 @@ class RealtimePipeline:
                     identity_similarity=id_sim,
                 ))
 
+        t7 = tc()
         self._step_idx += 1
         infer_ms = (time.perf_counter() - t0) * 1000
+        if self._step_perf_log and (_si % 6 == 0 or infer_ms > 300.0):
+            self._perf_log_append(
+                {
+                    "step": int(_si),
+                    "infer_ms": round(infer_ms, 1),
+                    "ms_pixit": round((t1 - t0) * 1000, 1),
+                    "ms_h2d_seg_tail": round((t2 - t1) * 1000, 1),
+                    "ms_embed": round((t3 - t2) * 1000, 1),
+                    "ms_cluster_agg": round((t4 - t3) * 1000, 1),
+                    "ms_map": round((t5 - t4) * 1000, 1),
+                    "ms_dbglog": round((t6 - t5) * 1000, 1),
+                    "ms_extract": round((t7 - t6) * 1000, 1),
+                    "n_pairs": int(len(pairs)),
+                }
+            )
 
         return StepResult(
             speakers=results,

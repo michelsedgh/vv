@@ -1,4 +1,8 @@
 # ─── Voice ID: Real-Time Diarization & Separation ─────────────────
+#
+debug:
+  # Optional STEP_PERF line (log.info) every 6 steps or when infer_ms > 300 ms.
+  step_perf_log: false
 # Stack: [optional mic DF] → PixIT (5 s chunk, 0.5 s step) → WeSpeaker on
 # separated sources → EnrolledSpeakerClustering → DelayedAggregation on
 # permuted diarization → per-speaker tail extract + crossfade → [optional DF on output].

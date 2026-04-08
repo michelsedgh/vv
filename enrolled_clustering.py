@@ -420,56 +420,6 @@ class EnrolledSpeakerClustering(OnlineSpeakerClustering):
         for local_spk, global_idx in enrolled_assignments.items():
             valid_map = valid_map.set_source_speaker(local_spk, global_idx)
 
-        # #region agent log
-        if self._call_count % 2 == 0:
-            import json as _j
-            import time as _t
-
-            _dmin: Dict[str, float] = {}
-            if self._anchors and num_local > 0:
-                _aids = sorted(self._anchors.keys())
-                _amat = np.array([self._anchors[i] for i in _aids])
-                for li in range(num_local):
-                    if np.isnan(embeddings[li]).any():
-                        continue
-                    _dmin[str(li)] = round(
-                        float(
-                            np.min(
-                                cdist(
-                                    embeddings[li : li + 1],
-                                    _amat,
-                                    metric=self.metric,
-                                )
-                            )
-                        ),
-                        4,
-                    )
-            open(
-                "/home/michel/Documents/Voice/.cursor/debug-21cffc.log", "a"
-            ).write(
-                _j.dumps(
-                    {
-                        "sessionId": "21cffc",
-                        "hypothesisId": "H3",
-                        "location": "enrolled_clustering.py:identify",
-                        "message": "IDENTIFY_SUM",
-                        "data": {
-                            "call": self._call_count,
-                            "enrolled": {str(k): int(v) for k, v in enrolled_assignments.items()},
-                            "leakage": sorted(enrolled_leakage),
-                            "missed_n": len(missed),
-                            "new_c": len(new_center_speakers),
-                            "dist_min": _dmin,
-                            "leak_th": float(self.leakage_delta),
-                            "d_enr": float(self.delta_enrolled),
-                        },
-                        "timestamp": int(_t.time() * 1000),
-                    }
-                )
-                + "\n"
-            )
-        # #endregion
-
         return valid_map
 
     # ─── Override __call__ ───────────────────────────────────────
