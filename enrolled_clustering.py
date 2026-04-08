@@ -98,6 +98,7 @@ class EnrolledSpeakerClustering(OnlineSpeakerClustering):
         unknown_reuse_delta: Optional[float] = None,
         unknown_min_voiced_sec: float = 0.18,
         unknown_min_tail_rms: float = 0.0,
+        enrolled_session_alpha: float = 0.15,
     ):
         super().__init__(tau_active, rho_update, delta_new, metric, max_speakers)
         self.delta_enrolled = delta_enrolled
@@ -114,9 +115,13 @@ class EnrolledSpeakerClustering(OnlineSpeakerClustering):
         )
         self.unknown_min_voiced_sec = unknown_min_voiced_sec
         self.unknown_min_tail_rms = unknown_min_tail_rms
+        self.enrolled_session_alpha = enrolled_session_alpha
 
         # Enrollment state
         self._anchors: Dict[int, np.ndarray] = {}      # global_idx → L2-normed anchor
+        self._profiles: Dict[int, np.ndarray] = {}     # global_idx → (k, dim) profile vectors
+        self._session_centroids: Dict[int, np.ndarray] = {}  # global_idx → live EMA
+        self._session_counts: Dict[int, int] = {}
         self._labels: Dict[int, str] = {}               # global_idx → speaker name
         self._unknown_counter: int = 0
         self._current_source_stats: Optional[list[dict]] = None
@@ -155,10 +160,32 @@ class EnrolledSpeakerClustering(OnlineSpeakerClustering):
                 emb = emb / norm
             idx = self.add_center(emb)
             self._anchors[idx] = emb.copy()
+            self._profiles[idx] = emb.reshape(1, -1).copy()
+            self._session_centroids[idx] = emb.copy()
+            self._session_counts[idx] = 0
             self._labels[idx] = name
             # Seed grace period so the first few steps can reuse the initial
             # local channel with a small extra margin.
             self._last_enrolled_step[idx] = 0
+
+    def inject_profiles(self, profiles: Dict[str, np.ndarray]) -> None:
+        """Attach additional enrollment profile vectors per enrolled speaker."""
+        if not profiles:
+            return
+        label_to_idx = {label: idx for idx, label in self._labels.items()}
+        for name, prof in profiles.items():
+            idx = label_to_idx.get(name)
+            if idx is None:
+                continue
+            prof = np.asarray(prof, dtype=np.float64)
+            if prof.ndim == 1:
+                prof = prof.reshape(1, -1)
+            norms = np.linalg.norm(prof, axis=1, keepdims=True)
+            prof = prof / np.maximum(norms, 1e-12)
+            self._profiles[idx] = prof.copy()
+            if idx not in self._session_centroids:
+                self._session_centroids[idx] = prof.mean(axis=0)
+                self._session_counts[idx] = 0
 
     # ─── Labels ──────────────────────────────────────────────────
 
@@ -208,6 +235,40 @@ class EnrolledSpeakerClustering(OnlineSpeakerClustering):
             eff += self.enrolled_grace_margin
         return eff
 
+    def enrolled_distance(
+        self, anchor_idx: int, embedding: np.ndarray, local_spk: Optional[int] = None
+    ) -> float:
+        """Distance between a live embedding and the enrolled speaker profile."""
+        emb = np.asarray(embedding, dtype=np.float64).reshape(1, -1)
+        candidates = [self._anchors[anchor_idx].reshape(1, -1)]
+        profile = self._profiles.get(anchor_idx)
+        if profile is not None and profile.size > 0:
+            candidates.append(profile)
+        session = self._session_centroids.get(anchor_idx)
+        if session is not None:
+            candidates.append(session.reshape(1, -1))
+        cand = np.concatenate(candidates, axis=0)
+        return float(cdist(emb, cand, metric=self.metric).min())
+
+    def _update_enrolled_session(self, anchor_idx: int, embedding: np.ndarray) -> None:
+        emb = np.asarray(embedding, dtype=np.float64).ravel()
+        norm = np.linalg.norm(emb)
+        if norm == 0:
+            return
+        emb = emb / norm
+        prev = self._session_centroids.get(anchor_idx)
+        if prev is None:
+            self._session_centroids[anchor_idx] = emb.copy()
+            self._session_counts[anchor_idx] = 1
+            return
+        alpha = float(np.clip(self.enrolled_session_alpha, 0.0, 1.0))
+        merged = (1.0 - alpha) * prev + alpha * emb
+        merged_norm = np.linalg.norm(merged)
+        if merged_norm > 0:
+            merged = merged / merged_norm
+        self._session_centroids[anchor_idx] = merged.astype(np.float64, copy=False)
+        self._session_counts[anchor_idx] = self._session_counts.get(anchor_idx, 0) + 1
+
     # ─── Core override: enrolled-priority identify ───────────────
 
     def identify(
@@ -252,27 +313,24 @@ class EnrolledSpeakerClustering(OnlineSpeakerClustering):
         # For each enrolled anchor, find speakers within the effective
         # threshold, then pick the closest one. Activity is only a tie-breaker.
         enrolled_assignments = {}          # local_spk → global_idx
+        enrolled_assignment_dist: Dict[int, float] = {}
         taken_enrolled: set = set()
         mean_act = np.mean(segmentation.data, axis=0)  # (n_local,)
+        anchor_ids = sorted(self._anchors.keys()) if self._anchors else []
 
         if self._anchors and len(active_speakers) > 0:
-            anchor_ids = sorted(self._anchors.keys())
-            anchor_mat = np.array([self._anchors[i] for i in anchor_ids])
-            active_embs = embeddings[active_speakers]
-            dists = cdist(active_embs, anchor_mat, metric=self.metric)
-
             used_local: set = set()
-            for ai, anchor_idx in enumerate(anchor_ids):
+            for anchor_idx in anchor_ids:
                 if anchor_idx in taken_enrolled:
                     continue
 
                 # Collect all candidates within effective threshold
                 candidates = []
-                for li in range(len(active_speakers)):
-                    local_spk = int(active_speakers[li])
+                for li, local_spk in enumerate(active_speakers):
+                    local_spk = int(local_spk)
                     if local_spk in used_local:
                         continue
-                    dist = float(dists[li, ai])
+                    dist = self.enrolled_distance(anchor_idx, embeddings[local_spk], local_spk)
                     eff_delta = self._effective_enrolled_delta(anchor_idx, local_spk)
                     if dist < eff_delta:
                         candidates.append((li, local_spk, dist))
@@ -287,13 +345,14 @@ class EnrolledSpeakerClustering(OnlineSpeakerClustering):
                 prev_local = self._last_local_for_enrolled.get(anchor_idx)
                 prev_match = [c for c in candidates if c[1] == prev_local]
                 if prev_match:
-                    best_li, best_local, _ = min(prev_match, key=lambda x: x[2])
+                    _, best_local, best_dist = min(prev_match, key=lambda x: x[2])
                 else:
-                    best_li, best_local, _ = min(
+                    _, best_local, best_dist = min(
                         candidates,
                         key=lambda x: (x[2], -mean_act[x[1]]),
                     )
                 enrolled_assignments[best_local] = anchor_idx
+                enrolled_assignment_dist[anchor_idx] = float(best_dist)
                 taken_enrolled.add(anchor_idx)
                 used_local.add(best_local)
                 self._last_enrolled_step[anchor_idx] = self._call_count
@@ -310,9 +369,21 @@ class EnrolledSpeakerClustering(OnlineSpeakerClustering):
                     continue
                 if np.isnan(embeddings[s]).any():
                     continue
-                s_dists = cdist(embeddings[s:s+1], anchor_mat, metric=self.metric)
-                min_dist = float(s_dists.min())
-                if min_dist < self.leakage_delta:
+                best_anchor = min(
+                    anchor_ids,
+                    key=lambda a_idx: self.enrolled_distance(a_idx, embeddings[s], int(s)),
+                )
+                min_anchor = int(best_anchor)
+                min_dist = self.enrolled_distance(min_anchor, embeddings[s], int(s))
+                if (
+                    min_anchor in taken_enrolled
+                    and min_dist
+                    <= max(
+                        self.leakage_delta,
+                        self.delta_enrolled,
+                        enrolled_assignment_dist.get(min_anchor, 0.0) + 0.10,
+                    )
+                ):
                     enrolled_leakage.add(int(s))
 
         # ── 2. General matching for remaining speakers ──
@@ -365,9 +436,11 @@ class EnrolledSpeakerClustering(OnlineSpeakerClustering):
             grace_delta = None
             assigned_globals = {int(g) for g in valid_map.valid_assignments(strict=True)[1]}
             if self._anchors and not np.isnan(embeddings[spk]).any():
-                sp_dists = cdist(embeddings[spk:spk+1], anchor_mat, metric=self.metric)
-                min_dist = float(sp_dists.min())
-                min_anchor = anchor_ids[int(sp_dists.argmin())]
+                min_anchor = min(
+                    anchor_ids,
+                    key=lambda a_idx: self.enrolled_distance(a_idx, embeddings[spk], int(spk)),
+                )
+                min_dist = self.enrolled_distance(min_anchor, embeddings[spk], int(spk))
                 prev_local = self._last_local_for_enrolled.get(min_anchor)
                 grace_delta = (
                     self._effective_enrolled_delta(min_anchor, spk)
@@ -394,7 +467,12 @@ class EnrolledSpeakerClustering(OnlineSpeakerClustering):
                 # separation leakage rather than spawning/reusing Unknown-*.
                 if (
                     min_anchor in taken_enrolled
-                    and min_dist < max(self.leakage_delta, self.delta_new)
+                    and min_dist
+                    <= max(
+                        self.leakage_delta,
+                        self.delta_enrolled,
+                        enrolled_assignment_dist.get(min_anchor, 0.0) + 0.10,
+                    )
                 ):
                     continue
 
@@ -487,6 +565,10 @@ class EnrolledSpeakerClustering(OnlineSpeakerClustering):
         for local_spk, global_idx in enrolled_assignments.items():
             valid_map = valid_map.set_source_speaker(local_spk, global_idx)
 
+        for local_spk, global_idx in zip(*valid_map.valid_assignments(strict=True)):
+            if global_idx in self._anchors:
+                self._update_enrolled_session(int(global_idx), embeddings[int(local_spk)])
+
         return valid_map
 
     # ─── Override __call__ ───────────────────────────────────────
@@ -538,8 +620,6 @@ class EnrolledSpeakerClustering(OnlineSpeakerClustering):
         if len(valid_local) == 0 or not self._anchors:
             return
         anchor_ids = sorted(self._anchors.keys())
-        anchor_mat = np.array([self._anchors[i] for i in anchor_ids])
-        dists = cdist(emb_np[valid_local], anchor_mat, metric="cosine")
         anchor_labels = [self._labels.get(i, f"g{i}") for i in anchor_ids]
         l_assigned, g_assigned = speaker_map.valid_assignments(strict=True)
         assign_str = ", ".join(
@@ -552,7 +632,10 @@ class EnrolledSpeakerClustering(OnlineSpeakerClustering):
             "  ".join(f"{l:>12s}" for l in anchor_labels),
             "\n  ".join(
                 f"local-{valid_local[i]}: "
-                + "  ".join(f"{d:12.3f}" for d in row)
-                for i, row in enumerate(dists)
+                + "  ".join(
+                    f"{self.enrolled_distance(anchor_ids[j], emb_np[valid_local[i]], int(valid_local[i])):12.3f}"
+                    for j in range(len(anchor_ids))
+                )
+                for i in range(len(valid_local))
             ),
         )

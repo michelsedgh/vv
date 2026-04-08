@@ -7,13 +7,17 @@ debug:
   step_perf_spike_threshold_ms: 340.0
   step_perf_reset_on_init: true
   step_perf_ndjson: logs/infer_step_perf.ndjson
+  capture_live_session: true
+  live_capture_dir: logs/live_sessions
 # Stack: [optional mic DF] → PixIT (5 s chunk, 0.5 s step) → WeSpeaker on
-# separated sources → EnrolledSpeakerClustering → DelayedAggregation on
-# permuted diarization → per-speaker tail extract + crossfade → [optional DF on output].
+# mixed waveform + segmentation weights → EnrolledSpeakerClustering →
+# global separated-source reconstruction → delayed per-speaker output slice
+# → [optional DF on output].
 #
 # Smooth playback / fewer spectrogram holes (tune in this order):
-#   • audio.output_crossfade_ms — overlap at step boundaries; longer (e.g. 100)
-#     reduces zipper when PixIT tails disagree between steps (see pipeline.py).
+#   • audio.output_latency_sec — must be > step if you want the emitted slice to
+#     be covered by more than one PixIT window. 1.0 s is the minimum useful
+#     value here; 0.5 s falls back to the unstable newest edge again.
 #   • clustering.tau_active — lower ⇒ more “active” locals ⇒ fewer empty maps;
 #     too low adds noise; ~0.28 was a good tradeoff vs 0.4.
 #   • clustering.holdover_* — keep enrolled audio on last PixIT channel when
@@ -29,15 +33,9 @@ debug:
 audio:
   device_index: 0          # sounddevice input device (IC800 USB mic)
   sample_rate: 16000       # PixIT native sample rate
-  # Longer fade masks PixIT tail changing every step (logs showed 0.1–0.22 sample jumps).
-  output_crossfade_ms: 100
-  # After N steps without audio for a global speaker, discard saved tail (else new speech
-  # crossfades from stale/near-silent tail → first word sounds quiet then ramps up).
-  crossfade_stale_silent_steps: 6
-  # If previous tail RMS is below the first and new audio in the fade region is louder,
-  # skip crossfade for that step (full-level attack after silence).
-  crossfade_onset_skip_if_prev_below: 0.02
-  crossfade_onset_skip_if_new_above: 0.025
+  # Emit audio with the same 2.0 s latency used by diarization aggregation so
+  # every speaker packet is built from multiple overlapping PixIT windows.
+  output_latency_sec: 2.0
 
 device: cuda               # torch device
 
@@ -83,6 +81,7 @@ clustering:
   rho_update: 0.3          # slightly lower so speaker tracking updates on less sustained speech
   delta_new: 0.62          # slightly looser so one real unknown speaker doesn't fragment into many lanes
   delta_enrolled: 0.70     # enrolled match threshold (mich=0.24, others>0.69; safe margin)
+  enrolled_session_alpha: 0.15  # adapt a session-local enrolled centroid slowly after confident matches; frozen enrollment stays untouched
   max_speakers: 8          # max global speakers tracked across session
   max_drift: 0.0           # unused (enrolled centroids are frozen)
   enrolled_grace_margin: 0.05   # grace only for the previously matched local channel
@@ -93,10 +92,12 @@ clustering:
   unknown_min_voiced_sec: 0.35  # don't create a new unknown speaker from a tiny onset fragment
   unknown_min_tail_rms: 0.01    # don't keep/spawn Unknown-* from stale context when the current separated tail is effectively silent
   reentry_max_steps: 8          # after a short silence gap, allow the last enrolled local channel to reclaim the speaker on the first onset
-  reentry_min_voiced_sec: 0.25
+  reentry_min_voiced_sec: 0.05   # let the last enrolled speaker reclaim the first post-silence packet instead of waiting for a long voiced window
   reentry_tail_rms: 0.02
   reentry_dominance_ratio: 3.0
   unknown_output_min_activity: 0.05  # low-confidence Unknown-* flicker is dropped from output/UI
+  unknown_output_min_tail_rms: 0.02  # drop Unknown-* if the current separated tail is essentially flat
+  unknown_output_min_tail_ratio: 0.15  # also drop Unknown-* when its tail energy is tiny relative to the dominant local speaker
   # Keep continuity conservative: only rescue the last enrolled local channel when
   # segmentation and tail energy still both indicate speech, or when the current
   # embedding is still close to the enrolled anchor.

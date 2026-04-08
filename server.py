@@ -76,6 +76,7 @@ class MonitorState:
         self.stop_event = threading.Event()
         self.step_count = 0
         self.last_infer_ms = 0.0
+        self.last_capture_dir: Optional[str] = None
 
     def reset(self):
         self.running = False
@@ -83,6 +84,140 @@ class MonitorState:
         self.stop_event = threading.Event()
         self.step_count = 0
         self.last_infer_ms = 0.0
+        self.last_capture_dir = None
+
+
+def _slug_label(label: str) -> str:
+    safe = "".join(ch.lower() if ch.isalnum() else "_" for ch in str(label))
+    safe = safe.strip("_")
+    return safe or "speaker"
+
+
+class LiveSessionCapture:
+    """Capture raw mic + emitted per-speaker audio + per-step metadata."""
+
+    def __init__(self, root_dir: Path, sample_rate: int, step_samples: int):
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.session_id = f"live_{ts}"
+        self.root_dir = root_dir / self.session_id
+        self.sample_rate = int(sample_rate)
+        self.step_samples = int(step_samples)
+        self._silence = np.zeros(self.step_samples, dtype=np.int16)
+        self.mic_blocks: List[np.ndarray] = []
+        self.speaker_blocks: Dict[int, List[np.ndarray]] = {}
+        self.speaker_labels: Dict[int, List[str]] = {}
+        self.step_meta: List[dict] = []
+
+    def record_mic_block(self, block: np.ndarray) -> None:
+        audio_i16 = np.clip(
+            np.asarray(block, dtype=np.float32) * 32767.0,
+            -32768,
+            32767,
+        ).astype(np.int16)
+        self.mic_blocks.append(audio_i16.copy())
+
+    def record_step(self, result) -> None:
+        step_idx = int(result.step_idx)
+        present_audio: Dict[int, np.ndarray] = {}
+        present_labels: Dict[int, str] = {}
+        speakers_meta = []
+
+        for sp in result.speakers:
+            speaker_id = int(sp.global_idx)
+            audio_i16 = np.clip(sp.audio * 32767, -32768, 32767).astype(np.int16)
+            present_audio[speaker_id] = audio_i16
+            present_labels[speaker_id] = str(sp.label)
+            audio_f64 = np.asarray(sp.audio, dtype=np.float64)
+            speakers_meta.append({
+                "id": speaker_id,
+                "label": str(sp.label),
+                "enrolled": bool(sp.is_enrolled),
+                "activity": round(float(sp.activity), 4),
+                "identity_similarity": (
+                    round(float(sp.identity_similarity), 4)
+                    if sp.identity_similarity is not None
+                    else None
+                ),
+                "audio_rms": (
+                    round(float(np.sqrt(np.mean(audio_f64 ** 2))), 6)
+                    if audio_f64.size
+                    else 0.0
+                ),
+                "audio_peak": (
+                    round(float(np.max(np.abs(audio_f64))), 6)
+                    if audio_f64.size
+                    else 0.0
+                ),
+            })
+
+        for speaker_id, label in present_labels.items():
+            if speaker_id not in self.speaker_blocks:
+                self.speaker_blocks[speaker_id] = [
+                    self._silence.copy() for _ in range(step_idx)
+                ]
+                self.speaker_labels[speaker_id] = []
+            history = self.speaker_labels[speaker_id]
+            if not history or history[-1] != label:
+                history.append(label)
+
+        for speaker_id, blocks in self.speaker_blocks.items():
+            while len(blocks) < step_idx:
+                blocks.append(self._silence.copy())
+            blocks.append(present_audio.get(speaker_id, self._silence.copy()))
+
+        self.step_meta.append({
+            "step": step_idx,
+            "infer_ms": round(float(result.infer_ms), 3),
+            "speakers": speakers_meta,
+        })
+
+    def finalize(self) -> Path:
+        self.root_dir.mkdir(parents=True, exist_ok=True)
+
+        if self.mic_blocks:
+            mic = np.concatenate(self.mic_blocks)
+        else:
+            mic = np.zeros(0, dtype=np.int16)
+        sf.write(
+            str(self.root_dir / "mic_input.wav"),
+            mic,
+            self.sample_rate,
+            subtype="PCM_16",
+        )
+
+        manifest = {
+            "session_id": self.session_id,
+            "sample_rate": self.sample_rate,
+            "step_samples": self.step_samples,
+            "num_steps": len(self.step_meta),
+            "num_speakers": len(self.speaker_blocks),
+            "speakers": {},
+        }
+
+        for speaker_id, blocks in sorted(self.speaker_blocks.items()):
+            audio = np.concatenate(blocks) if blocks else np.zeros(0, dtype=np.int16)
+            labels = self.speaker_labels.get(speaker_id, [])
+            label = labels[-1] if labels else f"speaker_{speaker_id}"
+            fname = f"speaker_{speaker_id}_{_slug_label(label)}.wav"
+            sf.write(
+                str(self.root_dir / fname),
+                audio,
+                self.sample_rate,
+                subtype="PCM_16",
+            )
+            manifest["speakers"][str(speaker_id)] = {
+                "file": fname,
+                "labels": labels,
+            }
+
+        with open(self.root_dir / "steps.ndjson", "w") as f:
+            for row in self.step_meta:
+                f.write(json.dumps(row) + "\n")
+
+        with open(self.root_dir / "manifest.json", "w") as f:
+            json.dump(manifest, f, indent=2)
+
+        return self.root_dir
 
 
 monitor = MonitorState()
@@ -215,6 +350,7 @@ def _pack_audio_packet(
 def _run_diarization_monitor():
     """Background thread: mic → rolling buffer → pipeline → WebSocket."""
     cfg = load_config()
+    dbg_cfg = cfg.get("debug", {})
     sample_rate = cfg["audio"]["sample_rate"]
     device_index = cfg["audio"]["device_index"]
     duration = cfg["pixit"]["duration"]
@@ -222,6 +358,13 @@ def _run_diarization_monitor():
 
     chunk_samples = int(duration * sample_rate)    # 80000
     step_samples = int(step * sample_rate)         # 8000
+    capture: Optional[LiveSessionCapture] = None
+    if dbg_cfg.get("capture_live_session", True):
+        capture_root = BASE_DIR / dbg_cfg.get(
+            "live_capture_dir", "logs/live_sessions"
+        )
+        capture = LiveSessionCapture(capture_root, sample_rate, step_samples)
+        log.info("Live session capture enabled: %s", capture.root_dir)
 
     # Load enrolled embeddings
     enrolled = load_enrolled_embeddings(cfg)
@@ -279,6 +422,8 @@ def _run_diarization_monitor():
     def broadcast_step_result(result):
         monitor.step_count = result.step_idx
         monitor.last_infer_ms = result.infer_ms
+        if capture is not None:
+            capture.record_step(result)
 
         speakers_data = []
         audio_packets = []
@@ -318,6 +463,8 @@ def _run_diarization_monitor():
                 try:
                     block = mic_queue.get_nowait()
                     block = pipeline.denoise_block(block)  # ~8ms for 500ms
+                    if capture is not None:
+                        capture.record_mic_block(block)
                     with buf_lock:
                         audio_buffer = np.concatenate([audio_buffer, block])
                         chunk = _build_live_chunk(audio_buffer, chunk_samples)
@@ -339,6 +486,11 @@ def _run_diarization_monitor():
     finally:
         mic_stream.stop()
         mic_stream.close()
+        if capture is not None:
+            saved_dir = capture.finalize()
+            monitor.last_capture_dir = str(saved_dir)
+            log.info("Live session capture saved: %s", saved_dir)
+            ws_event("status", message=f"Capture saved: {saved_dir.name}")
         monitor.running = False
         ws_event("status", message="Monitor stopped.")
         log.info("Diarization monitor stopped.")
@@ -469,6 +621,7 @@ async def api_status():
         "running": monitor.running,
         "step": monitor.step_count,
         "infer_ms": round(monitor.last_infer_ms, 1),
+        "last_capture_dir": monitor.last_capture_dir,
     }
 
 

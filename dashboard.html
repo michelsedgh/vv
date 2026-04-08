@@ -141,7 +141,7 @@ const AUDIO_LOOKAHEAD_SEC = 0.12;
 const AUDIO_MAX_BUFFER_SEC = 0.75;
 const AUDIO_PACKET_HEADER_BYTES = 20;
 const AUDIO_PACKET_MAGIC = 'VAUD';
-const UNKNOWN_LANE_STALE_STEPS = 8;
+const UNKNOWN_LANE_STALE_STEPS = 3;
 let currentStep = 0;
 
 // ─── Diarization Timeline State ──────────────────────────────────
@@ -278,19 +278,11 @@ function createSpeakerLane(sp) {
   canvas.height = 80;
   const canvasCtx = canvas.getContext('2d');
 
-  // Audio playback node
-  let gainNode = null;
-  if (audioCtx) {
-    gainNode = audioCtx.createGain();
-    gainNode.gain.value = defaultMuted ? 0 : 0.8;
-    gainNode.connect(audioCtx.destination);
-  }
-
   speakerLanes[id] = {
     element: div,
     canvas: canvas,
     canvasCtx: canvasCtx,
-    gainNode: gainNode,
+    gainNode: null,
     color: color,
     waveformBuf: new Float32Array(0),
     muted: defaultMuted,
@@ -300,11 +292,37 @@ function createSpeakerLane(sp) {
     lastSeenStep: currentStep,
   };
 
+  ensureLaneAudioNode(speakerLanes[id]);
   refreshLaneMuteUI(speakerLanes[id]);
   return speakerLanes[id];
 }
 
+function ensureLaneAudioNode(lane) {
+  if (!audioCtx || lane.gainNode) return;
+  const slider = lane.element.querySelector('.vol-slider');
+  lane.gainNode = audioCtx.createGain();
+  lane.gainNode.gain.value = lane.muted ? 0 : ((slider ? Number(slider.value) : 80) / 100);
+  lane.gainNode.connect(audioCtx.destination);
+}
+
+async function ensureAudioReady() {
+  if (!audioCtx) {
+    audioCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
+  }
+  if (audioCtx.state !== 'running') {
+    try {
+      await audioCtx.resume();
+    } catch (err) {
+      logEvent('Audio resume failed: ' + err, true);
+    }
+  }
+  for (const lane of Object.values(speakerLanes)) {
+    ensureLaneAudioNode(lane);
+  }
+}
+
 function refreshLaneMuteUI(lane) {
+  ensureLaneAudioNode(lane);
   const btn = lane.element.querySelector('.mute-btn');
   btn.textContent = lane.muted ? 'unmute' : 'mute';
   btn.classList.toggle('text-red-400', lane.muted);
@@ -387,6 +405,9 @@ function appendSpeakerAudio(speakerId, f32, sampleRate) {
 
   drawWaveform(lane);
 
+  if (audioCtx && !lane.gainNode) {
+    ensureLaneAudioNode(lane);
+  }
   if (audioCtx && lane.gainNode && !lane.muted) {
     playAudio(f32, sampleRate, lane);
   }
@@ -452,6 +473,10 @@ function drawWaveform(lane) {
 
 function playAudio(f32, sampleRate, lane) {
   if (!audioCtx || !lane.gainNode) return;
+  if (audioCtx.state !== 'running') {
+    audioCtx.resume().catch(() => {});
+    return;
+  }
   const buf = audioCtx.createBuffer(1, f32.length, sampleRate);
   buf.getChannelData(0).set(f32);
   const src = audioCtx.createBufferSource();
@@ -492,10 +517,7 @@ function toggleMute(id) {
 async function toggleMonitor() {
   const btn = document.getElementById('btn-start');
   if (!isRunning) {
-    // Init AudioContext on user gesture
-    if (!audioCtx) {
-      audioCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
-    }
+    await ensureAudioReady();
     try {
       const resp = await fetch('/api/start', { method: 'POST' });
       if (resp.ok) {
