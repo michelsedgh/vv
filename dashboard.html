@@ -138,6 +138,7 @@ const COLORS = [
   '#ec4899', '#14b8a6', '#f97316'
 ];
 const AUDIO_LOOKAHEAD_SEC = 0.12;
+const AUDIO_MIN_LEAD_SEC = 0.02;
 const AUDIO_MAX_BUFFER_SEC = 0.75;
 const AUDIO_PACKET_HEADER_BYTES = 20;
 const AUDIO_PACKET_MAGIC = 'VAUD';
@@ -289,6 +290,8 @@ function createSpeakerLane(sp) {
     autoMuted: defaultMuted,
     enrolled: !!sp.enrolled,
     nextPlayTime: 0,  // scheduled AudioContext time for gapless playback
+    lastPacketStep: null,
+    lastPacketStart: 0,
     lastSeenStep: currentStep,
   };
 
@@ -396,7 +399,7 @@ function pruneStaleUnknownLanes(step) {
   }
 }
 
-function appendSpeakerAudio(speakerId, f32, sampleRate) {
+function appendSpeakerAudio(speakerId, f32, sampleRate, packetStep = null) {
   const lane = speakerLanes[speakerId];
   if (!lane) return;
 
@@ -414,7 +417,7 @@ function appendSpeakerAudio(speakerId, f32, sampleRate) {
     ensureLaneAudioNode(lane);
   }
   if (audioCtx && lane.gainNode && !lane.muted) {
-    playAudio(f32, sampleRate, lane);
+    playAudio(f32, sampleRate, lane, packetStep);
   }
 }
 
@@ -430,6 +433,7 @@ function handleAudioPacket(buffer) {
     return;
   }
 
+  const packetStep = view.getUint32(4, true);
   const speakerId = view.getUint32(8, true);
   const sampleRate = view.getUint32(12, true);
   const numSamples = view.getUint32(16, true);
@@ -440,7 +444,7 @@ function handleAudioPacket(buffer) {
 
   const i16 = new Int16Array(buffer, AUDIO_PACKET_HEADER_BYTES, numSamples);
   const f32 = decodePcm16(i16);
-  appendSpeakerAudio(speakerId, f32, sampleRate);
+  appendSpeakerAudio(speakerId, f32, sampleRate, packetStep);
 }
 
 function drawWaveform(lane) {
@@ -476,7 +480,7 @@ function drawWaveform(lane) {
   ctx.stroke();
 }
 
-function playAudio(f32, sampleRate, lane) {
+function playAudio(f32, sampleRate, lane, packetStep = null) {
   if (!audioCtx || !lane.gainNode) return;
   if (audioCtx.state !== 'running') {
     audioCtx.resume().catch(() => {});
@@ -488,19 +492,39 @@ function playAudio(f32, sampleRate, lane) {
   src.buffer = buf;
   src.connect(lane.gainNode);
 
-  // Keep a modest playback buffer so websocket/JS jitter does not create
-  // audible underruns, but also drop stale backlog if scheduling drifts.
+  // Schedule from packet sequence, not raw arrival time. Arrival-jitter-based
+  // scheduling can reset every few steps and sound like disconnect/reconnect
+  // even when packets are continuous.
   const now = audioCtx.currentTime;
   const duration = f32.length / sampleRate;
   const targetStart = now + AUDIO_LOOKAHEAD_SEC;
+  let scheduledStart = targetStart;
+  const hasPacketStep = Number.isInteger(packetStep);
+
   if (
-    lane.nextPlayTime < targetStart ||
-    lane.nextPlayTime > now + AUDIO_MAX_BUFFER_SEC
+    hasPacketStep &&
+    Number.isInteger(lane.lastPacketStep) &&
+    packetStep > lane.lastPacketStep
   ) {
-    lane.nextPlayTime = targetStart;
+    const stepDelta = packetStep - lane.lastPacketStep;
+    const expectedStart = lane.lastPacketStart + stepDelta * duration;
+    if (expectedStart <= now + AUDIO_MAX_BUFFER_SEC) {
+      scheduledStart = Math.max(expectedStart, now + AUDIO_MIN_LEAD_SEC);
+    }
+  } else if (
+    lane.nextPlayTime >= now + AUDIO_MIN_LEAD_SEC &&
+    lane.nextPlayTime <= now + AUDIO_MAX_BUFFER_SEC
+  ) {
+    scheduledStart = lane.nextPlayTime;
   }
-  src.start(lane.nextPlayTime);
-  lane.nextPlayTime += duration;
+  if (scheduledStart < targetStart && !hasPacketStep) {
+    scheduledStart = targetStart;
+  }
+
+  src.start(scheduledStart);
+  lane.nextPlayTime = scheduledStart + duration;
+  lane.lastPacketStart = scheduledStart;
+  lane.lastPacketStep = hasPacketStep ? packetStep : null;
 }
 
 function setVolume(id, val) {

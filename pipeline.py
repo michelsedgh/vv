@@ -329,8 +329,19 @@ class RealtimePipeline:
             strategy="first",
             cropping_mode="center",
         )
+        # Audio gating must use a prediction track aligned to the SAME delayed
+        # step as emitted audio. Using the 2.0 s UI/activity aggregation here
+        # would shift the gate by multiple 500 ms steps and create periodic
+        # packet-boundary dropouts.
+        self._emit_pred_aggregation = DelayedAggregation(
+            self.step_duration,
+            latency=self._output_latency_sec,
+            strategy="hamming",
+            cropping_mode="loose",
+        )
         self._audio_buffer: List[SlidingWindowFeature] = []
         self._mix_buffer: List[SlidingWindowFeature] = []
+        self._emit_pred_buffer: List[SlidingWindowFeature] = []
         self._emit_meta_buffer: List[tuple[int, List[Dict[str, Any]]]] = []
         if self._step_perf_log and self._step_perf_path is not None:
             log.info(
@@ -627,12 +638,20 @@ class RealtimePipeline:
             audio = audio[: self.step_samples]
         return audio
 
-    def _step_track_mask(self, step_track: np.ndarray, threshold: float, collar_sec: float) -> np.ndarray:
-        """Upsample one step-length activity track to a sample mask."""
+    def _step_track_mask(self, step_track: np.ndarray, collar_sec: float) -> np.ndarray:
+        """Upsample one delayed global activity track to a sample gate mask.
+
+        The important fix is *which* track we gate with: the delayed aggregated
+        global speaker track, not the raw current-step local track. We still use
+        a binary speech gate here so enrolled playback keeps its level instead
+        of collapsing to very low volume on every low-confidence frame.
+        """
         track = np.asarray(step_track, dtype=np.float32).reshape(-1)
         if track.size == 0:
             return np.zeros(self.step_samples, dtype=np.float32)
-        active = track >= float(threshold)
+        track = np.nan_to_num(track, nan=0.0, posinf=1.0, neginf=0.0)
+        track = np.clip(track, 0.0, 1.0)
+        active = track >= float(self._enrolled_mix_gate_threshold)
         if collar_sec > 0.0:
             frame_sec = self.step_duration / float(max(1, track.size))
             collar_frames = max(0, int(round(collar_sec / frame_sec)))
@@ -1076,8 +1095,12 @@ class RealtimePipeline:
         if len(self._pred_seg_buffer) == self._pred_aggregation.num_overlapping_windows:
             self._pred_seg_buffer = self._pred_seg_buffer[1:]
 
-        n_seg_frames = agg_permuted.data.shape[0]
-        step_frames = max(1, int(n_seg_frames * self.step_duration / self.duration))
+        self._emit_pred_buffer.append(permuted_seg)
+        emit_agg_permuted = self._emit_pred_aggregation(self._emit_pred_buffer)
+        if len(self._emit_pred_buffer) == self._emit_pred_aggregation.num_overlapping_windows:
+            self._emit_pred_buffer = self._emit_pred_buffer[1:]
+
+        emit_step_scores = np.asarray(emit_agg_permuted.data, dtype=np.float32)
 
         t4 = tc()
         # ── 4. Map sources to global speakers (single window) ──
@@ -1123,7 +1146,7 @@ class RealtimePipeline:
             (self.chunk_samples, self.clustering.max_speakers),
             dtype=np.float32,
         )
-        emit_pairs: List[tuple[int, int, float, bool, np.ndarray]] = []
+        emit_pairs: List[tuple[int, int, float, bool]] = []
         local_step_frames = max(
             1, int(round(seg_np.shape[0] * self.step_duration / self.duration))
         )
@@ -1161,21 +1184,12 @@ class RealtimePipeline:
                 src = sources[0, :, local_idx].detach().cpu().numpy()
                 chunk_global[:, global_idx] = src.astype(np.float32, copy=False)
                 step_track = seg_np[-local_step_frames:, local_idx]
-                mix_mask = (
-                    self._step_track_mask(
-                        step_track,
-                        self._enrolled_mix_gate_threshold,
-                        self._enrolled_mix_gate_collar_sec,
-                    )
-                    if is_enrolled and self._enrolled_live_mix
-                    else np.zeros(self.step_samples, dtype=np.float32)
-                )
-                emit_pairs.append((local_idx, global_idx, activity, is_enrolled, mix_mask))
+                emit_pairs.append((local_idx, global_idx, activity, is_enrolled))
 
         delayed_audio = self._aggregate_audio_chunk(self._step_idx, chunk_global)
         delayed_mix_audio = self._aggregate_mix_chunk(self._step_idx, waveform)
         current_emit_meta: List[Dict[str, Any]] = []
-        for local_idx, global_idx, activity, is_enrolled, mix_mask in emit_pairs:
+        for local_idx, global_idx, activity, is_enrolled in emit_pairs:
             label = self.clustering.get_label(global_idx)
             id_sim: Optional[float] = None
             if global_idx in self.clustering._anchors:
@@ -1195,7 +1209,6 @@ class RealtimePipeline:
                     "activity": float(activity),
                     "is_enrolled": bool(is_enrolled),
                     "identity_similarity": id_sim,
-                    "mix_mask": mix_mask,
                 }
             )
 
@@ -1210,18 +1223,36 @@ class RealtimePipeline:
                 delayed_emit_meta = hist_meta
                 break
 
-        for meta in delayed_emit_meta:
-            global_idx = int(meta["global_idx"])
-            activity = float(meta["activity"])
-            is_enrolled = bool(meta["is_enrolled"])
-            label = str(meta["label"])
-            id_sim = meta["identity_similarity"]
+        delayed_meta_by_global: Dict[int, Dict[str, Any]] = {
+            int(meta["global_idx"]): meta for meta in delayed_emit_meta
+        }
+        candidate_globals = set(delayed_meta_by_global.keys())
+        if self._enrolled_live_mix and emit_step_scores.ndim == 2:
+            continuity_min = max(0.02, self._enrolled_mix_gate_threshold * 0.5)
+            for global_idx in self.clustering._anchors:
+                if global_idx >= emit_step_scores.shape[1]:
+                    continue
+                if float(np.max(emit_step_scores[:, global_idx])) >= continuity_min:
+                    candidate_globals.add(int(global_idx))
+
+        for global_idx in sorted(candidate_globals):
+            meta = delayed_meta_by_global.get(global_idx)
+            is_enrolled = bool(meta["is_enrolled"]) if meta is not None else self.clustering.is_enrolled(global_idx)
+            if not is_enrolled and meta is None:
+                continue
+            label = str(meta["label"]) if meta is not None else self.clustering.get_label(global_idx)
+            id_sim = meta["identity_similarity"] if meta is not None else None
+            if emit_step_scores.ndim == 2 and global_idx < emit_step_scores.shape[1]:
+                global_track = emit_step_scores[:, global_idx]
+            else:
+                global_track = np.zeros(1, dtype=np.float32)
+            activity = float(np.mean(global_track)) if global_track.size else 0.0
 
             audio = delayed_audio[:, global_idx].astype(np.float32, copy=False)
             if is_enrolled and self._enrolled_live_mix:
-                mix_mask = np.asarray(
-                    meta.get("mix_mask", np.zeros(self.step_samples, dtype=np.float32)),
-                    dtype=np.float32,
+                mix_mask = self._step_track_mask(
+                    global_track,
+                    self._enrolled_mix_gate_collar_sec,
                 )
                 if mix_mask.shape[0] != delayed_mix_audio.shape[0]:
                     mix_mask = np.resize(mix_mask, delayed_mix_audio.shape[0]).astype(np.float32)
@@ -1357,8 +1388,10 @@ class RealtimePipeline:
         """Reset pipeline state for a new session."""
         self._step_idx = 0
         self._audio_buffer.clear()
+        self._mix_buffer.clear()
         self._emit_meta_buffer.clear()
         self._pred_seg_buffer.clear()
+        self._emit_pred_buffer.clear()
         self._df_output_states.clear()
         # Re-create clustering with same params, re-inject enrolled centroids
         clust_cfg = self.cfg["clustering"]
