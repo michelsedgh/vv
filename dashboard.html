@@ -133,6 +133,20 @@ let isRunning = false;
 let audioCtx = null;
 const speakerLanes = {};  // global_id -> { element, canvas, canvasCtx, gainNode, waveformData, ... }
 
+// Dashboard audio notes
+// ---------------------
+// The visuals and the heard audio intentionally use different signals:
+//
+// - visuals follow speaker/activity metadata from the backend
+// - audio is driven by binary PCM packets sent right after each diarization step
+//
+// A long debugging thread found that "visuals look continuous but audio sounds
+// like it reconnects every few steps" was mostly a browser scheduling bug, not
+// a model bug: the client used to schedule each 500 ms audio packet by arrival
+// time only. Normal websocket/JS jitter was enough to reset playback and create
+// audible gaps. We now use ``step_idx`` from the packet header as part of the
+// audio scheduling contract. Keep that in mind before changing lookahead values.
+
 const COLORS = [
   '#ef4444', '#3b82f6', '#22c55e', '#f59e0b', '#8b5cf6',
   '#ec4899', '#14b8a6', '#f97316'
@@ -290,6 +304,7 @@ function createSpeakerLane(sp) {
     autoMuted: defaultMuted,
     enrolled: !!sp.enrolled,
     nextPlayTime: 0,  // scheduled AudioContext time for gapless playback
+    // Packet sequence state used to schedule by backend step, not arrival time.
     lastPacketStep: null,
     lastPacketStart: 0,
     lastSeenStep: currentStep,
@@ -433,6 +448,8 @@ function handleAudioPacket(buffer) {
     return;
   }
 
+  // ``step_idx`` comes from server.py::_pack_audio_packet and is critical for
+  // stable browser-side scheduling.
   const packetStep = view.getUint32(4, true);
   const speakerId = view.getUint32(8, true);
   const sampleRate = view.getUint32(12, true);
@@ -495,6 +512,10 @@ function playAudio(f32, sampleRate, lane, packetStep = null) {
   // Schedule from packet sequence, not raw arrival time. Arrival-jitter-based
   // scheduling can reset every few steps and sound like disconnect/reconnect
   // even when packets are continuous.
+  //
+  // ``targetStart`` is still used as a fallback for the very first packet or if
+  // we ever lose sequence continuity badly enough that resynchronizing is safer
+  // than stretching stale timing state.
   const now = audioCtx.currentTime;
   const duration = f32.length / sampleRate;
   const targetStart = now + AUDIO_LOOKAHEAD_SEC;

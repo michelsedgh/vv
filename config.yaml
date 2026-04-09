@@ -12,8 +12,19 @@ debug:
 # Stack: [optional mic DF] → PixIT (5 s chunk, 0.5 s step) → WeSpeaker on
 # mixed waveform + segmentation weights → EnrolledSpeakerClustering →
 # global separated-source reconstruction → delayed per-speaker output slice
-# → [optional DF on output].
+# → dashboard websocket transport / packet-step scheduling → browser playback.
 #
+# History-backed rules from debugging this repo:
+#   • Do not reintroduce variable-length per-source embedding crops for live ID.
+#     That was the main infer-ms regression that pushed runtime from ~240 ms
+#     toward ~480+ ms.
+#   • Do not treat raw current-window PixIT locals as perfectly stable live
+#     speaker streams. They are useful for verification/diagnostics, but direct
+#     playback caused weak onsets, leakage, and chopped words.
+#   • If audio sounds chopped in 500 ms windows while visuals look OK, first
+#     suspect latency alignment between emitted audio, emitted activity mask, and
+#     the browser scheduler before changing model thresholds.
+# 
 # Smooth playback / fewer spectrogram holes (tune in this order):
 #   • audio.output_latency_sec — must be > step if you want the emitted slice to
 #     be covered by more than one PixIT window. 1.0 s is the minimum useful
@@ -40,6 +51,9 @@ audio:
   # Live enrolled playback uses delayed mixed audio gated by the assigned
   # speaker track, not raw separated PixIT locals. This is the causally stable
   # path; raw separated locals are still used for verification.
+  # Important: the gate that controls this path must be aggregated with the
+  # SAME latency as ``output_latency_sec``. Using the slower 2.0 s UI smoother
+  # here created the "good window / bad window" chopping bug.
   enrolled_live_mix: true
   enrolled_mix_gate_threshold: 0.07
   enrolled_mix_gate_collar_sec: 0.03
@@ -73,6 +87,9 @@ embedding:
   # channels only for final audio extraction. Identity uses diart's official
   # mixed-waveform + segmentation-weight path, but only on a fixed recent window
   # so stale silence in the 5 s buffer does not dominate onset verification.
+  # The live enrolled verifier still uses fixed-length separated-source
+  # embeddings internally, because that matched enrollment much better than
+  # forcing every persistent-ID decision through the mixed weighted path.
   source_seg_threshold: 0.14
   source_min_voiced_sec: 0.10
   source_recent_sec: 2.0
@@ -83,6 +100,8 @@ embedding:
 clustering:
   # Keep this section close to vanilla diart: plain tau/rho/delta clustering,
   # plus the minimum extra pieces needed for persistent enrolled identity.
+  # We previously had a much larger custom rescue stack here; that made the
+  # system harder to reason about and contributed to choppy output.
   tau_active: 0.28
   rho_update: 0.3
   delta_new: 0.62

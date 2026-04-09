@@ -9,6 +9,27 @@ This keeps only the custom behavior we actually need on top of diart:
    matched enrolled speaker
 
 Everything else should stay close to vanilla diart OnlineSpeakerClustering.
+
+Why this file still exists
+──────────────────────────
+During debugging we tried both extremes:
+
+- lots of custom rescue / holdover / remap logic:
+  this made the output choppy and hard to reason about
+- totally vanilla diart:
+  this fragmented the enrolled speaker into ``Unknown-*`` lanes too easily in
+  our PixIT + enrollment setup
+
+This module is the small compromise that survived:
+
+- frozen enrolled anchors for persistent identity
+- optional multi-vector enrollment profiles for robustness
+- enrolled-first assignment
+- duplicate-leakage suppression
+- unknown-lane reuse before spawning more speakers
+
+Anything beyond that should be treated skeptically unless logs clearly show why
+it is necessary.
 """
 
 from __future__ import annotations
@@ -27,7 +48,13 @@ log = logging.getLogger(__name__)
 
 
 class EnrolledSpeakerClustering(OnlineSpeakerClustering):
-    """Online clustering with frozen enrolled centroids."""
+    """Online clustering with frozen enrolled centroids.
+
+    Important distinction:
+    diart's clustering solves online speaker consistency *within a session*.
+    This subclass adds the minimum needed to recognize enrolled speakers across
+    sessions without letting those frozen identities drift.
+    """
 
     def __init__(
         self,
@@ -127,6 +154,10 @@ class EnrolledSpeakerClustering(OnlineSpeakerClustering):
     def _anchor_embedding(
         self, embedding: np.ndarray, local_spk: Optional[int] = None
     ) -> np.ndarray:
+        # Prefer direct separated-source verification embeddings for enrolled
+        # comparisons when available. This was empirically more stable than
+        # using the mixed weighted embedding for both clustering and persistent
+        # speaker verification.
         if (
             local_spk is not None
             and self._verify_embeddings is not None
@@ -185,6 +216,11 @@ class EnrolledSpeakerClustering(OnlineSpeakerClustering):
             )
 
         # 1. Greedy enrolled-first matching.
+        #
+        # This ordering is intentional. Without it, strong local unknown
+        # candidates could temporarily win before the enrolled anchor had a
+        # chance to claim the same speech, which created ``Unknown-*`` onsets
+        # for the enrolled speaker.
         enrolled_assignments: Dict[int, int] = {}
         enrolled_assignment_dist: Dict[int, float] = {}
         taken_enrolled: set[int] = set()
@@ -204,6 +240,10 @@ class EnrolledSpeakerClustering(OnlineSpeakerClustering):
             taken_enrolled.add(anchor_idx)
 
         # 2. Suppress duplicate enrolled leakage locals.
+        #
+        # PixIT can put the same real speaker into more than one local channel
+        # in a chunk. Treat those secondary locals as leakage of the matched
+        # enrolled speaker, not as evidence for spawning a new ``Unknown-*``.
         enrolled_leakage: set[int] = set()
         if taken_enrolled:
             for local_spk in active_speakers:
@@ -225,6 +265,10 @@ class EnrolledSpeakerClustering(OnlineSpeakerClustering):
                     enrolled_leakage.add(local_spk)
 
         # 3. Plain vanilla matching for the rest.
+        #
+        # At this point we deliberately fall back toward diart's normal online
+        # behavior. The rest of the system became much more stable once we
+        # stopped trying to "fix" every edge case here.
         remaining_active = np.array(
             [
                 int(s)

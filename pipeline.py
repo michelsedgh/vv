@@ -1,9 +1,16 @@
 """
 RealtimePipeline — orchestrates DeepFilterNet → PixIT → WeSpeaker → EnrolledClustering.
 
-Identity follows diart's official embedding path: mixed waveform plus
-per-speaker segmentation weights. PixIT-separated channels are used only for
-final audio reconstruction.
+Current architecture
+────────────────────
+Identity follows diart's official embedding idea: a mixed waveform plus
+per-speaker segmentation weights. PixIT-separated channels are still useful,
+but only in tightly scoped places:
+
+1. direct separated-source verification for *enrolled* matching, so live and
+   enrollment embeddings stay in the same domain
+2. separated-source reconstruction / diagnostics
+3. never as "instant stable causal speaker streams" for live playback
 
 Data flow per step
 ──────────────────
@@ -17,7 +24,46 @@ Data flow per step
       (same idea as diart SpeakerDiarization.pred_aggregation; clustering still
       runs on the instantaneous permuted chunk like DIART)
     → source mapping: per-speaker step audio + activity from aggregated seg
+    → enrolled live playback: delayed mixed audio gated by aligned global activity
     → [optional] DeepFilterNet on separated audio for enrolled speakers only
+
+Historical debugging summary
+───────────────────────────
+These notes are here because we spent a long time chasing symptoms that looked
+like "bad models" but were actually integration bugs:
+
+- Infer-ms spikes:
+  We previously built variable-length per-source waveform crops for WeSpeaker
+  and sometimes retried on larger buffers. That made one step turn into several
+  unequal embedding forwards and pushed inference from ~240 ms to ~480+ ms.
+  The fix was to stop doing custom long variable crops for clustering and to use
+  a fixed recent window with diart's overlap-aware mixed-waveform embedding path.
+
+- Enrollment mismatch:
+  Using one brittle frozen vector was not enough. Enrollment is now re-extracted
+  through the same PixIT/WeSpeaker path as live audio, and we keep a small
+  enrollment profile so first-word variations do not immediately become
+  ``Unknown-*``.
+
+- Raw PixIT live audio:
+  PixIT is a fixed-number separator on overlapping 5 s windows. A local source
+  at time ``t`` is not a stable realtime speaker track by itself. Streaming raw
+  current-window separated tails caused weak onsets, leakage, and chopped words.
+  Live enrolled playback therefore uses delayed *mixed* audio gated by the
+  speaker track. Separation remains useful for verification and diagnostics.
+
+- Gate/audio latency mismatch:
+  We once gated emitted audio with the 2.0 s activity smoother while the audio
+  packets themselves were delayed only 1.0 s. That shifted the mute/unmute
+  decision by whole 500 ms steps and created the "good window / bad window"
+  effect. The emit-time gate now has its own aggregation path aligned to the
+  actual output latency.
+
+- Dashboard audio vs visuals:
+  The browser originally scheduled chunks by websocket arrival time only. That
+  made the heard audio periodically "disconnect/reconnect" even while backend
+  packets and visuals were continuous. The binary audio packet header already
+  carries ``step_idx``; the dashboard now uses it for gapless scheduling.
 
 Playback quality and output alignment
 ────────────────────────────────────
@@ -96,8 +142,23 @@ class RealtimePipeline:
     - Feed ``EnrolledSpeakerClustering`` for local→global IDs.
     - Reconstruct global separated sources across overlapping chunks.
     - Emit a delayed 500 ms slice. Enrolled live playback uses delayed mixed
-      audio gated by the assigned speaker activity mask, because raw separated
-      PixIT locals are not stable causal speaker streams at onsets.
+      audio gated by an aligned global speaker activity mask, because raw
+      separated PixIT locals are not stable causal speaker streams at onsets.
+
+    Design invariants
+    -----------------
+    If you refactor this file later, these invariants are the important ones to
+    preserve:
+
+    - Unknown-speaker clustering stays as close to vanilla diart as practical.
+    - Enrolled verification is allowed a small custom layer because persistent
+      identity across sessions is the product requirement diart does not solve
+      by itself.
+    - Live playback and visualization do not have to use the same aggregation
+      latency. UI can be smoother; emitted audio must be aligned to its own
+      packet latency.
+    - Do not revert to raw current-window PixIT-local playback for enrolled
+      speech unless you intentionally accept more onset artifacts.
 
     Parameters
     ----------
@@ -189,10 +250,17 @@ class RealtimePipeline:
         self._emb_model.eval()
 
         # Unknown-speaker clustering uses diart's official path: one mixed
-        # waveform chunk plus per-speaker segmentation weights. Persistent
-        # enrolled verification uses fixed-length embeddings from PixIT's
-        # separated sources so enrollment/live verification stay in the same
-        # domain and avoid frame-mismatch warnings in the weighted path.
+        # waveform chunk plus per-speaker segmentation weights.
+        #
+        # Persistent enrolled verification intentionally uses fixed-length
+        # embeddings from PixIT's separated sources instead. This is one of the
+        # key history-backed decisions in this repo:
+        #
+        # - mixed weighted embeddings are great for online clustering
+        # - direct separated-source embeddings are more stable for matching live
+        #   speech against saved enrollment references
+        # - reverting to custom variable-length voiced crops caused large
+        #   infer-ms spikes, so keep this path fixed-length and recent-windowed
         self._embed_seg_threshold = float(
             emb_cfg.get("source_seg_threshold", max(0.12, clust_cfg["tau_active"] * 0.5))
         )
@@ -491,7 +559,12 @@ class RealtimePipeline:
         sources: torch.Tensor,
         active_indices: List[int],
     ) -> torch.Tensor:
-        """Extract fixed-length direct-source embeddings for enrolled verification."""
+        """Extract fixed-length direct-source embeddings for enrolled verification.
+
+        Historical note: this stays fixed-length on purpose. Earlier versions
+        kept "all voiced audio" and grouped by exact length, which produced
+        multiple large WeSpeaker forwards per step and doubled inference time.
+        """
         verify = torch.full(
             (self.n_local_speakers, self._emb_dim), float("nan"), device="cpu"
         )
@@ -775,6 +848,11 @@ class RealtimePipeline:
         Runs reference.wav through the EXACT same path as live audio:
         DeepFilterNet (if enabled) → PixIT separation → WeSpeaker embedding.
         This eliminates any domain gap between enrollment and live embeddings.
+
+        This function exists because "saved embedding.npy from some other path"
+        repeatedly caused brittle enrolled matching in practice. The repo now
+        treats ``reference.wav`` as the source of truth and rebuilds anchors on
+        startup through the same stack used at runtime.
         """
         import soundfile as sf
         enroll_dir = Path(__file__).parent / config["enrollment"]["dir"]

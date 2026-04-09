@@ -12,6 +12,19 @@ FastAPI backend that:
 Playback continuity (crossfade, holdover, tau_active tuning) is implemented
 inside ``RealtimePipeline.step()`` — this server only feeds fixed-size chunks
 and forwards ``StepResult`` frames; see ``pipeline.py`` module docstring.
+
+Transport notes
+───────────────
+The websocket sends:
+
+1. one JSON diarization message per emitted step
+2. zero or more binary audio packets immediately after it
+
+Each binary packet includes ``step_idx`` in the header. That field is not just
+for debugging; the dashboard audio scheduler uses it to keep playback aligned
+despite websocket/browser jitter. Earlier versions ignored it and scheduled
+audio only by arrival time, which sounded like periodic disconnect/reconnect
+even when backend packets were continuous.
 """
 from __future__ import annotations
 
@@ -336,7 +349,14 @@ def _pack_audio_packet(
     sample_rate: int,
     audio_i16: np.ndarray,
 ) -> bytes:
-    """Pack a speaker audio chunk into a binary websocket frame."""
+    """Pack a speaker audio chunk into a binary websocket frame.
+
+    Header layout:
+    ``magic(4) | step_idx(4) | speaker_id(4) | sample_rate(4) | num_samples(4)``
+
+    ``step_idx`` is part of the scheduling contract with ``dashboard.html``.
+    Keep it stable if the client ever changes.
+    """
     header = struct.pack(
         "<4sIIII",
         AUDIO_PACKET_MAGIC,
