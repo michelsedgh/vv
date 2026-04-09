@@ -128,6 +128,16 @@ class LiveSessionCapture:
             present_audio[speaker_id] = audio_i16
             present_labels[speaker_id] = str(sp.label)
             audio_f64 = np.asarray(sp.audio, dtype=np.float64)
+            audio_peak = (
+                float(np.max(np.abs(audio_f64)))
+                if audio_f64.size
+                else 0.0
+            )
+            audio_rms = (
+                float(np.sqrt(np.mean(audio_f64 ** 2)))
+                if audio_f64.size
+                else 0.0
+            )
             speakers_meta.append({
                 "id": speaker_id,
                 "label": str(sp.label),
@@ -138,16 +148,9 @@ class LiveSessionCapture:
                     if sp.identity_similarity is not None
                     else None
                 ),
-                "audio_rms": (
-                    round(float(np.sqrt(np.mean(audio_f64 ** 2))), 6)
-                    if audio_f64.size
-                    else 0.0
-                ),
-                "audio_peak": (
-                    round(float(np.max(np.abs(audio_f64))), 6)
-                    if audio_f64.size
-                    else 0.0
-                ),
+                "audio_active": bool(audio_peak > (32.0 / 32767.0)),
+                "audio_rms": round(audio_rms, 6),
+                "audio_peak": round(audio_peak, 6),
             })
 
         for speaker_id, label in present_labels.items():
@@ -430,11 +433,26 @@ def _run_diarization_monitor():
         for sp in result.speakers:
             audio_i16 = np.clip(sp.audio * 32767, -32768, 32767).astype(np.int16)
             speaker_id = int(sp.global_idx)
-            audio_active = bool(np.max(np.abs(audio_i16)) > 32)
+            audio_peak = (
+                float(np.max(np.abs(np.asarray(sp.audio, dtype=np.float32))))
+                if np.asarray(sp.audio).size
+                else 0.0
+            )
+            audio_rms = (
+                float(np.sqrt(np.mean(np.asarray(sp.audio, dtype=np.float64) ** 2)))
+                if np.asarray(sp.audio).size
+                else 0.0
+            )
+            audio_active = bool(audio_peak > (32.0 / 32767.0))
+            diar_active = bool(sp.activity > cfg["clustering"]["tau_active"])
             _sd = {
                 "id": speaker_id,
                 "label": str(sp.label),
-                "active": bool(audio_active or sp.activity > cfg["clustering"]["tau_active"]),
+                "active": bool(audio_active or diar_active),
+                "audio_active": audio_active,
+                "diar_active": diar_active,
+                "audio_rms": round(audio_rms, 6),
+                "audio_peak": round(audio_peak, 6),
                 "activity": round(float(sp.activity), 3),
                 "enrolled": bool(sp.is_enrolled),
             }

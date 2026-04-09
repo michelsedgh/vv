@@ -360,7 +360,8 @@ function updateSpeakerLane(sp) {
   }
 
   // Active state
-  const isActive = sp.active;
+  const audioActive = sp.audio_active == null ? !!sp.active : !!sp.audio_active;
+  const isActive = audioActive;
   if (isActive) {
     lane.element.classList.add('active');
     lane.element.querySelector('.glow-dot').classList.add('on');
@@ -374,6 +375,10 @@ function updateSpeakerLane(sp) {
   // Diarization vs identity: activity is NOT embedding quality (see title on .lane-metrics).
   const diarPct = Math.round(sp.activity * 100);
   let line = diarPct + '% diar';
+  if (sp.audio_peak != null && !Number.isNaN(sp.audio_peak)) {
+    const audioPct = Math.max(0, Math.min(100, Math.round(sp.audio_peak * 100)));
+    line += ' · ' + audioPct + '% aud';
+  }
   if (sp.enrolled && sp.identity_similarity != null && !Number.isNaN(sp.identity_similarity)) {
     const idPct = Math.max(0, Math.min(100, Math.round(sp.identity_similarity * 100)));
     line += ' · ' + idPct + '% ID';
@@ -621,10 +626,13 @@ function updateTimeline(msg) {
   const t = msg.step * timeline.stepDuration;
   const activeSpeakers = [];
   for (const sp of msg.speakers) {
-    if (sp.activity > 0.3) {
+    const diarActive = sp.diar_active == null ? sp.activity > 0.3 : !!sp.diar_active;
+    const audioActive = !!sp.audio_active;
+    if (audioActive || diarActive) {
       activeSpeakers.push({
         id: sp.id, label: sp.label,
         activity: sp.activity, enrolled: sp.enrolled,
+        audio_active: audioActive,
       });
       // Track known speakers
       if (!timeline.knownSpeakers[sp.id]) {

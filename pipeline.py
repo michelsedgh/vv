@@ -95,8 +95,9 @@ class RealtimePipeline:
     - Extract overlap-aware WeSpeaker embeddings from the mixed chunk.
     - Feed ``EnrolledSpeakerClustering`` for local→global IDs.
     - Reconstruct global separated sources across overlapping chunks.
-    - Emit a delayed 500 ms slice so playback does not use the unsupported
-      single-window separator edge.
+    - Emit a delayed 500 ms slice. Enrolled live playback uses delayed mixed
+      audio gated by the assigned speaker activity mask, because raw separated
+      PixIT locals are not stable causal speaker streams at onsets.
 
     Parameters
     ----------
@@ -187,9 +188,11 @@ class RealtimePipeline:
         self._emb_model = PyanModel.from_pretrained(emb_cfg["model"]).to(self.device)
         self._emb_model.eval()
 
-        # Identity uses diart's official path: one mixed waveform chunk plus
-        # per-speaker segmentation weights. PixIT-separated channels are used
-        # only for final audio extraction, not for verification.
+        # Unknown-speaker clustering uses diart's official path: one mixed
+        # waveform chunk plus per-speaker segmentation weights. Persistent
+        # enrolled verification uses fixed-length embeddings from PixIT's
+        # separated sources so enrollment/live verification stay in the same
+        # domain and avoid frame-mismatch warnings in the weighted path.
         self._embed_seg_threshold = float(
             emb_cfg.get("source_seg_threshold", max(0.12, clust_cfg["tau_active"] * 0.5))
         )
@@ -216,25 +219,14 @@ class RealtimePipeline:
             self._embed_gamma,
             self._embed_beta,
         )
-        # Keep continuity simple: trust clustering first, then allow a very short
-        # enrolled-only continuity rescue on the persisted local channel.
-        self._holdover_max_steps = int(clust_cfg.get("holdover_max_steps", 3))
-        self._reentry_max_steps = int(clust_cfg.get("reentry_max_steps", 8))
-        self._reentry_min_voiced_sec = float(
-            clust_cfg.get("reentry_min_voiced_sec", 0.25)
+        self._onset_aux_max_voiced_sec = float(
+            clust_cfg.get("onset_aux_max_voiced_sec", 1.5)
         )
-        self._reentry_tail_rms = float(clust_cfg.get("reentry_tail_rms", 0.02))
-        self._reentry_dominance_ratio = float(
-            clust_cfg.get("reentry_dominance_ratio", 3.0)
+        self._onset_aux_dominance_ratio = float(
+            clust_cfg.get("onset_aux_dominance_ratio", 1.25)
         )
-        self._unknown_output_min_activity = float(
-            clust_cfg.get("unknown_output_min_activity", 0.05)
-        )
-        self._unknown_output_min_tail_rms = float(
-            clust_cfg.get("unknown_output_min_tail_rms", 0.02)
-        )
-        self._unknown_output_min_tail_ratio = float(
-            clust_cfg.get("unknown_output_min_tail_ratio", 0.15)
+        self._onset_aux_dist_margin = float(
+            clust_cfg.get("onset_aux_dist_margin", 0.08)
         )
 
         # ── DeepFilterNet (optional) — load BEFORE enrollment ──
@@ -288,14 +280,7 @@ class RealtimePipeline:
             max_speakers=clust_cfg["max_speakers"],
             max_drift=clust_cfg.get("max_drift", 0.0),
             delta_enrolled=clust_cfg.get("delta_enrolled", 0.80),
-            enrolled_grace_margin=clust_cfg.get("enrolled_grace_margin", 0.05),
             leakage_delta=clust_cfg.get("leakage_delta"),
-            new_center_grace_margin=clust_cfg.get("new_center_grace_margin", 0.05),
-            enrolled_preference_margin=clust_cfg.get("enrolled_preference_margin", 0.03),
-            unknown_reuse_delta=clust_cfg.get("unknown_reuse_delta"),
-            unknown_min_voiced_sec=clust_cfg.get("unknown_min_voiced_sec", 0.18),
-            unknown_min_tail_rms=clust_cfg.get("unknown_min_tail_rms", 0.0),
-            enrolled_session_alpha=clust_cfg.get("enrolled_session_alpha", 0.15),
         )
         self._enrollment_profiles_by_name: Dict[str, np.ndarray] = {}
         if enrolled_embeddings:
@@ -322,16 +307,30 @@ class RealtimePipeline:
         self._output_latency_steps = max(
             1, int(round(self._output_latency_sec / self.step_duration))
         )
+        self._enrolled_live_mix = bool(acfg.get("enrolled_live_mix", True))
+        self._enrolled_mix_gate_threshold = float(
+            acfg.get(
+                "enrolled_mix_gate_threshold",
+                max(0.06, self.cfg["clustering"]["tau_active"] * 0.25),
+            )
+        )
+        self._enrolled_mix_gate_collar_sec = float(
+            acfg.get("enrolled_mix_gate_collar_sec", 0.03)
+        )
         log.info(
             "Separated-audio output latency: %.3fs (%d step%s)",
             self._output_latency_sec,
             self._output_latency_steps,
             "" if self._output_latency_steps == 1 else "s",
         )
-        self._source_chunk_buffer: List[tuple[int, np.ndarray]] = []
-        self._source_agg_max_chunks = max(
-            2, int(round(self.duration / self.step_duration))
+        self._audio_aggregation = DelayedAggregation(
+            self.step_duration,
+            latency=self._output_latency_sec,
+            strategy="first",
+            cropping_mode="center",
         )
+        self._audio_buffer: List[SlidingWindowFeature] = []
+        self._mix_buffer: List[SlidingWindowFeature] = []
         self._emit_meta_buffer: List[tuple[int, List[Dict[str, Any]]]] = []
         if self._step_perf_log and self._step_perf_path is not None:
             log.info(
@@ -476,6 +475,53 @@ class RealtimePipeline:
             emb = emb / norm
         return emb
 
+    def _extract_source_verify_embeddings(
+        self,
+        sources: torch.Tensor,
+        active_indices: List[int],
+    ) -> torch.Tensor:
+        """Extract fixed-length direct-source embeddings for enrolled verification."""
+        verify = torch.full(
+            (self.n_local_speakers, self._emb_dim), float("nan"), device="cpu"
+        )
+        if not active_indices:
+            return verify
+
+        keep_samples = min(
+            self.chunk_samples,
+            max(1, int(round(self._embed_recent_sec * self.sample_rate))),
+        )
+        batch: List[np.ndarray] = []
+        batch_indices: List[int] = []
+        for spk_idx in active_indices:
+            src = (
+                sources[0, -keep_samples:, spk_idx]
+                .detach()
+                .cpu()
+                .numpy()
+                .astype(np.float32)
+            )
+            peak = float(np.max(np.abs(src))) if src.size else 0.0
+            if peak <= 1e-6:
+                continue
+            src = np.clip(src / peak, -1.0, 1.0)
+            batch.append(src)
+            batch_indices.append(int(spk_idx))
+
+        if not batch:
+            return verify
+
+        wav = torch.from_numpy(np.stack(batch, axis=0)).unsqueeze(1).to(
+            device=self.device, dtype=torch.float32
+        )
+        with torch.inference_mode():
+            embs = self._emb_model(wav)
+        embs = embs / (embs.norm(dim=-1, keepdim=True) + 1e-8)
+        embs = embs.cpu()
+        for row_idx, spk_idx in enumerate(batch_indices):
+            verify[spk_idx] = embs[row_idx]
+        return verify
+
     def _source_stats(
         self,
         source_audio: torch.Tensor,
@@ -542,11 +588,61 @@ class RealtimePipeline:
         """Absolute start time of the chunk processed at ``step_idx``."""
         return step_idx * self.step_duration - (self.duration - self.step_duration)
 
-    def _append_source_chunk(self, step_idx: int, chunk_sources: np.ndarray) -> None:
-        """Append one chunk of global-aligned separated sources to the rolling buffer."""
-        self._source_chunk_buffer.append((step_idx, chunk_sources))
-        if len(self._source_chunk_buffer) > self._source_agg_max_chunks:
-            self._source_chunk_buffer = self._source_chunk_buffer[-self._source_agg_max_chunks :]
+    def _aggregate_audio_chunk(self, step_idx: int, chunk_sources: np.ndarray) -> np.ndarray:
+        """Aggregate one global-aligned separated chunk using diart's audio policy."""
+        audio_sw = SlidingWindow(
+            start=self._chunk_start_time(step_idx),
+            duration=1.0 / float(self.sample_rate),
+            step=1.0 / float(self.sample_rate),
+        )
+        self._audio_buffer.append(SlidingWindowFeature(chunk_sources, audio_sw))
+        agg_audio = self._audio_aggregation(self._audio_buffer)
+        if len(self._audio_buffer) == self._audio_aggregation.num_overlapping_windows:
+            self._audio_buffer = self._audio_buffer[1:]
+
+        audio = np.asarray(agg_audio.data, dtype=np.float32)
+        if audio.shape[0] < self.step_samples:
+            audio = np.pad(audio, ((0, self.step_samples - audio.shape[0]), (0, 0)))
+        elif audio.shape[0] > self.step_samples:
+            audio = audio[: self.step_samples]
+        return audio
+
+    def _aggregate_mix_chunk(self, step_idx: int, chunk_waveform: np.ndarray) -> np.ndarray:
+        """Aggregate one mono chunk with the same delay policy as speaker audio."""
+        audio_sw = SlidingWindow(
+            start=self._chunk_start_time(step_idx),
+            duration=1.0 / float(self.sample_rate),
+            step=1.0 / float(self.sample_rate),
+        )
+        mono = np.asarray(chunk_waveform, dtype=np.float32).reshape(-1, 1)
+        self._mix_buffer.append(SlidingWindowFeature(mono, audio_sw))
+        agg_audio = self._audio_aggregation(self._mix_buffer)
+        if len(self._mix_buffer) == self._audio_aggregation.num_overlapping_windows:
+            self._mix_buffer = self._mix_buffer[1:]
+
+        audio = np.asarray(agg_audio.data, dtype=np.float32).reshape(-1)
+        if audio.shape[0] < self.step_samples:
+            audio = np.pad(audio, (0, self.step_samples - audio.shape[0]))
+        elif audio.shape[0] > self.step_samples:
+            audio = audio[: self.step_samples]
+        return audio
+
+    def _step_track_mask(self, step_track: np.ndarray, threshold: float, collar_sec: float) -> np.ndarray:
+        """Upsample one step-length activity track to a sample mask."""
+        track = np.asarray(step_track, dtype=np.float32).reshape(-1)
+        if track.size == 0:
+            return np.zeros(self.step_samples, dtype=np.float32)
+        active = track >= float(threshold)
+        if collar_sec > 0.0:
+            frame_sec = self.step_duration / float(max(1, track.size))
+            collar_frames = max(0, int(round(collar_sec / frame_sec)))
+            if collar_frames > 0:
+                kernel = np.ones(2 * collar_frames + 1, dtype=np.float32)
+                active = np.convolve(active.astype(np.float32), kernel, mode="same") > 0
+        frame_pos = np.linspace(0.0, self.step_samples - 1, track.size, dtype=np.float32)
+        sample_pos = np.arange(self.step_samples, dtype=np.float32)
+        mask = np.interp(sample_pos, frame_pos, active.astype(np.float32))
+        return mask.astype(np.float32)
 
     def _source_sample_mask(self, seg_track: np.ndarray, collar_sec: float = 0.05) -> np.ndarray:
         """Build a sample-rate activity mask from one local segmentation track."""
@@ -565,58 +661,90 @@ class RealtimePipeline:
         mask = np.interp(sample_pos, frame_pos, active.astype(np.float32))
         return mask.astype(np.float32)
 
-    def _aggregate_source_slices(
+    def _onset_aux_enrolled_pair(
         self,
-        step_idx: int,
-        candidate_globals: List[int],
-    ) -> Dict[int, np.ndarray]:
-        """Reconstruct one emitted step using the most recent valid source samples.
+        pairs: List[tuple[int, int]],
+        active_indices: List[int],
+        source_stats: List[Dict[str, float]],
+        step_tail_rms_np: np.ndarray,
+        embeddings: torch.Tensor,
+    ) -> tuple[List[tuple[int, int]], int]:
+        """Resolve short enrolled onsets when PixIT splits speech across locals.
 
-        Averaging overlapping separated chunks attenuates onsets because older
-        windows often contain weaker or leakage-heavy versions of the same
-        region. For separated audio, the newest chunk that still covers the
-        emitted region is usually the best estimate, so we let newer valid
-        samples overwrite older ones.
+        On first-word onsets, the enrolled anchor can briefly match a weaker
+        leakage local while the dominant separated local is only slightly
+        farther from the anchor. That produces the exact symptom the user hears:
+        correct identity, but a low-volume first syllable. Prefer the dominant
+        local when it is still close enough to the enrolled anchor.
         """
-        if not candidate_globals or not self._source_chunk_buffer:
-            return {}
+        if len(self.clustering._anchors) != 1 or not active_indices:
+            return pairs, 0
 
-        step_start_time = step_idx * self.step_duration
-        cols = sorted({int(g) for g in candidate_globals})
-        slices: Dict[int, np.ndarray] = {
-            int(global_idx): np.zeros(self.step_samples, dtype=np.float32)
-            for global_idx in cols
-        }
-        filled: Dict[int, np.ndarray] = {
-            int(global_idx): np.zeros(self.step_samples, dtype=bool)
-            for global_idx in cols
-        }
+        ranked = sorted(
+            (int(idx) for idx in active_indices),
+            key=lambda idx: float(step_tail_rms_np[idx]),
+            reverse=True,
+        )
+        local_idx = ranked[0]
+        if len(ranked) > 1:
+            second = float(step_tail_rms_np[ranked[1]])
+            if float(step_tail_rms_np[local_idx]) < (second * self._onset_aux_dominance_ratio):
+                return pairs, 0
+        if source_stats[local_idx]["voiced_sec"] > self._onset_aux_max_voiced_sec:
+            return pairs, 0
 
-        for chunk_step, chunk in self._source_chunk_buffer:
-            chunk_start = self._chunk_start_time(chunk_step)
-            start_sample = int(round((step_start_time - chunk_start) * self.sample_rate))
-            end_sample = start_sample + self.step_samples
-            src_lo = max(0, start_sample)
-            src_hi = min(chunk.shape[0], end_sample)
-            if src_hi <= src_lo:
-                continue
-            dst_lo = max(0, -start_sample)
-            dst_hi = dst_lo + (src_hi - src_lo)
-            for global_idx in cols:
-                seg = chunk[src_lo:src_hi, int(global_idx)]
-                valid = ~np.isnan(seg)
-                if not np.any(valid):
-                    continue
-                out_view = slices[int(global_idx)][dst_lo:dst_hi]
-                fill_view = filled[int(global_idx)][dst_lo:dst_hi]
-                out_view[valid] = seg[valid]
-                fill_view[valid] = True
-                slices[int(global_idx)][dst_lo:dst_hi] = out_view
-                filled[int(global_idx)][dst_lo:dst_hi] = fill_view
+        anchor_idx = next(iter(self.clustering._anchors))
+        dominant_dist = float(
+            self.clustering.enrolled_distance(
+                anchor_idx,
+                embeddings[local_idx].detach().cpu().numpy().astype(np.float64, copy=False),
+                local_idx,
+            )
+        )
 
-        for global_idx in cols:
-            np.nan_to_num(slices[int(global_idx)], copy=False)
-        return slices
+        enrolled_pairs = [
+            (int(local), int(global_idx))
+            for local, global_idx in pairs
+            if self.clustering.is_enrolled(int(global_idx))
+        ]
+        if not enrolled_pairs:
+            if dominant_dist > self.clustering.delta_enrolled:
+                return pairs, 1
+            out_pairs = [(l, g) for l, g in pairs if l != local_idx]
+            out_pairs.append((local_idx, anchor_idx))
+            return out_pairs, 1
+
+        assigned_local, _ = enrolled_pairs[0]
+        if assigned_local == local_idx:
+            return pairs, 1
+
+        assigned_dist = float(
+            self.clustering.enrolled_distance(
+                anchor_idx,
+                embeddings[assigned_local].detach().cpu().numpy().astype(np.float64, copy=False),
+                assigned_local,
+            )
+        )
+        tail_gain = float(step_tail_rms_np[local_idx]) / max(
+            float(step_tail_rms_np[assigned_local]),
+            1e-6,
+        )
+        dist_margin = float(getattr(self, "_onset_aux_dist_margin", 0.08))
+        should_swap = (
+            tail_gain >= self._onset_aux_dominance_ratio
+            and dominant_dist <= (self.clustering.delta_enrolled + dist_margin)
+            and dominant_dist <= (assigned_dist + dist_margin)
+        )
+        if not should_swap:
+            return pairs, 1
+
+        out_pairs = [
+            (l, g)
+            for l, g in pairs
+            if int(g) != anchor_idx and int(l) != local_idx
+        ]
+        out_pairs.append((local_idx, anchor_idx))
+        return out_pairs, 1
 
     def _reextract_enrollments(
         self,
@@ -697,7 +825,6 @@ class RealtimePipeline:
                     seg_np = seg_t[0].float().cpu().numpy()
                     sources = self._pixit_wrapper.last_sources.float()
 
-                    embed_chunk, embed_seg = self._embedding_window(chunk, seg_np)
                     batch_meta: List[tuple[int, Dict[str, float]]] = []
                     for spk_idx in range(seg_np.shape[1]):
                         stats = self._source_stats(
@@ -714,17 +841,15 @@ class RealtimePipeline:
                     if not batch_meta:
                         continue
 
-                    emb_t = self._oa_emb(
-                        embed_chunk[np.newaxis, :, np.newaxis],
-                        embed_seg[np.newaxis, :, :],
-                    )
-                    emb_np = np.asarray(emb_t, dtype=np.float64)
-                    if emb_np.ndim == 3 and emb_np.shape[0] == 1:
-                        emb_np = emb_np[0]
-                    if emb_np.ndim == 1:
-                        emb_np = emb_np.reshape(1, -1)
                     for spk_idx, stats in batch_meta:
-                        emb = emb_np[spk_idx]
+                        src = sources[0, :, spk_idx].detach().cpu().numpy().astype(np.float32)
+                        keep_samples = min(
+                            len(src),
+                            max(1, int(round(self._embed_recent_sec * self.sample_rate))),
+                        )
+                        if keep_samples <= 0:
+                            continue
+                        emb = self.extract_embedding(src[-keep_samples:])
                         from scipy.spatial.distance import cosine as cos_dist
                         dist = float(cos_dist(emb, target_emb))
                         score = (
@@ -908,6 +1033,7 @@ class RealtimePipeline:
                     continue
                 if (
                     stats["voiced_sec"] < self._embed_min_voiced_sec
+                    and not self.clustering._anchors
                 ):
                     embed_recent_failures += 1
                     continue
@@ -935,12 +1061,12 @@ class RealtimePipeline:
                 for spk_idx in active_indices:
                     embeddings[spk_idx] = embs[spk_idx].cpu()
                     source_stats[spk_idx]["has_embedding"] = True
+        verify_embeddings = self._extract_source_verify_embeddings(sources, active_indices)
+        self.clustering.set_verify_embeddings(verify_embeddings.numpy())
 
         t3 = tc()
         # ── 3. Clustering ──
-        self.clustering._current_source_stats = source_stats
         permuted_seg = self.clustering(segmentation, embeddings)
-        self.clustering._current_source_stats = None
         speaker_map = self.clustering.last_speaker_map
 
         t_cluster = tc()
@@ -961,7 +1087,6 @@ class RealtimePipeline:
         # only smooths *segmentation* for activity/UI, not separated audio.
 
         results = []
-        clust_cfg = self.cfg["clustering"]
         pairs: List[tuple[int, int]] = []
         used_local: set[int] = set()
         speaker_map_pairs = 0
@@ -980,125 +1105,29 @@ class RealtimePipeline:
                 pairs.append((l_i, g_i))
                 used_local.add(l_i)
 
-        ho_max = float(clust_cfg.get("holdover_seg_max", 0.12))
-        ho_rms = float(clust_cfg.get("holdover_tail_rms", 0.002))
-
-        # Keep only one conservative enrolled continuity rule:
-        # if clustering misses the enrolled speaker on the previously used local
-        # channel, recover it only when the current embedding is still near the
-        # enrolled anchor, or for one immediate step when segmentation and tail
-        # energy both still show speech. This avoids silence leakage while still
-        # covering weak sentence onsets and brief assignment misses.
-        if self.clustering._anchors:
-            emb_np = embeddings.detach().cpu().numpy()
-            for g_idx in sorted(self.clustering._anchors.keys()):
-                if any(g == g_idx for _, g in pairs):
-                    continue
-                last_seen = self.clustering._last_enrolled_step.get(g_idx, -999)
-                gap = int(self.clustering._call_count - last_seen)
-                max_continuity_gap = max(
-                    int(self._holdover_max_steps),
-                    int(self._reentry_max_steps),
-                )
-                if max_continuity_gap > 0 and gap > max_continuity_gap:
-                    continue
-                loc = self.clustering._last_local_for_enrolled.get(g_idx)
-                if loc is None or loc in used_local:
-                    continue
-                smax = float(np.max(seg_np[:, loc]))
-                t_rms = float(step_tail_rms_np[int(loc)])
-                has_embedding = bool(source_stats[loc]["has_embedding"])
-                rescue_with_embedding = False
-                if has_embedding and not np.isnan(emb_np[loc]).any():
-                    anchor_checks += 1
-                    dist = float(
-                        self.clustering.enrolled_distance(
-                            g_idx,
-                            emb_np[loc].astype(np.float64, copy=False),
-                            int(loc),
-                        )
-                    )
-                    eff = self.clustering._effective_enrolled_delta(g_idx, loc)
-                    rescue_with_embedding = (
-                        dist < (eff + self.clustering.new_center_grace_margin)
-                    )
-
-                cur_pair_idx = next(
-                    (i for i, (l_i, _) in enumerate(pairs) if l_i == loc),
-                    None,
-                )
-                if (
-                    cur_pair_idx is not None
-                    and not self.clustering.is_enrolled(int(pairs[cur_pair_idx][1]))
-                    and rescue_with_embedding
-                ):
-                    pairs[cur_pair_idx] = (loc, g_idx)
-                    remap_count += 1
-                    onset_grace_added += 1
-                    continue
-
-                if cur_pair_idx is not None:
-                    continue
-
-                if rescue_with_embedding:
-                    pairs.append((loc, g_idx))
-                    used_local.add(loc)
-                    onset_grace_added += 1
-                    continue
-
-                second_tail = 0.0
-                if active_indices:
-                    active_tail = sorted(
-                        (float(step_tail_rms_np[idx]) for idx in active_indices),
-                        reverse=True,
-                    )
-                    if len(active_tail) > 1:
-                        second_tail = active_tail[1]
-                dominant_reentry = (
-                    len(active_indices) == 1
-                    or t_rms >= max(
-                        self._reentry_tail_rms,
-                        second_tail * self._reentry_dominance_ratio,
-                    )
-                )
-                if (
-                    gap <= self._reentry_max_steps
-                    and active_mask[loc]
-                    and source_stats[loc]["voiced_sec"] >= self._reentry_min_voiced_sec
-                    and t_rms >= self._reentry_tail_rms
-                    and dominant_reentry
-                ):
-                    if cur_pair_idx is not None:
-                        pairs[cur_pair_idx] = (loc, g_idx)
-                    else:
-                        pairs.append((loc, g_idx))
-                        used_local.add(loc)
-                    onset_grace_added += 1
-                    continue
-
-                if gap <= 1 and smax >= ho_max and t_rms >= ho_rms:
-                    pairs.append((loc, g_idx))
-                    used_local.add(loc)
-                    holdover_added += 1
+        pairs_before_aux = list(pairs)
+        pairs, anchor_checks = self._onset_aux_enrolled_pair(
+            pairs,
+            active_indices,
+            source_stats,
+            step_tail_rms_np,
+            embeddings,
+        )
+        remap_count = int(pairs != pairs_before_aux)
 
         pairs_after_reconcile = int(len(pairs))
         unknown_pairs_dropped = 0
 
         t5 = tc()
-        dominant_tail_rms = (
-            float(np.max(step_tail_rms_np)) if step_tail_rms_np.size else 0.0
-        )
-        chunk_global = np.full(
+        chunk_global = np.zeros(
             (self.chunk_samples, self.clustering.max_speakers),
-            np.nan,
             dtype=np.float32,
         )
-        emit_pairs: List[tuple[int, int, float, bool]] = []
+        emit_pairs: List[tuple[int, int, float, bool, np.ndarray]] = []
+        local_step_frames = max(
+            1, int(round(seg_np.shape[0] * self.step_duration / self.duration))
+        )
         if pairs:
-            prekeep: List[tuple[int, int, float, bool]] = []
-            local_step_frames = max(
-                1, int(round(seg_np.shape[0] * self.step_duration / self.duration))
-            )
             enrolled_pair_globals = [
                 int(global_idx)
                 for _, global_idx in pairs
@@ -1107,64 +1136,52 @@ class RealtimePipeline:
             for local_idx, global_idx in pairs:
                 activity = float(np.mean(seg_np[-local_step_frames:, local_idx]))
                 is_enrolled = self.clustering.is_enrolled(global_idx)
-                local_tail_rms = float(step_tail_rms_np[local_idx])
-                if not is_enrolled:
-                    if (
-                        enrolled_pair_globals
-                        and bool(source_stats[local_idx]["has_embedding"])
-                    ):
+                if (
+                    not is_enrolled
+                    and enrolled_pair_globals
+                    and bool(source_stats[local_idx]["has_embedding"])
+                ):
+                    emb_row = verify_embeddings[local_idx].numpy().astype(np.float64, copy=False)
+                    if np.isnan(emb_row).any():
                         emb_row = embeddings[local_idx].numpy().astype(np.float64, copy=False)
-                        if not np.isnan(emb_row).any():
-                            nearest_enrolled = min(
-                                float(
-                                    self.clustering.enrolled_distance(
-                                        g_idx,
-                                        emb_row,
-                                        int(local_idx),
-                                    )
+                    if not np.isnan(emb_row).any():
+                        nearest_enrolled = min(
+                            float(
+                                self.clustering.enrolled_distance(
+                                    g_idx,
+                                    emb_row,
+                                    int(local_idx),
                                 )
-                                for g_idx in enrolled_pair_globals
                             )
-                            if nearest_enrolled <= (
-                                self.clustering.delta_enrolled
-                                + self.clustering.enrolled_preference_margin
-                            ):
-                                unknown_pairs_dropped += 1
-                                continue
-                    if activity < self._unknown_output_min_activity:
-                        unknown_pairs_dropped += 1
-                        continue
-                    if local_tail_rms < self._unknown_output_min_tail_rms:
-                        unknown_pairs_dropped += 1
-                        continue
-                    if (
-                        dominant_tail_rms > 0.0
-                        and local_tail_rms
-                        < (dominant_tail_rms * self._unknown_output_min_tail_ratio)
-                    ):
-                        unknown_pairs_dropped += 1
-                        continue
-                prekeep.append((local_idx, global_idx, activity, is_enrolled))
-
-            if prekeep:
-                keep_local_ids = [p[0] for p in prekeep]
-                keep_sources = (
-                    sources[0, :, keep_local_ids]
-                    .detach()
-                    .cpu()
-                    .numpy()
+                            for g_idx in enrolled_pair_globals
+                        )
+                        if nearest_enrolled <= (self.clustering.delta_enrolled + 0.03):
+                            unknown_pairs_dropped += 1
+                            continue
+                src = sources[0, :, local_idx].detach().cpu().numpy()
+                chunk_global[:, global_idx] = src.astype(np.float32, copy=False)
+                step_track = seg_np[-local_step_frames:, local_idx]
+                mix_mask = (
+                    self._step_track_mask(
+                        step_track,
+                        self._enrolled_mix_gate_threshold,
+                        self._enrolled_mix_gate_collar_sec,
+                    )
+                    if is_enrolled and self._enrolled_live_mix
+                    else np.zeros(self.step_samples, dtype=np.float32)
                 )
-                for src_col, (local_idx, global_idx, _, _) in enumerate(prekeep):
-                    chunk_global[:, global_idx] = keep_sources[:, src_col]
-                emit_pairs = prekeep
+                emit_pairs.append((local_idx, global_idx, activity, is_enrolled, mix_mask))
 
-        self._append_source_chunk(self._step_idx, chunk_global)
+        delayed_audio = self._aggregate_audio_chunk(self._step_idx, chunk_global)
+        delayed_mix_audio = self._aggregate_mix_chunk(self._step_idx, waveform)
         current_emit_meta: List[Dict[str, Any]] = []
-        for local_idx, global_idx, activity, is_enrolled in emit_pairs:
+        for local_idx, global_idx, activity, is_enrolled, mix_mask in emit_pairs:
             label = self.clustering.get_label(global_idx)
             id_sim: Optional[float] = None
             if global_idx in self.clustering._anchors:
-                _row = embeddings[local_idx].numpy()
+                _row = verify_embeddings[local_idx].numpy()
+                if np.isnan(_row).any():
+                    _row = embeddings[local_idx].numpy()
                 if not np.isnan(_row).any():
                     _a = self.clustering._anchors[global_idx]
                     id_sim = float(
@@ -1178,12 +1195,13 @@ class RealtimePipeline:
                     "activity": float(activity),
                     "is_enrolled": bool(is_enrolled),
                     "identity_similarity": id_sim,
+                    "mix_mask": mix_mask,
                 }
             )
 
         self._emit_meta_buffer.append((self._step_idx, current_emit_meta))
-        if len(self._emit_meta_buffer) > self._source_agg_max_chunks:
-            self._emit_meta_buffer = self._emit_meta_buffer[-self._source_agg_max_chunks :]
+        if len(self._emit_meta_buffer) > self._audio_aggregation.num_overlapping_windows:
+            self._emit_meta_buffer = self._emit_meta_buffer[-self._audio_aggregation.num_overlapping_windows :]
 
         emit_step_idx = self._step_idx - self._output_latency_steps + 1
         delayed_emit_meta: List[Dict[str, Any]] = []
@@ -1192,11 +1210,6 @@ class RealtimePipeline:
                 delayed_emit_meta = hist_meta
                 break
 
-        aggregated_slices = self._aggregate_source_slices(
-            emit_step_idx,
-            [int(meta["global_idx"]) for meta in delayed_emit_meta],
-        )
-
         for meta in delayed_emit_meta:
             global_idx = int(meta["global_idx"])
             activity = float(meta["activity"])
@@ -1204,17 +1217,25 @@ class RealtimePipeline:
             label = str(meta["label"])
             id_sim = meta["identity_similarity"]
 
-            audio = aggregated_slices.get(
-                global_idx,
-                np.zeros(self.step_samples, dtype=np.float32),
-            )
+            audio = delayed_audio[:, global_idx].astype(np.float32, copy=False)
+            if is_enrolled and self._enrolled_live_mix:
+                mix_mask = np.asarray(
+                    meta.get("mix_mask", np.zeros(self.step_samples, dtype=np.float32)),
+                    dtype=np.float32,
+                )
+                if mix_mask.shape[0] != delayed_mix_audio.shape[0]:
+                    mix_mask = np.resize(mix_mask, delayed_mix_audio.shape[0]).astype(np.float32)
+                audio = delayed_mix_audio.astype(np.float32, copy=False) * mix_mask
+                active_frac = float(np.mean(mix_mask)) if mix_mask.size else 0.0
+                if active_frac > 1e-3:
+                    audio = audio / max(np.sqrt(active_frac), 0.4)
             if is_enrolled and self._df_output_enrolled:
                 audio = self._enhance_enrolled_audio(audio, global_idx)
             audio = np.clip(audio, -1.0, 1.0)
             packet_rms = float(
                 np.sqrt(np.mean(audio.astype(np.float64) ** 2))
             ) if audio.size else 0.0
-            if not is_enrolled and packet_rms < (self._unknown_output_min_tail_rms * 0.5):
+            if packet_rms < 1e-4:
                 unknown_pairs_dropped += 1
                 continue
 
@@ -1246,6 +1267,9 @@ class RealtimePipeline:
                         "idx": int(idx),
                         "active": bool(active_mask[idx]),
                         "has_embedding": bool(source_stats[idx]["has_embedding"]),
+                        "has_verify_embedding": bool(
+                            not np.isnan(verify_embeddings[idx].numpy()).any()
+                        ),
                         "seg_max": round(float(source_stats[idx]["seg_max"]), 4),
                         "voiced_sec": round(float(source_stats[idx]["voiced_sec"]), 4),
                         "tail_rms": round(float(step_tail_rms_np[idx]), 5),
@@ -1332,7 +1356,7 @@ class RealtimePipeline:
     def reset(self) -> None:
         """Reset pipeline state for a new session."""
         self._step_idx = 0
-        self._source_chunk_buffer.clear()
+        self._audio_buffer.clear()
         self._emit_meta_buffer.clear()
         self._pred_seg_buffer.clear()
         self._df_output_states.clear()
@@ -1350,14 +1374,7 @@ class RealtimePipeline:
             max_speakers=clust_cfg["max_speakers"],
             max_drift=clust_cfg["max_drift"],
             delta_enrolled=clust_cfg.get("delta_enrolled", 0.80),
-            enrolled_grace_margin=clust_cfg.get("enrolled_grace_margin", 0.05),
             leakage_delta=clust_cfg.get("leakage_delta"),
-            new_center_grace_margin=clust_cfg.get("new_center_grace_margin", 0.05),
-            enrolled_preference_margin=clust_cfg.get("enrolled_preference_margin", 0.03),
-            unknown_reuse_delta=clust_cfg.get("unknown_reuse_delta"),
-            unknown_min_voiced_sec=clust_cfg.get("unknown_min_voiced_sec", 0.18),
-            unknown_min_tail_rms=clust_cfg.get("unknown_min_tail_rms", 0.0),
-            enrolled_session_alpha=clust_cfg.get("enrolled_session_alpha", 0.15),
         )
         if old_anchors:
             self.clustering.inject_centroids(old_anchors)
