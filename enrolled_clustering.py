@@ -84,7 +84,6 @@ class EnrolledSpeakerClustering(OnlineSpeakerClustering):
         self._anchors: Dict[int, np.ndarray] = {}
         self._profiles: Dict[int, np.ndarray] = {}
         self._labels: Dict[int, str] = {}
-        self._verify_embeddings: Optional[np.ndarray] = None
         self.last_speaker_map: Optional[SpeakerMap] = None
 
     # ─── Enrollment ──────────────────────────────────────────────
@@ -145,29 +144,6 @@ class EnrolledSpeakerClustering(OnlineSpeakerClustering):
         for idx, anchor in self._anchors.items():
             self.centers[idx] = anchor.copy()
 
-    def set_verify_embeddings(self, embeddings: Optional[np.ndarray]) -> None:
-        if embeddings is None:
-            self._verify_embeddings = None
-            return
-        self._verify_embeddings = np.asarray(embeddings, dtype=np.float64)
-
-    def _anchor_embedding(
-        self, embedding: np.ndarray, local_spk: Optional[int] = None
-    ) -> np.ndarray:
-        # Prefer direct separated-source verification embeddings for enrolled
-        # comparisons when available. This was empirically more stable than
-        # using the mixed weighted embedding for both clustering and persistent
-        # speaker verification.
-        if (
-            local_spk is not None
-            and self._verify_embeddings is not None
-            and 0 <= int(local_spk) < self._verify_embeddings.shape[0]
-        ):
-            verify = self._verify_embeddings[int(local_spk)]
-            if not np.isnan(verify).any():
-                return verify
-        return np.asarray(embedding, dtype=np.float64)
-
     def update(
         self, assignments: Iterable[Tuple[int, int]], embeddings: np.ndarray
     ) -> None:
@@ -180,13 +156,21 @@ class EnrolledSpeakerClustering(OnlineSpeakerClustering):
                 continue
             self.centers[g_spk] += embeddings[l_spk]
 
-    def enrolled_distance(self, anchor_idx: int, embedding: np.ndarray, local_spk: Optional[int] = None) -> float:
-        emb = self._anchor_embedding(embedding, local_spk).reshape(1, -1)
-        cand = [self._anchors[anchor_idx].reshape(1, -1)]
+    def enrolled_distance(self, anchor_idx: int, embedding: np.ndarray) -> float:
+        emb = np.asarray(embedding, dtype=np.float64).reshape(1, -1)
+        anchor = self._anchors[anchor_idx].reshape(1, -1)
+        anchor_dist = float(cdist(emb, anchor, metric=self.metric)[0, 0])
         profile = self._profiles.get(anchor_idx)
-        if profile is not None and profile.size > 0:
-            cand.append(profile)
-        return float(cdist(emb, np.concatenate(cand, axis=0), metric=self.metric).min())
+        # Profile rows can refine a clearly-close anchor, but they must not
+        # rescue a match the frozen anchor itself already rejects.
+        if (
+            profile is None
+            or profile.size == 0
+            or anchor_dist > self.delta_enrolled
+        ):
+            return anchor_dist
+        profile_dist = float(cdist(emb, profile, metric=self.metric).min())
+        return min(anchor_dist, profile_dist)
 
     # ─── Core override: enrolled-priority identify ───────────────
 
@@ -228,7 +212,7 @@ class EnrolledSpeakerClustering(OnlineSpeakerClustering):
         candidates = []
         for anchor_idx in sorted(self._anchors):
             for local_spk in active_speakers:
-                dist = self.enrolled_distance(anchor_idx, embeddings[int(local_spk)], int(local_spk))
+                dist = self.enrolled_distance(anchor_idx, embeddings[int(local_spk)])
                 if dist <= self.delta_enrolled:
                     candidates.append((float(dist), int(local_spk), int(anchor_idx)))
         for dist, local_spk, anchor_idx in sorted(candidates, key=lambda x: x[0]):
@@ -253,10 +237,10 @@ class EnrolledSpeakerClustering(OnlineSpeakerClustering):
                 closest = min(
                     taken_enrolled,
                     key=lambda anchor_idx: self.enrolled_distance(
-                        anchor_idx, embeddings[local_spk], local_spk
+                        anchor_idx, embeddings[local_spk]
                     ),
                 )
-                min_dist = self.enrolled_distance(closest, embeddings[local_spk], local_spk)
+                min_dist = self.enrolled_distance(closest, embeddings[local_spk])
                 if min_dist <= max(
                     self.leakage_delta,
                     self.delta_enrolled,
@@ -281,7 +265,11 @@ class EnrolledSpeakerClustering(OnlineSpeakerClustering):
         dist_map = SpeakerMapBuilder.dist(embeddings, self.centers, self.metric)
         block_local = [s for s in range(num_local) if s not in remaining_active]
         block_global = list(self.inactive_centers)
-        for g in taken_enrolled:
+        # Enrolled anchors must only be claimed through the explicit
+        # enrolled-distance checks above. Leaving them in the plain diart
+        # fallback map lets the one-to-one assignment solver push leftovers
+        # onto an enrolled center even when the enrolled threshold failed.
+        for g in self._anchors:
             if g not in block_global:
                 block_global.append(g)
         valid_map = dist_map.unmap_speakers(block_local, block_global).unmap_threshold(
@@ -300,10 +288,10 @@ class EnrolledSpeakerClustering(OnlineSpeakerClustering):
                 min_anchor = min(
                     self._anchors,
                     key=lambda anchor_idx: self.enrolled_distance(
-                        anchor_idx, embeddings[spk], spk
+                        anchor_idx, embeddings[spk]
                     ),
                 )
-                min_dist = self.enrolled_distance(min_anchor, embeddings[spk], spk)
+                min_dist = self.enrolled_distance(min_anchor, embeddings[spk])
                 if (
                     min_anchor in taken_enrolled
                     and min_dist
@@ -315,8 +303,15 @@ class EnrolledSpeakerClustering(OnlineSpeakerClustering):
                 ):
                     continue
 
+            assigned_globals = {
+                int(g) for g in valid_map.valid_assignments(strict=True)[1]
+            }
             unknown_globals = [
-                g for g in self.active_centers if g not in self._anchors and g not in taken_enrolled
+                g
+                for g in self.active_centers
+                if g not in self._anchors
+                and g not in taken_enrolled
+                and g not in assigned_globals
             ]
             if unknown_globals:
                 best_unknown = min(

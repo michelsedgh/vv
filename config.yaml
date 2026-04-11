@@ -19,7 +19,7 @@ debug:
 #     That was the main infer-ms regression that pushed runtime from ~240 ms
 #     toward ~480+ ms.
 #   • Do not treat raw current-window PixIT locals as perfectly stable live
-#     speaker streams. They are useful for verification/diagnostics, but direct
+#     speaker streams. They are useful for output/diagnostics, but direct
 #     playback caused weak onsets, leakage, and chopped words.
 #   • If audio sounds chopped in 500 ms windows while visuals look OK, first
 #     suspect latency alignment between emitted audio, emitted activity mask, and
@@ -50,7 +50,7 @@ audio:
   output_latency_sec: 1.0
   # Live enrolled playback uses delayed mixed audio gated by the assigned
   # speaker track, not raw separated PixIT locals. This is the causally stable
-  # path; raw separated locals are still used for verification.
+  # path; raw separated locals are only for emitted audio after assignment.
   # Important: the gate that controls this path must be aggregated with the
   # SAME latency as ``output_latency_sec``. Using the slower 2.0 s UI smoother
   # here created the "good window / bad window" chopping bug.
@@ -64,10 +64,11 @@ enrollment:
   dir: enrolled_speakers   # each sub-dir has embedding.npy + reference.wav
   record_seconds: 10       # default recording duration for enrollment
   # Distance / room: enrollment saves reference.wav; on server start the pipeline
-  # re-extracts your centroid via PixIT→WeSpeaker (same path as live). If you enroll
-  # nose-to-mic but use the app from across the room, separated audio and embeddings
-  # differ (level, reverb, separation leakage) → lower "ID %" on the dashboard while
-  # "diar %" still tracks how loud PixIT marks the slot. Fix: re-enroll at your usual
+  # re-extracts your centroid via the same overlap-aware embedding path as live.
+  # If you enroll nose-to-mic but use the app from across the room, the same
+  # voice will still move in embedding space (level, reverb, room response) and
+  # lower "ID %" on the dashboard while "diar %" still tracks how loud PixIT
+  # marks the slot. Fix: re-enroll at your usual
   # seating distance (or mid-room), speak naturally for ~10s, restart the server.
   # Optional: record a second take from another position and we can add multi-anchor
   # enrollment later; for now one good far-field reference beats one near-field clip.
@@ -83,17 +84,13 @@ pixit:
 
 embedding:
   model: pyannote/wespeaker-voxceleb-resnet34-LM
-  # PixIT already outputs separated speaker channels. We embed those full-length
-  # channels only for final audio extraction. Identity uses diart's official
-  # mixed-waveform + segmentation-weight path, but only on a fixed recent window
-  # so stale silence in the 5 s buffer does not dominate onset verification.
-  # The live enrolled verifier still uses fixed-length separated-source
-  # embeddings internally, because that matched enrollment much better than
-  # forcing every persistent-ID decision through the mixed weighted path.
+  # Identity uses diart's official mixed-waveform + segmentation-weight path
+  # for both enrollment rebuilds and live matching. The recent window keeps
+  # stale silence in the 5 s buffer from dominating identity decisions.
   source_seg_threshold: 0.14
   source_min_voiced_sec: 0.10
   source_recent_sec: 2.0
-  enrollment_profile_top_k: 3  # average top weighted enrollment embeddings for a more stable frozen profile
+  enrollment_profile_top_k: 3  # average top same-space enrollment embeddings for a more stable frozen profile
   gamma: 3.0
   beta: 10.0
 

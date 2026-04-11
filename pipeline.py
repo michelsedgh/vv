@@ -5,10 +5,9 @@ Current architecture
 ────────────────────
 Identity follows diart's official embedding idea: a mixed waveform plus
 per-speaker segmentation weights. PixIT-separated channels are still useful,
-but only in tightly scoped places:
+but only after identity is decided:
 
-1. direct separated-source verification for *enrolled* matching, so live and
-   enrollment embeddings stay in the same domain
+1. overlap-aware mixed-waveform embeddings for both enrollment and live matching
 2. separated-source reconstruction / diagnostics
 3. never as "instant stable causal speaker streams" for live playback
 
@@ -41,16 +40,16 @@ like "bad models" but were actually integration bugs:
 
 - Enrollment mismatch:
   Using one brittle frozen vector was not enough. Enrollment is now re-extracted
-  through the same PixIT/WeSpeaker path as live audio, and we keep a small
-  enrollment profile so first-word variations do not immediately become
-  ``Unknown-*``.
+  through the same overlap-aware embedding path as live audio, and we keep a
+  small same-space enrollment profile so first-word variations do not
+  immediately become ``Unknown-*``.
 
 - Raw PixIT live audio:
   PixIT is a fixed-number separator on overlapping 5 s windows. A local source
   at time ``t`` is not a stable realtime speaker track by itself. Streaming raw
   current-window separated tails caused weak onsets, leakage, and chopped words.
   Live enrolled playback therefore uses delayed *mixed* audio gated by the
-  speaker track. Separation remains useful for verification and diagnostics.
+  speaker track. Separation remains useful for output audio and diagnostics.
 
 - Gate/audio latency mismatch:
   We once gated emitted audio with the 2.0 s activity smoother while the audio
@@ -151,9 +150,9 @@ class RealtimePipeline:
     preserve:
 
     - Unknown-speaker clustering stays as close to vanilla diart as practical.
-    - Enrolled verification is allowed a small custom layer because persistent
-      identity across sessions is the product requirement diart does not solve
-      by itself.
+    - Persistent enrolled identity must stay in the same overlap-aware
+      embedding space as live clustering. Do not reintroduce a second verifier
+      space for enrollment or live matching.
     - Live playback and visualization do not have to use the same aggregation
       latency. UI can be smoother; emitted audio must be aligned to its own
       packet latency.
@@ -249,18 +248,11 @@ class RealtimePipeline:
         self._emb_model = PyanModel.from_pretrained(emb_cfg["model"]).to(self.device)
         self._emb_model.eval()
 
-        # Unknown-speaker clustering uses diart's official path: one mixed
-        # waveform chunk plus per-speaker segmentation weights.
-        #
-        # Persistent enrolled verification intentionally uses fixed-length
-        # embeddings from PixIT's separated sources instead. This is one of the
-        # key history-backed decisions in this repo:
-        #
-        # - mixed weighted embeddings are great for online clustering
-        # - direct separated-source embeddings are more stable for matching live
-        #   speech against saved enrollment references
-        # - reverting to custom variable-length voiced crops caused large
-        #   infer-ms spikes, so keep this path fixed-length and recent-windowed
+        # Keep identity close to official diart: one mixed waveform chunk plus
+        # per-speaker segmentation weights for both live matching and
+        # enrollment rebuilds. Earlier split-space verifier paths caused the
+        # enrolled lane to react to separated-source junk that clustering did
+        # not consider the same way.
         self._embed_seg_threshold = float(
             emb_cfg.get("source_seg_threshold", max(0.12, clust_cfg["tau_active"] * 0.5))
         )
@@ -352,7 +344,7 @@ class RealtimePipeline:
         )
         self._enrollment_profiles_by_name: Dict[str, np.ndarray] = {}
         if enrolled_embeddings:
-            # Re-extract through EXACT same path as live: [DF→]PixIT→WeSpeaker
+            # Re-extract through the same overlap-aware identity path as live.
             reextracted = self._reextract_enrollments(enrolled_embeddings, config)
             self.clustering.inject_centroids(reextracted)
             self.clustering.inject_profiles(self._enrollment_profiles_by_name)
@@ -529,8 +521,7 @@ class RealtimePipeline:
     def extract_embedding(self, audio: np.ndarray) -> np.ndarray:
         """Extract L2-normalized WeSpeaker embedding from raw mono audio.
 
-        Used as the raw enrollment fallback path when PixIT cannot provide a
-        speech-valid weighted embedding candidate.
+        Used for diagnostics and compatibility fallbacks.
 
         Parameters
         ----------
@@ -554,104 +545,28 @@ class RealtimePipeline:
             emb = emb / norm
         return emb
 
-    def _extract_source_verify_embeddings(
+    def _segmentation_stats(
         self,
-        sources: torch.Tensor,
-        active_indices: List[int],
-    ) -> torch.Tensor:
-        """Extract fixed-length direct-source embeddings for enrolled verification.
-
-        Historical note: this stays fixed-length on purpose. Earlier versions
-        kept "all voiced audio" and grouped by exact length, which produced
-        multiple large WeSpeaker forwards per step and doubled inference time.
-        """
-        verify = torch.full(
-            (self.n_local_speakers, self._emb_dim), float("nan"), device="cpu"
-        )
-        if not active_indices:
-            return verify
-
-        keep_samples = min(
-            self.chunk_samples,
-            max(1, int(round(self._embed_recent_sec * self.sample_rate))),
-        )
-        batch: List[np.ndarray] = []
-        batch_indices: List[int] = []
-        for spk_idx in active_indices:
-            src = (
-                sources[0, -keep_samples:, spk_idx]
-                .detach()
-                .cpu()
-                .numpy()
-                .astype(np.float32)
-            )
-            peak = float(np.max(np.abs(src))) if src.size else 0.0
-            if peak <= 1e-6:
-                continue
-            src = np.clip(src / peak, -1.0, 1.0)
-            batch.append(src)
-            batch_indices.append(int(spk_idx))
-
-        if not batch:
-            return verify
-
-        wav = torch.from_numpy(np.stack(batch, axis=0)).unsqueeze(1).to(
-            device=self.device, dtype=torch.float32
-        )
-        with torch.inference_mode():
-            embs = self._emb_model(wav)
-        embs = embs / (embs.norm(dim=-1, keepdim=True) + 1e-8)
-        embs = embs.cpu()
-        for row_idx, spk_idx in enumerate(batch_indices):
-            verify[spk_idx] = embs[row_idx]
-        return verify
-
-    def _source_stats(
-        self,
-        source_audio: torch.Tensor,
         seg_track: np.ndarray,
-        recent_sec: Optional[float] = None,
+        window_sec: float,
     ) -> Dict[str, float]:
-        """Summarize one separated source for embedding/clustering decisions."""
-        src = source_audio.float().flatten()
+        """Summarize one segmentation track over the embedding window."""
         seg_arr = np.asarray(seg_track, dtype=np.float32).reshape(-1)
-        if recent_sec is not None and recent_sec < self.duration:
-            keep_samples = min(
-                int(round(recent_sec * self.sample_rate)),
-                int(src.numel()),
-            )
-            if keep_samples > 0 and keep_samples < int(src.numel()):
-                src = src[-keep_samples:]
-            if len(seg_arr) > 0:
-                keep_frames = max(
-                    1,
-                    int(round(len(seg_arr) * min(1.0, keep_samples / float(max(1, source_audio.numel()))))),
-                )
-                if keep_frames < len(seg_arr):
-                    seg_arr = seg_arr[-keep_frames:]
-        peak = float(src.abs().max())
-        window_sec = (
-            min(self.duration, float(src.numel()) / float(self.sample_rate))
-            if src.numel() > 0
-            else 0.0
-        )
-        frame_sec = window_sec / float(max(1, len(seg_arr)))
+        frame_sec = float(window_sec) / float(max(1, len(seg_arr)))
         voiced_frames = int(np.count_nonzero(seg_arr >= self._embed_seg_threshold))
-        stats = {
-            "peak": peak,
+        return {
             "voiced_sec": voiced_frames * frame_sec,
             "voiced_ratio": voiced_frames / float(max(1, len(seg_arr))),
             "seg_max": float(np.max(seg_arr)) if len(seg_arr) else 0.0,
             "seg_mean": float(np.mean(seg_arr)) if len(seg_arr) else 0.0,
         }
-        return stats
 
     def _embedding_window(
         self,
         waveform: np.ndarray,
         segmentation: np.ndarray,
     ) -> tuple[np.ndarray, np.ndarray]:
-        """Crop waveform + segmentation to the recent fixed window used for verification."""
+        """Crop waveform + segmentation to the fixed identity-matching window."""
         waveform = np.asarray(waveform, dtype=np.float32).reshape(-1)
         segmentation = np.asarray(segmentation, dtype=np.float32)
         if self._embed_recent_sec >= self.duration:
@@ -667,6 +582,24 @@ class RealtimePipeline:
             int(round(segmentation.shape[0] * keep_samples / float(max(1, waveform.shape[0])))),
         )
         return waveform[-keep_samples:], segmentation[-keep_frames:, :]
+
+    def _extract_overlap_aware_embeddings(
+        self,
+        waveform: np.ndarray,
+        segmentation: np.ndarray,
+    ) -> np.ndarray:
+        """Run diart's overlap-aware embedder on one waveform/segmentation pair."""
+        with torch.inference_mode():
+            embs = self._oa_emb(
+                waveform[np.newaxis, :, np.newaxis],
+                segmentation[np.newaxis, :, :],
+            )
+        embs = torch.as_tensor(embs, dtype=torch.float32)
+        if embs.ndim == 3 and embs.shape[0] == 1:
+            embs = embs[0]
+        if embs.ndim == 1:
+            embs = embs.unsqueeze(0)
+        return embs.detach().cpu().numpy().astype(np.float64, copy=False)
 
     def _chunk_start_time(self, step_idx: int) -> float:
         """Absolute start time of the chunk processed at ``step_idx``."""
@@ -736,23 +669,6 @@ class RealtimePipeline:
         mask = np.interp(sample_pos, frame_pos, active.astype(np.float32))
         return mask.astype(np.float32)
 
-    def _source_sample_mask(self, seg_track: np.ndarray, collar_sec: float = 0.05) -> np.ndarray:
-        """Build a sample-rate activity mask from one local segmentation track."""
-        seg_arr = np.asarray(seg_track, dtype=np.float32).reshape(-1)
-        if seg_arr.size == 0:
-            return np.zeros(self.chunk_samples, dtype=np.float32)
-        active = seg_arr >= self._embed_seg_threshold
-        if collar_sec > 0.0:
-            frame_sec = self.duration / float(max(1, seg_arr.size))
-            collar_frames = max(0, int(round(collar_sec / frame_sec)))
-            if collar_frames > 0:
-                kernel = np.ones(2 * collar_frames + 1, dtype=np.float32)
-                active = np.convolve(active.astype(np.float32), kernel, mode="same") > 0
-        frame_pos = np.linspace(0.0, self.chunk_samples - 1, seg_arr.size, dtype=np.float32)
-        sample_pos = np.arange(self.chunk_samples, dtype=np.float32)
-        mask = np.interp(sample_pos, frame_pos, active.astype(np.float32))
-        return mask.astype(np.float32)
-
     def _onset_aux_enrolled_pair(
         self,
         pairs: List[tuple[int, int]],
@@ -790,7 +706,6 @@ class RealtimePipeline:
             self.clustering.enrolled_distance(
                 anchor_idx,
                 embeddings[local_idx].detach().cpu().numpy().astype(np.float64, copy=False),
-                local_idx,
             )
         )
 
@@ -814,7 +729,6 @@ class RealtimePipeline:
             self.clustering.enrolled_distance(
                 anchor_idx,
                 embeddings[assigned_local].detach().cpu().numpy().astype(np.float64, copy=False),
-                assigned_local,
             )
         )
         tail_gain = float(step_tail_rms_np[local_idx]) / max(
@@ -843,18 +757,17 @@ class RealtimePipeline:
         enrolled_embeddings: Dict[str, np.ndarray],
         config: dict,
     ) -> Dict[str, np.ndarray]:
-        """Re-extract enrollment embeddings through [DF→]PixIT→WeSpeaker.
+        """Rebuild enrolled anchors through the same identity path as live audio.
 
-        Runs reference.wav through the EXACT same path as live audio:
-        DeepFilterNet (if enabled) → PixIT separation → WeSpeaker embedding.
-        This eliminates any domain gap between enrollment and live embeddings.
-
-        This function exists because "saved embedding.npy from some other path"
-        repeatedly caused brittle enrolled matching in practice. The repo now
-        treats ``reference.wav`` as the source of truth and rebuilds anchors on
-        startup through the same stack used at runtime.
+        Reference audio still runs through the frontend stack (DeepFilterNet if
+        enabled, then PixIT segmentation), but enrollment vectors now come from
+        the same overlap-aware mixed-waveform embedder used at runtime. That
+        keeps persistent-ID matching in one embedding space instead of mixing
+        weighted-chunk embeddings with separated-source verifier embeddings.
         """
         import soundfile as sf
+        from scipy.spatial.distance import cdist
+
         enroll_dir = Path(__file__).parent / config["enrollment"]["dir"]
         reextracted = {}
         self._enrollment_profiles_by_name = {}
@@ -900,15 +813,8 @@ class RealtimePipeline:
                 if chunk_starts[-1] != tail_start:
                     chunk_starts.append(tail_start)
 
-            target_emb = np.asarray(enrolled_embeddings[name], dtype=np.float64)
-            raw_emb = self.extract_embedding(audio)
-            best_emb: Optional[np.ndarray] = None
-            best_stats: Optional[Dict[str, float]] = None
-            best_spk: Optional[int] = None
-            best_start: Optional[int] = None
-            best_dist: Optional[float] = None
-            candidate_embs: List[np.ndarray] = []
-            candidate_scores: List[tuple[float, float, float, float, float]] = []
+            accepted_candidates: List[Dict[str, Any]] = []
+            fallback_candidates: List[Dict[str, Any]] = []
 
             with torch.inference_mode():
                 for start in chunk_starts:
@@ -920,106 +826,98 @@ class RealtimePipeline:
                     wav_gpu = wav_gpu.unsqueeze(0).unsqueeze(0)
                     seg_t = self._pixit_wrapper(wav_gpu)
                     seg_np = seg_t[0].float().cpu().numpy()
-                    sources = self._pixit_wrapper.last_sources.float()
+                    embed_waveform, embed_seg = self._embedding_window(chunk, seg_np)
+                    window_sec = float(embed_waveform.shape[0]) / float(self.sample_rate)
+                    oa_embs = self._extract_overlap_aware_embeddings(
+                        embed_waveform,
+                        embed_seg,
+                    )
 
-                    batch_meta: List[tuple[int, Dict[str, float]]] = []
-                    for spk_idx in range(seg_np.shape[1]):
-                        stats = self._source_stats(
-                            sources[0, :, spk_idx],
-                            seg_np[:, spk_idx],
-                            recent_sec=self._embed_recent_sec,
-                        )
-                        if (
-                            stats["voiced_sec"] < self._embed_min_voiced_sec
-                        ):
+                    for spk_idx in range(embed_seg.shape[1]):
+                        emb = oa_embs[spk_idx]
+                        if np.isnan(emb).any():
                             continue
-                        batch_meta.append((spk_idx, stats))
-
-                    if not batch_meta:
-                        continue
-
-                    for spk_idx, stats in batch_meta:
-                        src = sources[0, :, spk_idx].detach().cpu().numpy().astype(np.float32)
-                        keep_samples = min(
-                            len(src),
-                            max(1, int(round(self._embed_recent_sec * self.sample_rate))),
+                        stats = self._segmentation_stats(
+                            embed_seg[:, spk_idx],
+                            window_sec,
                         )
-                        if keep_samples <= 0:
-                            continue
-                        emb = self.extract_embedding(src[-keep_samples:])
-                        from scipy.spatial.distance import cosine as cos_dist
-                        dist = float(cos_dist(emb, target_emb))
-                        score = (
-                            dist,
-                            -stats["voiced_sec"],
-                            -stats["seg_mean"],
-                            -stats["seg_max"],
-                            -stats["peak"],
-                        )
-                        best_score = (
-                            best_dist,
-                            -best_stats["voiced_sec"],
-                            -best_stats["seg_mean"],
-                            -best_stats["seg_max"],
-                            -best_stats["peak"],
-                        ) if best_stats is not None and best_dist is not None else None
-                        if best_score is None or score < best_score:
-                            best_emb = emb
-                            best_stats = stats
-                            best_spk = spk_idx
-                            best_start = start
-                            best_dist = dist
-                        candidate_embs.append(emb)
-                        candidate_scores.append(score)
+                        candidate = {
+                            "embedding": emb,
+                            "stats": stats,
+                            "local_idx": int(spk_idx),
+                            "start": int(start),
+                        }
+                        fallback_candidates.append(candidate)
+                        if stats["voiced_sec"] >= self._embed_min_voiced_sec:
+                            accepted_candidates.append(candidate)
 
-            if candidate_embs:
-                order = sorted(range(len(candidate_embs)), key=lambda i: candidate_scores[i])
-                keep = order[: min(self._enroll_profile_top_k, len(order))]
-                profile_rows = np.stack([candidate_embs[i] for i in keep], axis=0)
-                profile_rows = np.concatenate(
-                    [profile_rows, raw_emb.reshape(1, -1)],
-                    axis=0,
-                )
-                prof = profile_rows.mean(axis=0)
-                prof_norm = np.linalg.norm(prof)
-                if prof_norm > 0:
-                    prof = prof / prof_norm
-                emb = prof.astype(np.float64)
-                self._enrollment_profiles_by_name[name] = profile_rows.astype(
-                    np.float64, copy=False
-                )
-            else:
-                emb = raw_emb
-                self._enrollment_profiles_by_name[name] = raw_emb.reshape(1, -1)
-
-            from scipy.spatial.distance import cosine as cos_dist
-            raw_d = cos_dist(raw_emb, enrolled_embeddings[name])
-            sep_d = cos_dist(emb, enrolled_embeddings[name])
-            if best_stats is None:
+            candidate_pool = accepted_candidates if accepted_candidates else fallback_candidates
+            if not candidate_pool:
                 log.warning(
-                    "  '%s' had no speech-valid PixIT source; falling back to raw enrollment embedding",
+                    "  '%s' had no usable overlap-aware enrollment candidates; using stored embedding",
                     name,
                 )
-            else:
-                log.info(
-                    "  '%s' PixIT chunk=%0.2fs local=%d voiced=%0.2fs seg_mean=%0.3f seg_max=%0.3f topk=%d",
+                emb = np.asarray(enrolled_embeddings[name], dtype=np.float64).reshape(-1)
+                self._enrollment_profiles_by_name[name] = emb.reshape(1, -1)
+                reextracted[name] = emb
+                continue
+
+            rows = np.stack(
+                [cand["embedding"] for cand in candidate_pool],
+                axis=0,
+            ).astype(np.float64, copy=False)
+            dist_matrix = cdist(rows, rows, metric="cosine")
+            order = sorted(
+                range(len(candidate_pool)),
+                key=lambda idx: (
+                    float(dist_matrix[idx].mean()),
+                    -float(candidate_pool[idx]["stats"]["voiced_sec"]),
+                    -float(candidate_pool[idx]["stats"]["seg_mean"]),
+                    -float(candidate_pool[idx]["stats"]["seg_max"]),
+                    int(candidate_pool[idx]["start"]),
+                    int(candidate_pool[idx]["local_idx"]),
+                ),
+            )
+            keep = order[: min(self._enroll_profile_top_k, len(order))]
+            profile_rows = rows[keep]
+            # Keep the frozen anchor as the medoid candidate. Since enrolled
+            # matching requires the anchor itself to be close before profile
+            # rows can refine it, averaging can blur the anchor enough to miss
+            # otherwise-valid same-speaker live chunks.
+            emb = rows[order[0]].copy()
+            emb_norm = np.linalg.norm(emb)
+            if emb_norm > 0:
+                emb = emb / emb_norm
+            emb = emb.astype(np.float64, copy=False)
+
+            best = candidate_pool[order[0]]
+            if not accepted_candidates:
+                log.warning(
+                    "  '%s' had no speech-valid enrollment window; using best available overlap-aware profile",
                     name,
-                    best_start / self.sample_rate if best_start is not None else 0.0,
-                    best_spk if best_spk is not None else -1,
-                    best_stats["voiced_sec"],
-                    best_stats["seg_mean"],
-                    best_stats["seg_max"],
-                    min(self._enroll_profile_top_k, len(candidate_embs)),
                 )
             log.info(
-                "  '%s' enrollment: raw→stored=%.3f, sep-src→stored=%.3f (DF=%s)",
-                name, raw_d, sep_d,
-                "ON" if self._denoiser_enabled else "OFF",
+                "  '%s' OA chunk=%0.2fs local=%d voiced=%0.2fs seg_mean=%0.3f seg_max=%0.3f topk=%d candidates=%d",
+                name,
+                float(best["start"]) / float(self.sample_rate),
+                int(best["local_idx"]),
+                float(best["stats"]["voiced_sec"]),
+                float(best["stats"]["seg_mean"]),
+                float(best["stats"]["seg_max"]),
+                len(keep),
+                len(candidate_pool),
             )
 
+            self._enrollment_profiles_by_name[name] = profile_rows.astype(
+                np.float64, copy=False
+            )
             reextracted[name] = emb
-            log.info("Re-extracted '%s' through %sPixIT-seg→weighted-WeSpeaker (dim=%d)",
-                     name, "DF→" if self._denoiser_enabled else "", len(emb))
+            log.info(
+                "Re-extracted '%s' through %sPixIT-seg→overlap-aware-WeSpeaker (dim=%d)",
+                name,
+                "DF→" if self._denoiser_enabled else "",
+                len(emb),
+            )
         return reextracted
 
     def step(self, waveform: np.ndarray) -> StepResult:
@@ -1091,6 +989,7 @@ class RealtimePipeline:
         sw = SlidingWindow(start=start_time, duration=resolution, step=resolution)
         segmentation = SlidingWindowFeature(seg_np, sw)
         embed_waveform, embed_seg = self._embedding_window(waveform, seg_np)
+        embed_window_sec = float(embed_waveform.shape[0]) / float(self.sample_rate)
 
         # ── 2. Embeddings from mixed waveform + segmentation weights ──
         # This is diart's official path: one mixed chunk, one segmentation matrix,
@@ -1107,7 +1006,6 @@ class RealtimePipeline:
         embed_full_fallback_hits = 0
         source_stats = [
             {
-                "peak": 0.0,
                 "voiced_sec": 0.0,
                 "voiced_ratio": 0.0,
                 "seg_max": 0.0,
@@ -1119,19 +1017,15 @@ class RealtimePipeline:
         ]
         with torch.inference_mode():
             for spk_idx in range(self.n_local_speakers):
-                stats = self._source_stats(
-                    sources[0, :, spk_idx],
-                    seg_np[:, spk_idx],
-                    recent_sec=self._embed_recent_sec,
+                stats = self._segmentation_stats(
+                    embed_seg[:, spk_idx],
+                    embed_window_sec,
                 )
                 stats["tail_rms"] = float(step_tail_rms_np[spk_idx])
                 source_stats[spk_idx].update(stats)
                 if not active_mask[spk_idx]:
                     continue
-                if (
-                    stats["voiced_sec"] < self._embed_min_voiced_sec
-                    and not self.clustering._anchors
-                ):
+                if stats["voiced_sec"] < self._embed_min_voiced_sec:
                     embed_recent_failures += 1
                     continue
                 active_indices.append(spk_idx)
@@ -1144,22 +1038,14 @@ class RealtimePipeline:
             else []
         )
 
-        with torch.inference_mode():
-            if active_indices:
-                embs = self._oa_emb(
-                    embed_waveform[np.newaxis, :, np.newaxis],
-                    embed_seg[np.newaxis, :, :],
-                )
-                embs = torch.as_tensor(embs, dtype=torch.float32)
-                if embs.ndim == 3 and embs.shape[0] == 1:
-                    embs = embs[0]
-                if embs.ndim == 1:
-                    embs = embs.unsqueeze(0)
-                for spk_idx in active_indices:
-                    embeddings[spk_idx] = embs[spk_idx].cpu()
-                    source_stats[spk_idx]["has_embedding"] = True
-        verify_embeddings = self._extract_source_verify_embeddings(sources, active_indices)
-        self.clustering.set_verify_embeddings(verify_embeddings.numpy())
+        if active_indices:
+            embs = self._extract_overlap_aware_embeddings(
+                embed_waveform,
+                embed_seg,
+            )
+            for spk_idx in active_indices:
+                embeddings[spk_idx] = torch.from_numpy(embs[spk_idx]).float()
+                source_stats[spk_idx]["has_embedding"] = True
 
         t3 = tc()
         # ── 3. Clustering ──
@@ -1242,16 +1128,13 @@ class RealtimePipeline:
                     and enrolled_pair_globals
                     and bool(source_stats[local_idx]["has_embedding"])
                 ):
-                    emb_row = verify_embeddings[local_idx].numpy().astype(np.float64, copy=False)
-                    if np.isnan(emb_row).any():
-                        emb_row = embeddings[local_idx].numpy().astype(np.float64, copy=False)
+                    emb_row = embeddings[local_idx].numpy().astype(np.float64, copy=False)
                     if not np.isnan(emb_row).any():
                         nearest_enrolled = min(
                             float(
                                 self.clustering.enrolled_distance(
                                     g_idx,
                                     emb_row,
-                                    int(local_idx),
                                 )
                             )
                             for g_idx in enrolled_pair_globals
@@ -1271,9 +1154,7 @@ class RealtimePipeline:
             label = self.clustering.get_label(global_idx)
             id_sim: Optional[float] = None
             if global_idx in self.clustering._anchors:
-                _row = verify_embeddings[local_idx].numpy()
-                if np.isnan(_row).any():
-                    _row = embeddings[local_idx].numpy()
+                _row = embeddings[local_idx].numpy()
                 if not np.isnan(_row).any():
                     _a = self.clustering._anchors[global_idx]
                     id_sim = float(
@@ -1305,14 +1186,6 @@ class RealtimePipeline:
             int(meta["global_idx"]): meta for meta in delayed_emit_meta
         }
         candidate_globals = set(delayed_meta_by_global.keys())
-        if self._enrolled_live_mix and emit_step_scores.ndim == 2:
-            continuity_min = max(0.02, self._enrolled_mix_gate_threshold * 0.5)
-            for global_idx in self.clustering._anchors:
-                if global_idx >= emit_step_scores.shape[1]:
-                    continue
-                if float(np.max(emit_step_scores[:, global_idx])) >= continuity_min:
-                    candidate_globals.add(int(global_idx))
-
         for global_idx in sorted(candidate_globals):
             meta = delayed_meta_by_global.get(global_idx)
             is_enrolled = bool(meta["is_enrolled"]) if meta is not None else self.clustering.is_enrolled(global_idx)
@@ -1376,9 +1249,10 @@ class RealtimePipeline:
                         "idx": int(idx),
                         "active": bool(active_mask[idx]),
                         "has_embedding": bool(source_stats[idx]["has_embedding"]),
-                        "has_verify_embedding": bool(
-                            not np.isnan(verify_embeddings[idx].numpy()).any()
-                        ),
+                        # Retained for debug-log compatibility. There is no
+                        # separate verifier path anymore; identity uses the
+                        # same overlap-aware embedding end-to-end.
+                        "has_verify_embedding": bool(source_stats[idx]["has_embedding"]),
                         "seg_max": round(float(source_stats[idx]["seg_max"]), 4),
                         "voiced_sec": round(float(source_stats[idx]["voiced_sec"]), 4),
                         "tail_rms": round(float(step_tail_rms_np[idx]), 5),
