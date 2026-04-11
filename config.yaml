@@ -55,8 +55,8 @@ audio:
   # SAME latency as ``output_latency_sec``. Using the slower 2.0 s UI smoother
   # here created the "good window / bad window" chopping bug.
   enrolled_live_mix: true
-  enrolled_mix_gate_threshold: 0.07
-  enrolled_mix_gate_collar_sec: 0.03
+  enrolled_mix_gate_threshold: 0.05
+  enrolled_mix_gate_collar_sec: 0.10
 
 device: cuda               # torch device
 

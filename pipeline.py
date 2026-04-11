@@ -669,6 +669,38 @@ class RealtimePipeline:
         mask = np.interp(sample_pos, frame_pos, active.astype(np.float32))
         return mask.astype(np.float32)
 
+    def _candidate_emit_globals(
+        self,
+        delayed_meta_by_global: Dict[int, Dict[str, Any]],
+        current_meta_by_global: Dict[int, Dict[str, Any]],
+        emit_step_scores: np.ndarray,
+    ) -> set[int]:
+        """Pick which globals should emit for the current delayed packet.
+
+        Delayed metadata is the normal source of truth. For enrolled speakers
+        only, fall back to the current step's stable label when the delayed
+        track is already active but the speaker was assigned one step later.
+        That prevents the first delayed 500 ms packet from disappearing.
+        """
+        candidate_globals = {int(idx) for idx in delayed_meta_by_global.keys()}
+        if emit_step_scores.ndim != 2:
+            return candidate_globals
+
+        for global_idx, meta in current_meta_by_global.items():
+            if global_idx in candidate_globals or not bool(meta.get("is_enrolled", False)):
+                continue
+            if global_idx >= emit_step_scores.shape[1]:
+                continue
+            global_track = np.asarray(
+                emit_step_scores[:, global_idx], dtype=np.float32
+            ).reshape(-1)
+            if (
+                global_track.size
+                and float(np.max(global_track)) >= self._enrolled_mix_gate_threshold
+            ):
+                candidate_globals.add(int(global_idx))
+        return candidate_globals
+
     def _onset_aux_enrolled_pair(
         self,
         pairs: List[tuple[int, int]],
@@ -1185,9 +1217,18 @@ class RealtimePipeline:
         delayed_meta_by_global: Dict[int, Dict[str, Any]] = {
             int(meta["global_idx"]): meta for meta in delayed_emit_meta
         }
-        candidate_globals = set(delayed_meta_by_global.keys())
+        current_meta_by_global: Dict[int, Dict[str, Any]] = {
+            int(meta["global_idx"]): meta for meta in current_emit_meta
+        }
+        candidate_globals = self._candidate_emit_globals(
+            delayed_meta_by_global,
+            current_meta_by_global,
+            emit_step_scores,
+        )
         for global_idx in sorted(candidate_globals):
-            meta = delayed_meta_by_global.get(global_idx)
+            meta = delayed_meta_by_global.get(global_idx) or current_meta_by_global.get(
+                global_idx
+            )
             is_enrolled = bool(meta["is_enrolled"]) if meta is not None else self.clustering.is_enrolled(global_idx)
             if not is_enrolled and meta is None:
                 continue
@@ -1208,9 +1249,6 @@ class RealtimePipeline:
                 if mix_mask.shape[0] != delayed_mix_audio.shape[0]:
                     mix_mask = np.resize(mix_mask, delayed_mix_audio.shape[0]).astype(np.float32)
                 audio = delayed_mix_audio.astype(np.float32, copy=False) * mix_mask
-                active_frac = float(np.mean(mix_mask)) if mix_mask.size else 0.0
-                if active_frac > 1e-3:
-                    audio = audio / max(np.sqrt(active_frac), 0.4)
             if is_enrolled and self._df_output_enrolled:
                 audio = self._enhance_enrolled_audio(audio, global_idx)
             audio = np.clip(audio, -1.0, 1.0)
