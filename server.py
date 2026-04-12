@@ -29,6 +29,7 @@ even when backend packets were continuous.
 from __future__ import annotations
 
 import asyncio
+from copy import deepcopy
 import json
 import logging
 import struct
@@ -37,7 +38,7 @@ import time
 import uuid
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional, Set
 
 import numpy as np
 import sounddevice as sd
@@ -48,7 +49,7 @@ import yaml
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from pipeline import RealtimePipeline
 
@@ -56,6 +57,7 @@ from pipeline import RealtimePipeline
 
 BASE_DIR = Path(__file__).parent
 CONFIG_PATH = BASE_DIR / "config.yaml"
+OVERRIDE_CONFIG_PATH = BASE_DIR / "config.overrides.yaml"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -64,9 +66,473 @@ logging.basicConfig(
 log = logging.getLogger("server")
 
 
-def load_config() -> dict:
+def load_base_config() -> dict:
     with open(CONFIG_PATH) as f:
         return yaml.safe_load(f)
+
+
+def load_override_config() -> dict:
+    if not OVERRIDE_CONFIG_PATH.exists():
+        return {}
+    with open(OVERRIDE_CONFIG_PATH) as f:
+        data = yaml.safe_load(f) or {}
+    if not isinstance(data, dict):
+        raise ValueError("config.overrides.yaml must contain a mapping")
+    return data
+
+
+def _deep_merge(base: Any, override: Any) -> Any:
+    if isinstance(base, dict) and isinstance(override, dict):
+        merged = {k: deepcopy(v) for k, v in base.items()}
+        for key, value in override.items():
+            if key in merged:
+                merged[key] = _deep_merge(merged[key], value)
+            else:
+                merged[key] = deepcopy(value)
+        return merged
+    return deepcopy(override)
+
+
+def load_config() -> dict:
+    base = load_base_config()
+    overrides = load_override_config()
+    return _deep_merge(base, overrides)
+
+
+def _config_get(cfg: dict, path: str) -> Any:
+    cur: Any = cfg
+    for part in path.split("."):
+        if not isinstance(cur, dict) or part not in cur:
+            raise KeyError(path)
+        cur = cur[part]
+    return cur
+
+
+def _config_set(cfg: dict, path: str, value: Any) -> None:
+    parts = path.split(".")
+    cur = cfg
+    for part in parts[:-1]:
+        child = cur.get(part)
+        if not isinstance(child, dict):
+            child = {}
+            cur[part] = child
+        cur = child
+    cur[parts[-1]] = value
+
+
+def _config_delete(cfg: dict, path: str) -> None:
+    parts = path.split(".")
+    stack: List[tuple[dict, str]] = []
+    cur: Any = cfg
+    for part in parts[:-1]:
+        if not isinstance(cur, dict) or part not in cur:
+            return
+        stack.append((cur, part))
+        cur = cur[part]
+    if isinstance(cur, dict):
+        cur.pop(parts[-1], None)
+    for parent, key in reversed(stack):
+        child = parent.get(key)
+        if isinstance(child, dict) and not child:
+            parent.pop(key, None)
+        else:
+            break
+
+
+def _field(
+    path: str,
+    label: str,
+    section: str,
+    description: str,
+    field_type: str,
+    **kwargs: Any,
+) -> dict:
+    item = {
+        "path": path,
+        "label": label,
+        "section": section,
+        "description": description,
+        "type": field_type,
+    }
+    item.update(kwargs)
+    return item
+
+
+CONFIG_EDITOR_FIELDS: List[dict] = [
+    _field(
+        "audio.device_index",
+        "Mic Device Index",
+        "Audio",
+        "sounddevice input index used for live capture. Change this when the app is listening to the wrong microphone.",
+        "integer",
+        min=0,
+        step=1,
+    ),
+    _field(
+        "audio.output_latency_sec",
+        "Output Latency",
+        "Audio",
+        "How far the monitor output lags behind live capture. Higher values usually reduce edge-of-window artifacts, but add more delay.",
+        "number",
+        min=0.5,
+        max=5.0,
+        step=0.1,
+    ),
+    _field(
+        "audio.enrolled_live_mix",
+        "Enrolled Live Mix",
+        "Audio",
+        "When enabled, enrolled speakers play delayed gated mixed mic audio instead of the separated PixIT source. More stable, but it carries room/background with the target voice.",
+        "boolean",
+    ),
+    _field(
+        "audio.enrolled_mix_gate_threshold",
+        "Mix Gate Threshold",
+        "Audio",
+        "Activity threshold used to open the enrolled live-mix gate. Lower values keep the lane open more easily; higher values cut more bleed but can clip soft speech.",
+        "number",
+        min=0.0,
+        max=1.0,
+        step=0.01,
+    ),
+    _field(
+        "audio.enrolled_mix_gate_collar_sec",
+        "Mix Gate Collar",
+        "Audio",
+        "Extra time added before and after detected speech when gating enrolled live mix. Useful for preserving consonants at the edges of phrases.",
+        "number",
+        min=0.0,
+        max=1.0,
+        step=0.01,
+    ),
+    _field(
+        "audio.separated_leakage_removal",
+        "Separated Leakage Removal",
+        "Audio",
+        "Approximate pyannote off-turn cleanup for separated audio. This only zeros the lane when the speaker is inactive; it does not remove another speaker during active speech.",
+        "boolean",
+    ),
+    _field(
+        "audio.separated_gate_threshold",
+        "Separated Gate Threshold",
+        "Audio",
+        "Activity threshold for separated-output cleanup. Keep this low; higher values can punch holes into syllables on separated playback.",
+        "number",
+        min=0.0,
+        max=1.0,
+        step=0.01,
+    ),
+    _field(
+        "audio.separated_leakage_collar_sec",
+        "Separated Leakage Collar",
+        "Audio",
+        "Context kept around active separated speech before zeroing off-turn audio. Larger collars preserve more edges but also keep more residual bleed.",
+        "number",
+        min=0.0,
+        max=1.0,
+        step=0.01,
+    ),
+    _field(
+        "pixit.duration",
+        "Chunk Duration",
+        "PixIT",
+        "Length of each mono chunk sent to the separation model. The released AMI checkpoint is trained for 5 second chunks.",
+        "number",
+        min=1.0,
+        max=10.0,
+        step=0.5,
+    ),
+    _field(
+        "pixit.step",
+        "Chunk Step",
+        "PixIT",
+        "Hop between inference chunks. Smaller steps mean more overlap and smoother tracking, but more compute.",
+        "number",
+        min=0.1,
+        max=5.0,
+        step=0.1,
+    ),
+    _field(
+        "pixit.max_speakers",
+        "Local Sources",
+        "PixIT",
+        "Maximum number of speaker sources the PixIT model outputs for one 5 second chunk. Extra speakers or noise must be absorbed into those local slots.",
+        "integer",
+        min=1,
+        max=8,
+        step=1,
+    ),
+    _field(
+        "pixit.aggregation_latency_sec",
+        "Activity Aggregation Latency",
+        "PixIT",
+        "Hamming fusion window for speaker activity tracks. This smooths diarization/UI activity, not the separated waveform itself.",
+        "number",
+        min=0.5,
+        max=5.0,
+        step=0.1,
+    ),
+    _field(
+        "embedding.source_seg_threshold",
+        "Embedding Seg Threshold",
+        "Embedding",
+        "Minimum local segmentation weight used when building the recent waveform/mask for overlap-aware identity embeddings.",
+        "number",
+        min=0.0,
+        max=1.0,
+        step=0.01,
+    ),
+    _field(
+        "embedding.source_min_voiced_sec",
+        "Embedding Min Voiced",
+        "Embedding",
+        "Minimum voiced duration before a local source is allowed to produce an identity embedding. Raising this ignores very short weak fragments.",
+        "number",
+        min=0.0,
+        max=2.0,
+        step=0.01,
+    ),
+    _field(
+        "embedding.source_recent_sec",
+        "Embedding Recent Window",
+        "Embedding",
+        "How much recent speech to keep for live identity extraction. Smaller values emphasize the latest speech; larger values smooth over more context.",
+        "number",
+        min=0.5,
+        max=5.0,
+        step=0.1,
+    ),
+    _field(
+        "embedding.enrollment_profile_top_k",
+        "Enrollment Top-K",
+        "Embedding",
+        "How many strong enrollment windows to average into the frozen speaker profile. Higher values smooth enrollment, but can blur distinct positions/rooms.",
+        "integer",
+        min=1,
+        max=10,
+        step=1,
+    ),
+    _field(
+        "embedding.enrollment_scan_step_sec",
+        "Enrollment Scan Step",
+        "Embedding",
+        "Hop used when scanning the enrollment reference for strong windows. Smaller steps search more densely, but cost more startup time.",
+        "number",
+        min=0.1,
+        max=5.0,
+        step=0.1,
+    ),
+    _field(
+        "embedding.enrollment_min_voiced_sec",
+        "Enrollment Min Voiced",
+        "Embedding",
+        "Minimum voiced speech required before an enrollment chunk can contribute to the stored profile.",
+        "number",
+        min=0.0,
+        max=5.0,
+        step=0.05,
+    ),
+    _field(
+        "embedding.gamma",
+        "Overlap Gamma",
+        "Embedding",
+        "Advanced overlap-aware embedding weighting knob. Change only if you are comparing replays; higher values make weighting more selective.",
+        "number",
+        min=0.1,
+        max=10.0,
+        step=0.1,
+    ),
+    _field(
+        "embedding.beta",
+        "Overlap Beta",
+        "Embedding",
+        "Advanced overlap-aware embedding sharpening knob. Higher values make the mask weighting steeper.",
+        "number",
+        min=0.1,
+        max=20.0,
+        step=0.1,
+    ),
+    _field(
+        "clustering.tau_active",
+        "Active Threshold",
+        "Clustering",
+        "Minimum local activity for a source to count as active. Lower values reduce dropouts; higher values ignore more weak/noisy locals.",
+        "number",
+        min=0.0,
+        max=1.0,
+        step=0.01,
+    ),
+    _field(
+        "clustering.rho_update",
+        "Center Update Rate",
+        "Clustering",
+        "How quickly non-enrolled speaker centers move toward new embeddings. Larger values adapt faster; smaller values are stabler.",
+        "number",
+        min=0.0,
+        max=1.0,
+        step=0.01,
+    ),
+    _field(
+        "clustering.delta_new",
+        "New Speaker Threshold",
+        "Clustering",
+        "Distance threshold for deciding when a local source is too far from existing centers and should become or reuse an unknown speaker.",
+        "number",
+        min=0.0,
+        max=2.0,
+        step=0.01,
+    ),
+    _field(
+        "clustering.delta_enrolled",
+        "Enrolled Match Threshold",
+        "Clustering",
+        "Strict distance threshold for assigning a local source to an enrolled anchor. Lower values are stricter and reduce false matches.",
+        "number",
+        min=0.0,
+        max=2.0,
+        step=0.01,
+    ),
+    _field(
+        "clustering.max_speakers",
+        "Global Speaker Limit",
+        "Clustering",
+        "Maximum number of global speakers the online clustering layer can keep alive.",
+        "integer",
+        min=1,
+        max=16,
+        step=1,
+    ),
+    _field(
+        "clustering.leakage_delta",
+        "Leakage Suppression",
+        "Clustering",
+        "Distance used to suppress duplicate PixIT locals that look like leakage of an already matched enrolled speaker instead of a new unknown lane.",
+        "number",
+        min=0.0,
+        max=2.0,
+        step=0.01,
+    ),
+    _field(
+        "clustering.enrolled_continuity_margin",
+        "Continuity Margin",
+        "Clustering",
+        "Advanced. Extra relaxed margin for enrolled continuity rescue. With max gap set to 0 this is effectively inactive.",
+        "number",
+        min=0.0,
+        max=1.0,
+        step=0.01,
+    ),
+    _field(
+        "clustering.enrolled_continuity_max_gap",
+        "Continuity Max Gap",
+        "Clustering",
+        "How many live steps an enrolled speaker can be missing before rescue is no longer allowed. Zero disables continuity rescue.",
+        "integer",
+        min=0,
+        max=10,
+        step=1,
+    ),
+    _field(
+        "clustering.onset_aux_max_voiced_sec",
+        "Onset Aux Max Voiced",
+        "Clustering",
+        "Advanced onset rescue guard. Only very short dominant locals can trigger the onset auxiliary remap at the start of an utterance.",
+        "number",
+        min=0.0,
+        max=5.0,
+        step=0.1,
+    ),
+    _field(
+        "clustering.onset_aux_dominance_ratio",
+        "Onset Aux Dominance",
+        "Clustering",
+        "How much louder the dominant local tail must be before onset rescue prefers it over the directly matched enrolled local.",
+        "number",
+        min=1.0,
+        max=5.0,
+        step=0.05,
+    ),
+    _field(
+        "clustering.onset_aux_dist_margin",
+        "Onset Aux Distance Margin",
+        "Clustering",
+        "How much farther the dominant local may be from the enrolled anchor and still win the onset rescue remap.",
+        "number",
+        min=0.0,
+        max=1.0,
+        step=0.01,
+    ),
+    _field(
+        "denoiser.enabled",
+        "Mic DeepFilter",
+        "Denoiser",
+        "Run DeepFilterNet on each captured mic block before PixIT and embeddings. This can reduce noise, but it also changes separator input and identity features.",
+        "boolean",
+    ),
+    _field(
+        "denoiser.enhance_enrolled_output",
+        "Output DeepFilter",
+        "Denoiser",
+        "Experimental. Run DeepFilterNet only on emitted enrolled lanes after separation and gating. It does not affect identity, but on PixIT-separated speech it can chew up syllable interiors or sound pumpy/choppy.",
+        "boolean",
+    ),
+    _field(
+        "denoiser.model",
+        "Denoiser Model",
+        "Denoiser",
+        "Which DeepFilterNet checkpoint to load when either denoiser path is enabled.",
+        "select",
+        options=["DeepFilterNet", "DeepFilterNet2", "DeepFilterNet3"],
+    ),
+]
+CONFIG_EDITOR_FIELD_MAP = {field["path"]: field for field in CONFIG_EDITOR_FIELDS}
+
+
+def _coerce_editor_value(raw_value: Any, meta: dict) -> Any:
+    field_type = meta["type"]
+    if field_type == "boolean":
+        if isinstance(raw_value, bool):
+            value = raw_value
+        elif isinstance(raw_value, str):
+            lowered = raw_value.strip().lower()
+            if lowered in {"true", "1", "yes", "on"}:
+                value = True
+            elif lowered in {"false", "0", "no", "off"}:
+                value = False
+            else:
+                raise ValueError(f"Invalid boolean for {meta['path']}")
+        else:
+            raise ValueError(f"Invalid boolean for {meta['path']}")
+    elif field_type == "integer":
+        if isinstance(raw_value, bool):
+            raise ValueError(f"Invalid integer for {meta['path']}")
+        value = int(raw_value)
+    elif field_type == "number":
+        if isinstance(raw_value, bool):
+            raise ValueError(f"Invalid number for {meta['path']}")
+        value = float(raw_value)
+    elif field_type in {"text", "select"}:
+        value = str(raw_value)
+    else:
+        raise ValueError(f"Unsupported field type {field_type}")
+
+    if "options" in meta and value not in meta["options"]:
+        raise ValueError(f"Invalid option for {meta['path']}")
+    if isinstance(value, (int, float)):
+        if "min" in meta and value < meta["min"]:
+            raise ValueError(f"{meta['label']} must be >= {meta['min']}")
+        if "max" in meta and value > meta["max"]:
+            raise ValueError(f"{meta['label']} must be <= {meta['max']}")
+    return value
+
+
+def _config_editor_payload() -> dict:
+    return {
+        "config": load_config(),
+        "fields": CONFIG_EDITOR_FIELDS,
+        "override_file": OVERRIDE_CONFIG_PATH.name,
+        "has_overrides": OVERRIDE_CONFIG_PATH.exists(),
+    }
 
 
 app = FastAPI(title="Voice ID — Live Diarization")
@@ -616,9 +1082,13 @@ class StartRequest(BaseModel):
     pass
 
 
+class ConfigUpdateRequest(BaseModel):
+    values: Dict[str, Any] = Field(default_factory=dict)
+
+
 class EnrollRequest(BaseModel):
     name: str
-    duration: int = 10
+    duration: int = 30
 
 
 class DiagRecordRequest(BaseModel):
@@ -754,6 +1224,51 @@ async def api_enroll_status(name: str):
 @app.get("/api/config")
 async def api_config():
     return load_config()
+
+
+@app.get("/api/config/editor")
+async def api_config_editor():
+    return _config_editor_payload()
+
+
+@app.put("/api/config")
+async def api_update_config(req: ConfigUpdateRequest):
+    if monitor.running:
+        raise HTTPException(400, "Stop the monitor before changing settings")
+
+    base = load_base_config()
+    overrides = load_override_config()
+
+    try:
+        for path, raw_value in req.values.items():
+            meta = CONFIG_EDITOR_FIELD_MAP.get(path)
+            if meta is None:
+                raise ValueError(f"Unsupported setting: {path}")
+            value = _coerce_editor_value(raw_value, meta)
+            base_value = _config_get(base, path)
+            if value == base_value:
+                _config_delete(overrides, path)
+            else:
+                _config_set(overrides, path, value)
+    except (ValueError, KeyError) as e:
+        raise HTTPException(400, str(e))
+
+    if overrides:
+        with open(OVERRIDE_CONFIG_PATH, "w") as f:
+            yaml.safe_dump(overrides, f, sort_keys=False)
+    elif OVERRIDE_CONFIG_PATH.exists():
+        OVERRIDE_CONFIG_PATH.unlink()
+
+    return _config_editor_payload()
+
+
+@app.delete("/api/config")
+async def api_reset_config():
+    if monitor.running:
+        raise HTTPException(400, "Stop the monitor before resetting settings")
+    if OVERRIDE_CONFIG_PATH.exists():
+        OVERRIDE_CONFIG_PATH.unlink()
+    return _config_editor_payload()
 
 
 # ─── WebSocket ────────────────────────────────────────────────────

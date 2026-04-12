@@ -66,25 +66,37 @@ class EnrolledSpeakerClustering(OnlineSpeakerClustering):
         max_drift: float = 0.0,  # kept for config compatibility, unused
         delta_enrolled: float = 0.80,
         leakage_delta: Optional[float] = None,
-        enrolled_preference_margin: float = 0.03,
+        enrolled_preference_margin: float = 0.0,
         unknown_reuse_delta: Optional[float] = None,
+        enrolled_continuity_margin: float = 0.20,
+        enrolled_continuity_max_gap: int = 3,
     ):
         super().__init__(tau_active, rho_update, delta_new, metric, max_speakers)
         self.delta_enrolled = float(delta_enrolled)
         self.leakage_delta = float(
             leakage_delta if leakage_delta is not None else delta_enrolled
         )
+        # Keep this at zero in live use. A relaxed enrolled fallback was enough
+        # to claim non-matching speech as the enrolled speaker on saved sessions.
         self.enrolled_preference_margin = float(enrolled_preference_margin)
         self.unknown_reuse_delta = float(
             unknown_reuse_delta
             if unknown_reuse_delta is not None
             else max(delta_new, delta_enrolled + 0.04)
         )
+        self.enrolled_continuity_margin = float(enrolled_continuity_margin)
+        self.enrolled_continuity_max_gap = max(0, int(enrolled_continuity_max_gap))
 
         self._anchors: Dict[int, np.ndarray] = {}
         self._profiles: Dict[int, np.ndarray] = {}
         self._labels: Dict[int, str] = {}
         self.last_speaker_map: Optional[SpeakerMap] = None
+        self._call_count = 0
+        # Track the last step where an enrolled anchor won a strict
+        # delta_enrolled match. Continuity rescue must extend only from a real
+        # strict match, not keep refreshing itself from previous rescues.
+        self._last_enrolled_assignment_step: Dict[int, int] = {}
+        self._direct_enrolled_matches: set[int] = set()
 
     # ─── Enrollment ──────────────────────────────────────────────
 
@@ -222,6 +234,41 @@ class EnrolledSpeakerClustering(OnlineSpeakerClustering):
             enrolled_assignment_dist[anchor_idx] = float(dist)
             taken_local.add(local_spk)
             taken_enrolled.add(anchor_idx)
+        direct_enrolled_matches = set(taken_enrolled)
+        # 1b. Short continuity rescue for enrolled speakers.
+        #
+        # Live overlap-aware embeddings can temporarily drift during noisy or
+        # split-source spans even when the same enrolled speaker was matched in
+        # the immediately preceding steps. Allow a small relaxed margin for a
+        # very recent enrolled anchor so the identity does not fragment into a
+        # run of ``Unknown-*`` lanes mid-utterance.
+        for anchor_idx in sorted(self._anchors):
+            if anchor_idx in taken_enrolled:
+                continue
+            last_step = self._last_enrolled_assignment_step.get(int(anchor_idx), -10_000)
+            if (self._call_count - last_step) > self.enrolled_continuity_max_gap:
+                continue
+
+            available = [int(local) for local in active_speakers if int(local) not in taken_local]
+            if not available:
+                continue
+            ranked = sorted(
+                (
+                    (
+                        float(self.enrolled_distance(anchor_idx, embeddings[local])),
+                        int(local),
+                    )
+                    for local in available
+                ),
+                key=lambda item: item[0],
+            )
+            best_dist, best_local = ranked[0]
+            if best_dist > (self.delta_enrolled + self.enrolled_continuity_margin):
+                continue
+            enrolled_assignments[best_local] = int(anchor_idx)
+            enrolled_assignment_dist[int(anchor_idx)] = float(best_dist)
+            taken_local.add(int(best_local))
+            taken_enrolled.add(int(anchor_idx))
 
         # 2. Suppress duplicate enrolled leakage locals.
         #
@@ -319,29 +366,9 @@ class EnrolledSpeakerClustering(OnlineSpeakerClustering):
                     key=lambda g: float(dist_map.mapping_matrix[spk, g]),
                 )
                 best_unknown_dist = float(dist_map.mapping_matrix[spk, best_unknown])
-                if (
-                    min_anchor is not None
-                    and min_anchor not in taken_enrolled
-                    and min_dist is not None
-                    and min_dist < (self.delta_enrolled + self.enrolled_preference_margin)
-                    and min_dist <= (best_unknown_dist + self.enrolled_preference_margin)
-                ):
-                    valid_map = valid_map.set_source_speaker(spk, min_anchor)
-                    taken_enrolled.add(min_anchor)
-                    continue
                 if best_unknown_dist < self.unknown_reuse_delta:
                     valid_map = valid_map.set_source_speaker(spk, best_unknown)
                     continue
-
-            if (
-                min_anchor is not None
-                and min_anchor not in taken_enrolled
-                and min_dist is not None
-                and min_dist < (self.delta_enrolled + self.enrolled_preference_margin)
-            ):
-                valid_map = valid_map.set_source_speaker(spk, min_anchor)
-                taken_enrolled.add(min_anchor)
-                continue
 
             if spk in long_speakers and len(new_center_speakers) < self.num_free_centers:
                 new_center_speakers.append(spk)
@@ -361,6 +388,7 @@ class EnrolledSpeakerClustering(OnlineSpeakerClustering):
         for local_spk, global_idx in enrolled_assignments.items():
             valid_map = valid_map.set_source_speaker(local_spk, global_idx)
 
+        self._direct_enrolled_matches = direct_enrolled_matches
         return valid_map
 
     # ─── Override __call__ ───────────────────────────────────────
@@ -368,9 +396,14 @@ class EnrolledSpeakerClustering(OnlineSpeakerClustering):
     def __call__(
         self, segmentation: SlidingWindowFeature, embeddings: torch.Tensor
     ) -> SlidingWindowFeature:
+        self._call_count += 1
         self._freeze_enrolled()
         speaker_map = self.identify(segmentation, embeddings)
         self.last_speaker_map = speaker_map
+        for _, tgt_speaker in zip(*speaker_map.valid_assignments(strict=True)):
+            tgt_speaker = int(tgt_speaker)
+            if tgt_speaker in self._direct_enrolled_matches:
+                self._last_enrolled_assignment_step[tgt_speaker] = self._call_count
         return SlidingWindowFeature(
             self._apply_strict_map(speaker_map, segmentation.data),
             segmentation.sliding_window,

@@ -22,6 +22,18 @@
   #timeline-canvas { width: 100%; height: 100%; }
   .timeline-legend-item { display: flex; align-items: center; gap: 4px; }
   .timeline-legend-dot { width: 8px; height: 8px; border-radius: 2px; }
+  .settings-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 12px; }
+  .settings-card { background: rgba(15, 23, 42, 0.55); border: 1px solid #334155; border-radius: 14px; padding: 14px; }
+  .setting-row { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; padding: 10px 0; border-top: 1px solid rgba(71, 85, 105, 0.35); }
+  .setting-row:first-child { padding-top: 0; border-top: 0; }
+  .setting-meta { flex: 1; min-width: 0; }
+  .setting-input { width: 116px; background: #0f172a; border: 1px solid #475569; border-radius: 8px; padding: 6px 8px; color: #e2e8f0; font-size: 0.75rem; }
+  .setting-input:disabled { opacity: 0.45; cursor: not-allowed; }
+  .setting-input[type="checkbox"] { width: 18px; height: 18px; padding: 0; margin-top: 6px; accent-color: #10b981; }
+  .setting-help { position: relative; display: inline-flex; align-items: center; justify-content: center; width: 16px; height: 16px; border-radius: 999px; background: #1e293b; color: #94a3b8; font-size: 10px; border: 1px solid #334155; cursor: help; flex-shrink: 0; }
+  .setting-tip { position: absolute; left: 50%; top: calc(100% + 8px); transform: translateX(-50%); width: 240px; padding: 8px 10px; border-radius: 10px; background: #020617; color: #cbd5e1; font-size: 11px; line-height: 1.4; border: 1px solid #334155; box-shadow: 0 12px 32px rgba(0, 0, 0, 0.45); opacity: 0; pointer-events: none; transition: opacity 0.15s ease; z-index: 20; text-align: left; }
+  .setting-help:hover .setting-tip,
+  .setting-help:focus .setting-tip { opacity: 1; }
 </style>
 </head>
 <body class="min-h-screen p-4">
@@ -43,11 +55,37 @@
         Start
       </button>
     </div>
-  </div>
+	  </div>
 
-  <!-- Speaker Lanes -->
-  <div id="speaker-lanes" class="space-y-2 mb-6">
-    <div class="text-slate-500 text-sm italic" id="no-speakers-msg">
+	  <!-- Pre-run settings -->
+	  <div class="mb-6 bg-slate-800/50 rounded-xl p-4 border border-slate-700">
+	    <div class="flex flex-col gap-3 md:flex-row md:items-start md:justify-between mb-4">
+	      <div>
+	        <h2 class="text-sm font-semibold text-slate-200">Pre-Run Settings</h2>
+	        <p id="config-editor-meta" class="text-xs text-slate-400 mt-1">
+	          Edit runtime knobs before starting. Changes are saved separately from <code>config.yaml</code> comments and apply on the next start.
+	        </p>
+	      </div>
+	      <div class="flex items-center gap-2 flex-wrap">
+	        <span id="config-dirty" class="text-[11px] px-2 py-1 rounded-full bg-slate-700 text-slate-300">Loading…</span>
+	        <button id="btn-config-save" onclick="saveConfigEditor()"
+	                class="px-3 py-2 rounded-lg font-semibold text-xs bg-sky-600 hover:bg-sky-500 text-white transition">
+	          Save settings
+	        </button>
+	        <button id="btn-config-reset" onclick="resetConfigEditor()"
+	                class="px-3 py-2 rounded-lg font-semibold text-xs bg-slate-700 hover:bg-slate-600 text-slate-200 transition">
+	          Reset overrides
+	        </button>
+	      </div>
+	    </div>
+	    <div id="config-sections" class="settings-grid">
+	      <div class="settings-card text-xs text-slate-500 italic">Loading editable settings…</div>
+	    </div>
+	  </div>
+
+	  <!-- Speaker Lanes -->
+	  <div id="speaker-lanes" class="space-y-2 mb-6">
+	    <div class="text-slate-500 text-sm italic" id="no-speakers-msg">
       No speakers detected yet. Click Start to begin.
     </div>
   </div>
@@ -86,7 +124,7 @@
       <div class="flex gap-2 mb-3">
         <input id="enroll-name" type="text" placeholder="Speaker name"
                class="flex-1 bg-slate-900 border border-slate-600 rounded-lg px-3 py-2 text-sm text-white placeholder-slate-500 focus:outline-none focus:border-emerald-500">
-        <input id="enroll-duration" type="number" value="10" min="3" max="30"
+        <input id="enroll-duration" type="number" value="30" min="3" max="30"
                class="w-16 bg-slate-900 border border-slate-600 rounded-lg px-2 py-2 text-sm text-white text-center focus:outline-none focus:border-emerald-500">
         <button onclick="enrollSpeaker()" id="btn-enroll"
                 class="px-4 py-2 rounded-lg font-semibold text-sm bg-blue-600 hover:bg-blue-500 text-white transition">
@@ -132,6 +170,13 @@ let ws = null;
 let isRunning = false;
 let audioCtx = null;
 const speakerLanes = {};  // global_id -> { element, canvas, canvasCtx, gainNode, waveformData, ... }
+const configEditor = {
+  fields: [],
+  values: {},
+  loadedSnapshot: '',
+  overrideFile: '',
+  hasOverrides: false,
+};
 
 // Dashboard audio notes
 // ---------------------
@@ -235,9 +280,11 @@ function handleMessage(msg) {
     updateTimeline(msg);
 
   } else if (msg.type === 'status') {
-    logEvent(msg.message);
+	    logEvent(msg.message);
+      refreshMonitorStatus();
   } else if (msg.type === 'error') {
-    logEvent('ERROR: ' + msg.message, true);
+	    logEvent('ERROR: ' + msg.message, true);
+      refreshMonitorStatus();
   } else if (msg.type === 'diag') {
     document.getElementById('diag-status').textContent = msg.message || '';
     if (msg.status === 'done') {
@@ -563,27 +610,319 @@ function toggleMute(id) {
   refreshLaneMuteUI(lane);
 }
 
+// ─── Config editor ────────────────────────────────────────────────
+function configClone(value) {
+  return JSON.parse(JSON.stringify(value));
+}
+
+function getConfigValue(obj, path) {
+  return path.split('.').reduce((cur, key) => (cur == null ? undefined : cur[key]), obj);
+}
+
+function setConfigValue(obj, path, value) {
+  const parts = path.split('.');
+  let cur = obj;
+  for (let i = 0; i < parts.length - 1; i++) {
+    const key = parts[i];
+    if (typeof cur[key] !== 'object' || cur[key] == null || Array.isArray(cur[key])) {
+      cur[key] = {};
+    }
+    cur = cur[key];
+  }
+  cur[parts[parts.length - 1]] = value;
+}
+
+function snapshotConfigValues(values) {
+  const flat = {};
+  for (const field of configEditor.fields) {
+    flat[field.path] = getConfigValue(values, field.path);
+  }
+  return JSON.stringify(flat);
+}
+
+function updateConfigStatusBadge() {
+  const badge = document.getElementById('config-dirty');
+  const meta = document.getElementById('config-editor-meta');
+  const isDirty = configEditor.loadedSnapshot && snapshotConfigValues(configEditor.values) !== configEditor.loadedSnapshot;
+  if (!configEditor.fields.length) {
+    badge.textContent = 'Unavailable';
+    badge.className = 'text-[11px] px-2 py-1 rounded-full bg-red-900/40 text-red-300';
+    return;
+  }
+  if (isDirty) {
+    badge.textContent = 'Unsaved changes';
+    badge.className = 'text-[11px] px-2 py-1 rounded-full bg-amber-900/40 text-amber-300';
+  } else if (configEditor.hasOverrides) {
+    badge.textContent = 'Overrides saved';
+    badge.className = 'text-[11px] px-2 py-1 rounded-full bg-emerald-900/40 text-emerald-300';
+  } else {
+    badge.textContent = 'Using config defaults';
+    badge.className = 'text-[11px] px-2 py-1 rounded-full bg-slate-700 text-slate-300';
+  }
+  meta.textContent = configEditor.hasOverrides
+    ? `Editable while stopped. Saved values live in ${configEditor.overrideFile} and apply on the next start.`
+    : `Editable while stopped. Changes are written to ${configEditor.overrideFile} so config.yaml comments stay untouched.`;
+}
+
+function setConfigControlsDisabled(disabled) {
+  for (const el of document.querySelectorAll('[data-config-input="1"]')) {
+    el.disabled = disabled;
+  }
+  document.getElementById('btn-config-save').disabled = disabled;
+  document.getElementById('btn-config-reset').disabled = disabled;
+}
+
+function renderConfigEditor() {
+  const root = document.getElementById('config-sections');
+  root.innerHTML = '';
+  if (!configEditor.fields.length) {
+    root.innerHTML = '<div class="settings-card text-xs text-red-300">No editable settings metadata loaded.</div>';
+    updateConfigStatusBadge();
+    return;
+  }
+
+  const grouped = new Map();
+  for (const field of configEditor.fields) {
+    if (!grouped.has(field.section)) grouped.set(field.section, []);
+    grouped.get(field.section).push(field);
+  }
+
+  for (const [section, fields] of grouped.entries()) {
+    const card = document.createElement('div');
+    card.className = 'settings-card';
+
+    const title = document.createElement('div');
+    title.className = 'text-sm font-semibold text-slate-200 mb-1';
+    title.textContent = section;
+    card.appendChild(title);
+
+    const sub = document.createElement('div');
+    sub.className = 'text-[11px] text-slate-500 mb-2';
+    sub.textContent = `${fields.length} editable setting${fields.length === 1 ? '' : 's'}`;
+    card.appendChild(sub);
+
+    for (const field of fields) {
+      const row = document.createElement('div');
+      row.className = 'setting-row';
+
+      const meta = document.createElement('div');
+      meta.className = 'setting-meta';
+
+      const heading = document.createElement('div');
+      heading.className = 'flex items-center gap-2';
+
+      const label = document.createElement('label');
+      label.className = 'text-xs font-medium text-slate-200';
+      label.textContent = field.label;
+      heading.appendChild(label);
+
+      const help = document.createElement('span');
+      help.className = 'setting-help';
+      help.tabIndex = 0;
+      help.textContent = '?';
+      help.title = field.description;
+      const tip = document.createElement('span');
+      tip.className = 'setting-tip';
+      tip.textContent = field.description;
+      help.appendChild(tip);
+      heading.appendChild(help);
+
+      meta.appendChild(heading);
+
+      const path = document.createElement('div');
+      path.className = 'text-[10px] text-slate-500 mt-1 break-all';
+      path.textContent = field.path;
+      meta.appendChild(path);
+
+      row.appendChild(meta);
+
+      let input;
+      const currentValue = getConfigValue(configEditor.values, field.path);
+      if (field.type === 'boolean') {
+        input = document.createElement('input');
+        input.type = 'checkbox';
+        input.checked = !!currentValue;
+      } else if (field.type === 'select') {
+        input = document.createElement('select');
+        for (const optionValue of field.options || []) {
+          const option = document.createElement('option');
+          option.value = optionValue;
+          option.textContent = optionValue;
+          if (String(currentValue) === String(optionValue)) option.selected = true;
+          input.appendChild(option);
+        }
+      } else {
+        input = document.createElement('input');
+        input.type = 'number';
+        if (field.min != null) input.min = field.min;
+        if (field.max != null) input.max = field.max;
+        input.step = field.step != null ? field.step : 'any';
+        input.value = currentValue;
+      }
+      input.className = 'setting-input';
+      input.dataset.configInput = '1';
+      input.dataset.path = field.path;
+      input.disabled = isRunning;
+      input.addEventListener('change', () => {
+        let value;
+        if (field.type === 'boolean') {
+          value = input.checked;
+        } else if (field.type === 'integer') {
+          value = parseInt(input.value, 10);
+          if (Number.isNaN(value)) return;
+        } else if (field.type === 'number') {
+          value = parseFloat(input.value);
+          if (Number.isNaN(value)) return;
+        } else {
+          value = input.value;
+        }
+        setConfigValue(configEditor.values, field.path, value);
+        updateConfigStatusBadge();
+      });
+      row.appendChild(input);
+
+      card.appendChild(row);
+    }
+
+    root.appendChild(card);
+  }
+
+  updateConfigStatusBadge();
+  setConfigControlsDisabled(isRunning);
+}
+
+function applyConfigEditorPayload(payload) {
+  configEditor.fields = payload.fields || [];
+  configEditor.values = configClone(payload.config || {});
+  configEditor.loadedSnapshot = snapshotConfigValues(configEditor.values);
+  configEditor.overrideFile = payload.override_file || 'config.overrides.yaml';
+  configEditor.hasOverrides = !!payload.has_overrides;
+  renderConfigEditor();
+}
+
+async function loadConfigEditor() {
+  try {
+    const resp = await fetch('/api/config/editor');
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    applyConfigEditorPayload(await resp.json());
+  } catch (e) {
+    logEvent('Config editor failed to load: ' + e, true);
+    configEditor.fields = [];
+    renderConfigEditor();
+  }
+}
+
+function collectConfigEditorValues() {
+  const values = {};
+  for (const field of configEditor.fields) {
+    values[field.path] = getConfigValue(configEditor.values, field.path);
+  }
+  return values;
+}
+
+async function saveConfigEditor({ silent = false } = {}) {
+  if (isRunning) {
+    if (!silent) logEvent('Stop the monitor before changing settings', true);
+    return false;
+  }
+  if (!configEditor.fields.length) return true;
+
+  try {
+    const resp = await fetch('/api/config', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ values: collectConfigEditorValues() }),
+    });
+    const data = await resp.json();
+    if (!resp.ok) {
+      logEvent('Settings save failed: ' + (data.detail || resp.statusText), true);
+      return false;
+    }
+    applyConfigEditorPayload(data);
+    if (!silent) logEvent(`Settings saved to ${configEditor.overrideFile}`);
+    return true;
+  } catch (e) {
+    logEvent('Settings save failed: ' + e, true);
+    return false;
+  }
+}
+
+async function resetConfigEditor() {
+  if (isRunning) {
+    logEvent('Stop the monitor before resetting settings', true);
+    return;
+  }
+  const hasDirty = configEditor.loadedSnapshot && snapshotConfigValues(configEditor.values) !== configEditor.loadedSnapshot;
+  const msg = configEditor.hasOverrides
+    ? `Delete saved overrides from ${configEditor.overrideFile} and reload the defaults?`
+    : 'Discard unsaved changes and reload the current saved settings?';
+  if (!confirm(msg)) return;
+
+  try {
+    if (configEditor.hasOverrides) {
+      const resp = await fetch('/api/config', { method: 'DELETE' });
+      const data = await resp.json();
+      if (!resp.ok) {
+        logEvent('Reset failed: ' + (data.detail || resp.statusText), true);
+        return;
+      }
+      applyConfigEditorPayload(data);
+      logEvent(`Removed ${configEditor.overrideFile}`);
+    } else if (hasDirty) {
+      await loadConfigEditor();
+      logEvent('Discarded unsaved config changes');
+    }
+  } catch (e) {
+    logEvent('Reset failed: ' + e, true);
+  }
+}
+
 // ─── Controls ────────────────────────────────────────────────────
-async function toggleMonitor() {
+function applyMonitorButtonState() {
   const btn = document.getElementById('btn-start');
+  if (isRunning) {
+    btn.textContent = 'Stop';
+    btn.classList.remove('bg-emerald-600', 'hover:bg-emerald-500');
+    btn.classList.add('bg-red-600', 'hover:bg-red-500');
+  } else {
+    btn.textContent = 'Start';
+    btn.classList.remove('bg-red-600', 'hover:bg-red-500');
+    btn.classList.add('bg-emerald-600', 'hover:bg-emerald-500');
+  }
+  setConfigControlsDisabled(isRunning);
+}
+
+async function refreshMonitorStatus() {
+  try {
+    const resp = await fetch('/api/status');
+    if (!resp.ok) return;
+    const status = await resp.json();
+    isRunning = !!status.running;
+    document.getElementById('stat-step').textContent = status.step || 0;
+    document.getElementById('stat-infer').textContent = status.infer_ms ?? '—';
+    applyMonitorButtonState();
+  } catch (e) {
+    logEvent('Status refresh failed: ' + e, true);
+  }
+}
+
+async function toggleMonitor() {
   if (!isRunning) {
+    const saved = await saveConfigEditor({ silent: true });
+    if (!saved) return;
     await ensureAudioReady();
     try {
       const resp = await fetch('/api/start', { method: 'POST' });
       if (resp.ok) {
         isRunning = true;
-        btn.textContent = 'Stop';
-        btn.classList.remove('bg-emerald-600', 'hover:bg-emerald-500');
-        btn.classList.add('bg-red-600', 'hover:bg-red-500');
+        applyMonitorButtonState();
       }
     } catch (e) { logEvent('Start failed: ' + e, true); }
   } else {
     try {
       await fetch('/api/stop', { method: 'POST' });
       isRunning = false;
-      btn.textContent = 'Start';
-      btn.classList.remove('bg-red-600', 'hover:bg-red-500');
-      btn.classList.add('bg-emerald-600', 'hover:bg-emerald-500');
+      applyMonitorButtonState();
     } catch (e) { logEvent('Stop failed: ' + e, true); }
   }
 }
@@ -897,6 +1236,8 @@ async function loadDiagClips() {
 // ─── Init ────────────────────────────────────────────────────
 window.addEventListener('load', () => {
   connectWS();
+  loadConfigEditor();
+  refreshMonitorStatus();
   loadSpeakers();
   loadDiagClips();
   initTimeline();

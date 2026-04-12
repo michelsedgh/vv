@@ -1,0 +1,2 @@
+denoiser:
+  enhance_enrolled_output: true

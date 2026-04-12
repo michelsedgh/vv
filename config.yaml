@@ -54,15 +54,24 @@ audio:
   # Important: the gate that controls this path must be aggregated with the
   # SAME latency as ``output_latency_sec``. Using the slower 2.0 s UI smoother
   # here created the "good window / bad window" chopping bug.
-  enrolled_live_mix: true
+  enrolled_live_mix: false
   enrolled_mix_gate_threshold: 0.05
   enrolled_mix_gate_collar_sec: 0.10
+  # Approximate pyannote SpeechSeparation leakage-removal on emitted separated
+  # packets: zero audio when the aligned speaker track is inactive. This does
+  # not denoise speech while the speaker is active; it just removes clearly
+  # inactive bleed between/around turns.
+  separated_leakage_removal: true
+  # Separated-output cleanup should be softer than the enrolled live-mix gate.
+  # Too-high values here can punch holes into syllables on separated playback.
+  separated_gate_threshold: 0.01
+  separated_leakage_collar_sec: 0.10
 
 device: cuda               # torch device
 
 enrollment:
   dir: enrolled_speakers   # each sub-dir has embedding.npy + reference.wav
-  record_seconds: 10       # default recording duration for enrollment
+  record_seconds: 30       # default recording duration for enrollment; longer refs help the profile bank more than inflating top_k on a short clip
   # Distance / room: enrollment saves reference.wav; on server start the pipeline
   # re-extracts your centroid via the same overlap-aware embedding path as live.
   # If you enroll nose-to-mic but use the app from across the room, the same
@@ -90,29 +99,41 @@ embedding:
   source_seg_threshold: 0.14
   source_min_voiced_sec: 0.10
   source_recent_sec: 2.0
-  enrollment_profile_top_k: 3  # average top same-space enrollment embeddings for a more stable frozen profile
+  # Keep this conservative unless reference.wav is much longer. Replays with the
+  # current 10 s enrollment regressed when we inflated the bank aggressively.
+  enrollment_profile_top_k: 3
+  enrollment_scan_step_sec: 0.5
+  enrollment_min_voiced_sec: 0.40
   gamma: 3.0
   beta: 10.0
 
 clustering:
-  # Keep this section close to vanilla diart: plain tau/rho/delta clustering,
-  # plus the minimum extra pieces needed for persistent enrolled identity.
-  # We previously had a much larger custom rescue stack here; that made the
-  # system harder to reason about and contributed to choppy output.
-  tau_active: 0.28
-  rho_update: 0.3
-  delta_new: 0.62
-  delta_enrolled: 0.70
-  max_speakers: 8
-  max_drift: 0.0
-  leakage_delta: 0.55
+  # Core knobs that actually matter in day-to-day tuning:
+  #   tau_active      — local speaker must be this active to participate
+  #   delta_enrolled  — strict enrolled match distance
+  #   delta_new       — how easily unmatched locals become/reuse unknowns
+  #   leakage_delta   — suppress duplicate PixIT leakage locals near an
+  #                     already matched enrolled speaker
+  # Usually leave rho_update and max_speakers alone unless logs show why.
+  tau_active: 0.28        # practical range ~0.22–0.30
+  rho_update: 0.3         # usually keep at 0.3
+  delta_new: 0.62         # practical range ~0.60–0.68
+  delta_enrolled: 0.70    # practical range ~0.68–0.72
+  max_speakers: 8         # session-level global speaker budget
+  leakage_delta: 0.55     # practical range ~0.50–0.58
+  # Continuity rescue is disabled. With max_gap: 0 these are effectively no-op.
+  # Re-enabling them made wrong-speaker audio stick to the enrolled lane.
+  enrolled_continuity_margin: 0.05
+  enrolled_continuity_max_gap: 0
+  # Onset auxiliary remap only affects the very start of short enrolled onsets.
+  # It can help clipped first syllables, but it will not fix missing middles.
   onset_aux_max_voiced_sec: 1.5
   onset_aux_dominance_ratio: 1.25
   onset_aux_dist_margin: 0.08
 
 denoiser:
   enabled: false             # mic → buffer: can shift embeddings vs enrollment; keep off unless you re-enroll
-  # Output DF caused strong block-wise pumping in logs (raw_rms swings); keep off unless you need denoised playback.
+  # Output DF can chew up separated speech interiors and cause block-wise pumping/choppy syllables; keep off unless you are explicitly A/B testing it.
   enhance_enrolled_output: false
   model: DeepFilterNet3      # model variant (DeepFilterNet, DeepFilterNet2, DeepFilterNet3)
 
