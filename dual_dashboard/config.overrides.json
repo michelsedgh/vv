@@ -1,0 +1,10 @@
+{
+  "poguise": {
+    "confidence_threshold": 0.42,
+    "debounce_frames": 2,
+    "infer_every": 1
+  },
+  "scheduler": {
+    "enabled": false
+  }
+}

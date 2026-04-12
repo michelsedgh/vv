@@ -1,0 +1,328 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Dual Dashboard</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=Space+Grotesk:wght@500;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/static/styles.css">
+  <script defer src="/static/app.js"></script>
+</head>
+<body>
+  <div class="page-shell">
+    <header class="panel topbar fade-up">
+      <div>
+        <p class="eyebrow">Voice + Vision Runtime</p>
+        <h1>Dual Dashboard</h1>
+        <p class="subtle">One process, one GPU gate, Voice-first scheduling.</p>
+      </div>
+      <div class="topbar-actions">
+        <div class="status-row" id="system-status-row"></div>
+        <div class="button-row">
+          <button class="btn btn-primary" id="btn-system-action">Start Runtime</button>
+        </div>
+      </div>
+    </header>
+
+    <main class="layout">
+      <section class="panel scheduler-panel fade-up">
+        <div class="panel-head">
+          <div>
+            <p class="eyebrow">Shared Policy</p>
+            <h2>Coexistence Scheduler</h2>
+          </div>
+          <button class="btn btn-ghost btn-small" id="btn-toggle-scheduler-settings">Hide Settings</button>
+        </div>
+        <div class="metric-strip" id="scheduler-metrics">
+          <article class="metric-card">
+            <span class="metric-label">Last Voice</span>
+            <strong id="sched-last-voice">-</strong>
+          </article>
+          <article class="metric-card">
+            <span class="metric-label">Avg Voice</span>
+            <strong id="sched-avg-voice">-</strong>
+          </article>
+          <article class="metric-card">
+            <span class="metric-label">Last PO</span>
+            <strong id="sched-last-pog">-</strong>
+          </article>
+          <article class="metric-card">
+            <span class="metric-label">Protection</span>
+            <strong id="sched-protection">-</strong>
+          </article>
+        </div>
+        <div class="config-shell" id="scheduler-settings-shell">
+          <div class="config-toolbar">
+            <div>
+              <h3>Scheduler Settings</h3>
+              <p class="config-meta" id="scheduler-config-meta">Voice-protection rules are editable while both models are stopped.</p>
+            </div>
+            <div class="config-actions">
+              <span class="badge" id="scheduler-config-badge">Loading...</span>
+              <button class="btn btn-secondary btn-small" id="btn-save-scheduler">Save</button>
+              <button class="btn btn-ghost btn-small" id="btn-reset-scheduler">Reset</button>
+            </div>
+          </div>
+          <div class="config-grid" id="scheduler-config-fields"></div>
+        </div>
+      </section>
+
+      <section class="panel runtime-panel fade-up">
+        <div class="panel-head">
+          <div>
+            <p class="eyebrow">Shared Runtime</p>
+            <h2>Events + Live Stats</h2>
+          </div>
+        </div>
+        <div class="metric-strip runtime-metrics">
+          <article class="metric-card compact">
+            <span class="metric-label">Voice Step</span>
+            <strong id="runtime-voice-step">0</strong>
+          </article>
+          <article class="metric-card compact">
+            <span class="metric-label">Voice Infer</span>
+            <strong id="runtime-voice-infer">-</strong>
+          </article>
+          <article class="metric-card compact">
+            <span class="metric-label">PO Infer</span>
+            <strong id="runtime-pog-infer">-</strong>
+          </article>
+          <article class="metric-card compact">
+            <span class="metric-label">Camera FPS</span>
+            <strong id="runtime-pog-fps">-</strong>
+          </article>
+        </div>
+        <div class="event-log shared-event-log" id="event-log"></div>
+      </section>
+
+      <section class="panel diarization-panel fade-up">
+        <div class="panel-head">
+          <div>
+            <p class="eyebrow">Audio Identity</p>
+            <h2>Diarization</h2>
+          </div>
+          <div class="panel-controls">
+            <div class="tiny-metrics">
+              <div>Step <span id="voice-step">0</span></div>
+              <div>Infer <span id="voice-infer">-</span></div>
+            </div>
+            <button class="btn btn-secondary btn-small" id="btn-toggle-voice-settings">Hide Settings</button>
+            <button class="btn btn-primary btn-small" id="btn-voice-action">Start Voice</button>
+          </div>
+        </div>
+
+        <div class="config-shell" id="voice-settings-shell">
+          <div class="config-toolbar">
+            <div>
+              <h3>Voice Settings</h3>
+              <p class="config-meta" id="voice-config-meta">Editable while Voice is stopped. Settings are written to the existing Voice override file.</p>
+            </div>
+            <div class="config-actions">
+              <span class="badge" id="voice-config-badge">Loading...</span>
+              <button class="btn btn-secondary btn-small" id="btn-save-voice">Save</button>
+              <button class="btn btn-ghost btn-small" id="btn-reset-voice">Reset</button>
+            </div>
+          </div>
+          <div class="config-grid" id="voice-config-fields"></div>
+        </div>
+
+        <div class="diarization-layout">
+          <section class="tool-card diarization-table-card">
+            <div class="tool-head">
+              <div>
+                <p class="eyebrow">Current Speakers</p>
+                <h3>Live Table</h3>
+              </div>
+            </div>
+            <div class="diarization-table-wrap">
+              <table class="diarization-table">
+                <thead>
+                  <tr>
+                    <th>Speaker</th>
+                    <th>Type</th>
+                    <th>Diar</th>
+                    <th>Audio</th>
+                    <th>ID</th>
+                    <th>State</th>
+                  </tr>
+                </thead>
+                <tbody id="diarization-current-body">
+                  <tr>
+                    <td colspan="6" class="diarization-empty">No diarization data yet.</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+          </section>
+
+          <section class="tool-card timeline-card">
+            <div class="tool-head">
+              <div>
+                <p class="eyebrow">Timeline</p>
+                <h3>Diarization History</h3>
+              </div>
+              <div class="timeline-toolbar">
+                <div id="timeline-legend" class="timeline-legend"></div>
+                <select id="timeline-window" class="field-input timeline-window">
+                  <option value="30">30s</option>
+                  <option value="60" selected>60s</option>
+                  <option value="120">2min</option>
+                  <option value="300">5min</option>
+                </select>
+              </div>
+            </div>
+            <div class="timeline-canvas-shell">
+              <canvas id="timeline-canvas"></canvas>
+            </div>
+            <div class="timeline-footer">
+              <span id="timeline-t-start">0:00</span>
+              <span>Overlap shown as layered bars</span>
+              <span id="timeline-t-end">0:00</span>
+            </div>
+          </section>
+        </div>
+      </section>
+
+      <section class="panel voice-panel fade-up">
+        <div class="panel-head">
+          <div>
+            <p class="eyebrow">Voice Output</p>
+            <h2>Separated Voices</h2>
+          </div>
+        </div>
+        <div class="speaker-stage" id="speaker-lanes">
+          <div class="empty-card" id="no-speakers-msg">No separated voice lanes yet. Start Voice to begin streaming.</div>
+        </div>
+      </section>
+
+      <section class="panel voice-library-panel fade-up" id="voice-tools-panel">
+        <div class="panel-head">
+          <div>
+            <p class="eyebrow">Voice Management</p>
+            <h2>Enrollment + Diagnostics</h2>
+          </div>
+        </div>
+        <div class="voice-tools">
+          <section class="tool-card">
+            <div class="tool-head">
+              <div>
+                <p class="eyebrow">Enrollment</p>
+                <h3>Known Voices</h3>
+              </div>
+            </div>
+            <div class="inline-form">
+              <input id="enroll-name" type="text" placeholder="Speaker name">
+              <input id="enroll-duration" type="number" min="3" max="30" value="30">
+              <button class="btn btn-secondary btn-small" id="btn-enroll">Record</button>
+            </div>
+            <p class="helper-line" id="enroll-status">Ready.</p>
+            <div class="list-stack" id="enrolled-list"></div>
+          </section>
+
+          <section class="tool-card">
+            <div class="tool-head">
+              <div>
+                <p class="eyebrow">Diagnostics</p>
+                <h3>Reference Clips</h3>
+              </div>
+            </div>
+            <div class="inline-form">
+              <input id="diag-label" type="text" placeholder="Clip label">
+              <input id="diag-duration" type="number" min="2" max="15" value="5">
+              <button class="btn btn-secondary btn-small" id="btn-diag">Record</button>
+            </div>
+            <p class="helper-line" id="diag-status">Stop Voice before recording.</p>
+            <div class="list-stack compact" id="diag-clips"></div>
+          </section>
+        </div>
+      </section>
+
+      <section class="panel poguise-panel fade-up">
+        <div class="panel-head">
+          <div>
+            <p class="eyebrow">Activity Recognition</p>
+            <h2>PO-GUISE Camera</h2>
+          </div>
+          <div class="panel-controls">
+            <div class="tiny-metrics">
+              <div>Camera <span id="pog-fps">-</span></div>
+              <div>Infer <span id="pog-infer">-</span></div>
+            </div>
+            <button class="btn btn-secondary btn-small" id="btn-toggle-pog-settings">Hide Settings</button>
+            <button class="btn btn-secondary btn-small" id="btn-toggle-heatmap">Heatmap</button>
+            <button class="btn btn-primary btn-small" id="btn-pog-action">Start PO-GUISE</button>
+          </div>
+        </div>
+
+        <div class="config-shell" id="pog-settings-shell">
+          <div class="config-toolbar">
+            <div>
+              <h3>PO-GUISE Settings</h3>
+              <p class="config-meta" id="pog-config-meta">Editable while PO-GUISE is stopped. The scheduler can still adjust the effective interval at runtime.</p>
+            </div>
+            <div class="config-actions">
+              <span class="badge" id="pog-config-badge">Loading...</span>
+              <button class="btn btn-secondary btn-small" id="btn-save-pog">Save</button>
+              <button class="btn btn-ghost btn-small" id="btn-reset-pog">Reset</button>
+            </div>
+          </div>
+          <div class="config-grid" id="pog-config-fields"></div>
+        </div>
+
+        <div class="pog-runtime">
+          <div class="video-shell">
+            <img id="poguise-video" alt="PO-GUISE live feed">
+          </div>
+
+          <div class="pog-side">
+            <section class="hero-card">
+              <p class="eyebrow">Current Action</p>
+              <h3 id="pog-current-action">Waiting...</h3>
+              <div class="hero-metrics">
+                <span>Buffer <strong id="pog-buffer">-</strong></span>
+                <span>Effective infer every <strong id="pog-effective">-</strong></span>
+              </div>
+            </section>
+
+            <section class="tool-card">
+              <div class="tool-head">
+                <div>
+                  <p class="eyebrow">Top Predictions</p>
+                  <h3>Confidence</h3>
+                </div>
+              </div>
+              <div class="prediction-list" id="pog-predictions"></div>
+            </section>
+
+            <section class="tool-card">
+              <div class="tool-head">
+                <div>
+                  <p class="eyebrow">Recent Actions</p>
+                  <h3>History</h3>
+                </div>
+              </div>
+              <div class="list-stack" id="pog-history"></div>
+            </section>
+          </div>
+
+          <section class="tool-card backoff-card">
+            <div class="tool-head">
+              <div>
+                <p class="eyebrow">Backoff Stats</p>
+                <h3>Scheduler Impact</h3>
+              </div>
+            </div>
+            <div class="metric-list">
+              <div><span>Skipped by policy</span><strong id="pog-skip-policy">0</strong></div>
+              <div><span>Skipped by busy GPU</span><strong id="pog-skip-gpu">0</strong></div>
+              <div><span>Checkpoint</span><strong id="pog-checkpoint">-</strong></div>
+            </div>
+          </section>
+        </div>
+      </section>
+    </main>
+  </div>
+</body>
+</html>
