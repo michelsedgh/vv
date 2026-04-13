@@ -197,10 +197,10 @@ def main() -> None:
     metrics["config"] = {
         "embedding.model": cfg["embedding"]["model"],
         "audio.output_latency_sec": cfg["audio"]["output_latency_sec"],
-        "audio.enrolled_mix_gate_threshold": cfg["audio"]["enrolled_mix_gate_threshold"],
-        "audio.enrolled_mix_gate_collar_sec": cfg["audio"]["enrolled_mix_gate_collar_sec"],
-        "audio.enrolled_onset_gate_threshold": cfg["audio"].get("enrolled_onset_gate_threshold"),
-        "audio.enrolled_onset_gate_collar_sec": cfg["audio"].get("enrolled_onset_gate_collar_sec"),
+        "audio.enrolled_onset_activity_threshold": cfg["audio"].get(
+            "enrolled_onset_activity_threshold",
+            cfg["audio"].get("enrolled_onset_gate_threshold"),
+        ),
         "audio.enrolled_min_activity": cfg["audio"].get("enrolled_min_activity"),
         "audio.enrolled_onset_min_activity": cfg["audio"].get("enrolled_onset_min_activity"),
         "clustering.tau_active": cfg["clustering"]["tau_active"],

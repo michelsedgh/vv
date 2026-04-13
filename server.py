@@ -9,9 +9,10 @@ FastAPI backend that:
   - Broadcasts per-speaker audio + metadata over WebSocket
   - Handles speaker enrollment (record → extract WeSpeaker embedding → save)
 
-Playback continuity (crossfade, continuity rescue, tau_active tuning) is implemented
-inside ``RealtimePipeline.step()`` — this server only feeds fixed-size chunks
-and forwards ``StepResult`` frames; see ``pipeline.py`` module docstring.
+Playback continuity (latent aggregation, continuity rescue, tau_active tuning)
+is implemented inside ``RealtimePipeline.step()`` — this server only feeds
+fixed-size chunks and forwards ``StepResult`` frames; see ``pipeline.py``
+module docstring.
 
 Transport notes
 ───────────────
@@ -242,47 +243,10 @@ CONFIG_EDITOR_FIELDS: List[dict] = [
         step=0.1,
     ),
     _field(
-        "audio.enrolled_live_mix",
-        "Enrolled Live Mix",
+        "audio.enrolled_onset_activity_threshold",
+        "Onset Activity Threshold",
         "Audio",
-        "When enabled, enrolled speakers play delayed gated mixed mic audio instead of the separated PixIT source. More stable, but it carries room/background with the target voice.",
-        "boolean",
-    ),
-    _field(
-        "audio.enrolled_mix_gate_threshold",
-        "Mix Gate Threshold",
-        "Audio",
-        "Activity threshold used to open the enrolled live-mix gate. Lower values keep the lane open more easily; higher values cut more bleed but can clip soft speech.",
-        "number",
-        min=0.0,
-        max=1.0,
-        step=0.01,
-    ),
-    _field(
-        "audio.enrolled_mix_gate_collar_sec",
-        "Mix Gate Collar",
-        "Audio",
-        "Extra time added before and after detected speech when gating enrolled live mix. Useful for preserving consonants at the edges of phrases.",
-        "number",
-        min=0.0,
-        max=1.0,
-        step=0.01,
-    ),
-    _field(
-        "audio.enrolled_onset_gate_threshold",
-        "Onset Gate Threshold",
-        "Audio",
-        "More permissive gate threshold used only when an enrolled speaker is recognized one step later than the delayed packet being emitted. Lower values help recover clipped first syllables.",
-        "number",
-        min=0.0,
-        max=1.0,
-        step=0.01,
-    ),
-    _field(
-        "audio.enrolled_onset_gate_collar_sec",
-        "Onset Gate Collar",
-        "Audio",
-        "Extra collar used only for late-recognized enrolled onsets. Increase this to recover more of the first word at the cost of more room bleed right before speech starts.",
+        "Minimum aggregated speaker activity required before a late-recovered enrolled onset is allowed to emit. Lower values recover more first-word content; higher values stay stricter.",
         "number",
         min=0.0,
         max=1.0,
@@ -297,16 +261,6 @@ CONFIG_EDITOR_FIELDS: List[dict] = [
         min=0.0,
         max=1.0,
         step=0.01,
-    ),
-    _field(
-        "audio.enrolled_onset_fade_sec",
-        "Onset Fade",
-        "Audio",
-        "Short fade-in applied only to newly emitted enrolled separated packets. This softens abrupt starts when using model output instead of live mix.",
-        "number",
-        min=0.0,
-        max=0.25,
-        step=0.005,
     ),
     _field(
         "audio.separated_leakage_removal",

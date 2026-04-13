@@ -45,31 +45,21 @@ debug:
 audio:
   device_index: 0          # sounddevice input device (IC800 USB mic)
   sample_rate: 16000       # PixIT native sample rate
-  # Emit audio with a small delay so the packet comes from a better-supported
-  # region of the latest PixIT chunk without adding a very noticeable lag.
+  # Emit audio with a small delay so the packet is reconstructed from latent
+  # features covered by more than one overlapping PixIT window.
   output_latency_sec: 1.0
-  # Live enrolled playback uses delayed mixed audio gated by the assigned
-  # speaker track, not raw separated PixIT locals. This is the causally stable
-  # path; raw separated locals are only for emitted audio after assignment.
-  # Important: the gate that controls this path must be aggregated with the
-  # SAME latency as ``output_latency_sec``. Using the slower 2.0 s UI smoother
-  # here created the "good window / bad window" chopping bug.
-  enrolled_live_mix: false
-  enrolled_mix_gate_threshold: 0.05
-  enrolled_mix_gate_collar_sec: 0.10
   # Onset fallback only applies when an enrolled speaker is recognized one
-  # step later than the delayed packet being emitted. Keep it slightly more
-  # permissive than the steady-state live-mix gate to avoid clipped first
-  # syllables without opening the lane all the time.
-  enrolled_onset_gate_threshold: 0.01
-  enrolled_onset_gate_collar_sec: 0.30
+  # step later than the delayed packet being emitted. This is now only a
+  # speaker-map/activity decision; there is no extra sample-level onset mixer.
+  enrolled_onset_activity_threshold: 0.01
   # Approximate pyannote SpeechSeparation leakage-removal on emitted separated
   # packets: zero audio when the aligned speaker track is inactive. This does
   # not denoise speech while the speaker is active; it just removes clearly
-  # inactive bleed between/around turns.
+  # inactive bleed between/around turns. This applies to unknown lanes only;
+  # enrolled lanes use identity/continuity decisions instead of a second hard
+  # sample gate on top of the separator.
   separated_leakage_removal: true
-  # Separated-output cleanup should be softer than the enrolled live-mix gate.
-  # Too-high values here can punch holes into syllables on separated playback.
+  # Too-high values here can punch holes into syllables on unknown-lane output.
   separated_gate_threshold: 0.01
   separated_leakage_collar_sec: 0.10
   # Verification gates: enrolled audio is only emitted when both identity
@@ -77,6 +67,8 @@ audio:
   # positive enrolled audio when clustering makes a marginal distance match.
   enrolled_min_similarity: 0.25
   enrolled_min_activity: 0.10
+  # Fresh recovered onsets can use a slightly lower activity floor than steady
+  # state, but the audio itself still comes from pure latent reconstruction.
   enrolled_onset_min_activity: 0.02
 
 device: cuda               # torch device

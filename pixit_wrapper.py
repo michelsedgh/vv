@@ -14,16 +14,25 @@ from __future__ import annotations
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from diart.models import SegmentationModel
 from huggingface_hub import HfFolder
 from pyannote.audio import Model
+
+try:
+    from asteroid.utils.torch_utils import pad_x_to_y
+except ImportError as exc:  # pragma: no cover - runtime dependency checked by pyannote
+    raise ImportError(
+        "PixIT separation requires asteroid. Install pyannote-audio[separation]."
+    ) from exc
 
 
 class PixITWrapper(nn.Module):
     """Wraps ToTaToNet so that forward() returns only the diarization tensor.
 
-    The separated source waveforms are stored in ``last_sources`` after every
-    forward pass so that downstream code (pipeline.py) can retrieve them.
+    The separated source waveforms and masked latent representation are stored
+    after every forward pass so downstream code can reconstruct in latent space
+    instead of overlap-adding already-decoded waveforms.
 
     Shapes (for a 5 s chunk at 16 kHz):
         input  : (batch, 1, 80000)
@@ -36,6 +45,7 @@ class PixITWrapper(nn.Module):
         self.totatonet = totatonet
         # Populated after every forward(); detached, on the same device.
         self.last_sources: torch.Tensor | None = None
+        self.last_masked_tf_rep: torch.Tensor | None = None
 
     def forward(self, waveform: torch.Tensor) -> torch.Tensor:
         """Run ToTaToNet and return only the diarization activations.
@@ -48,10 +58,48 @@ class PixITWrapper(nn.Module):
         -------
         diarization : torch.Tensor, shape (batch, frames, speakers)
         """
-        diarization, sources = self.totatonet(waveform)
-        # Detach sources so they don't hold the compute graph in memory.
-        self.last_sources = sources.detach()
+        model = self.totatonet
+        bsz = waveform.shape[0]
+        tf_rep = model.encoder(waveform)
+        if model.use_wavlm:
+            wavlm_rep = model.wavlm(waveform.squeeze(1)).last_hidden_state
+            wavlm_rep = wavlm_rep.transpose(1, 2)
+            wavlm_rep = wavlm_rep.repeat_interleave(model.wavlm_scaling, dim=-1)
+            wavlm_rep = pad_x_to_y(wavlm_rep, tf_rep)
+            wavlm_rep = torch.cat((tf_rep, wavlm_rep), dim=1)
+            masks = model.masker(wavlm_rep)
+        else:
+            masks = model.masker(tf_rep)
+
+        masked_tf_rep = masks * tf_rep.unsqueeze(1)
+        decoded_sources = self.decode_masked_tf_rep(masked_tf_rep, waveform.shape[-1])
+        outputs = torch.flatten(masked_tf_rep, start_dim=0, end_dim=1)
+        outputs = model.average_pool(outputs)
+        outputs = outputs.transpose(1, 2)
+        if model.hparams.linear["num_layers"] > 0:
+            for linear in model.linear:
+                outputs = F.leaky_relu(linear(outputs))
+        if model.hparams.linear["num_layers"] == 0:
+            outputs = (outputs**2).sum(dim=2).unsqueeze(-1)
+        outputs = model.classifier(outputs)
+        outputs = outputs.reshape(bsz, model.n_sources, -1)
+        outputs = outputs.transpose(1, 2)
+        diarization = model.activation[0](outputs)
+
+        self.last_masked_tf_rep = masked_tf_rep.detach()
+        self.last_sources = decoded_sources.detach()
         return diarization
+
+    def decode_masked_tf_rep(
+        self,
+        masked_tf_rep: torch.Tensor,
+        target_num_samples: int,
+    ) -> torch.Tensor:
+        """Decode masked latent features to waveform with causal right trim/pad."""
+        decoded = self.totatonet.decoder(masked_tf_rep)
+        if decoded.shape[-1] != int(target_num_samples):
+            decoded = F.pad(decoded, [0, int(target_num_samples) - int(decoded.shape[-1])])
+        return decoded.transpose(1, 2)
 
 
 def make_pixit_segmentation_model(

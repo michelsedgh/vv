@@ -22,8 +22,9 @@ Data flow per step
     → DIART DelayedAggregation (Hamming) on permuted_seg → smoother activity
       (same idea as diart SpeakerDiarization.pred_aggregation; clustering still
       runs on the instantaneous permuted chunk like DIART)
-    → source mapping: per-speaker step audio + activity from aggregated seg
-    → enrolled live playback: delayed mixed audio gated by aligned global activity
+    → source mapping: per-speaker masked latent features + activity from aggregated seg
+    → Hamming aggregation of global masked latent features across overlapping chunks
+    → decode only the emitted delayed step back to waveform
     → [optional] DeepFilterNet on separated audio for enrolled speakers only
 
 Historical debugging summary
@@ -48,8 +49,9 @@ like "bad models" but were actually integration bugs:
   PixIT is a fixed-number separator on overlapping 5 s windows. A local source
   at time ``t`` is not a stable realtime speaker track by itself. Streaming raw
   current-window separated tails caused weak onsets, leakage, and chopped words.
-  Live enrolled playback therefore uses delayed *mixed* audio gated by the
-  speaker track. Separation remains useful for output audio and diagnostics.
+  Live playback now reconstructs from PixIT's masked latent features instead of
+  overlap-adding already-decoded waveforms. Global speaker alignment still
+  happens chunk-by-chunk, but decoding happens only after latent aggregation.
 
 - Gate/audio latency mismatch:
   We once gated emitted audio with the 2.0 s activity smoother while the audio
@@ -67,11 +69,12 @@ like "bad models" but were actually integration bugs:
 Playback quality and output alignment
 ────────────────────────────────────
 PixIT is re-run every 500 ms on a sliding 5 s window, so the newest 500 ms
-slice exists in only one separator window. Emitting that freshest slice
+slice exists in only one separator window. Emitting that freshest decoded slice
 directly makes onsets weak and unstable. The backend therefore emits a
-**delayed step** whose samples are already covered by at least two overlapping
-PixIT windows. This mirrors diart's latency-oriented design: real time with a
-controlled output delay rather than zero-latency edge audio.
+**delayed step** whose masked latent features are already covered by at least
+two overlapping PixIT windows, then decodes only that aggregated delayed step.
+This mirrors diart's latency-oriented design: real time with a controlled
+output delay rather than zero-latency edge audio.
 
 Clustered separated sources are also leakage-pruned before output. PixIT always
 produces a fixed number of local sources, and more than one local can contain
@@ -456,36 +459,19 @@ class RealtimePipeline:
         self._output_latency_steps = max(
             1, int(round(self._output_latency_sec / self.step_duration))
         )
-        self._enrolled_live_mix = bool(acfg.get("enrolled_live_mix", True))
-        self._enrolled_mix_gate_threshold = float(
+        # Onset fallback is only about speaker-map continuity now. A slightly
+        # lower activity floor lets a newly recovered enrolled speaker emit its
+        # first packet without needing a separate sample-level audio gate.
+        self._enrolled_onset_activity_threshold = float(
             acfg.get(
-                "enrolled_mix_gate_threshold",
-                max(0.06, self.cfg["clustering"]["tau_active"] * 0.25),
-            )
-        )
-        self._enrolled_mix_gate_collar_sec = float(
-            acfg.get("enrolled_mix_gate_collar_sec", 0.03)
-        )
-        # Onset fallback is only used when an enrolled speaker appears in the
-        # current step but was not yet assigned in the delayed packet. That is
-        # exactly the "first half of the first word got clipped" failure mode,
-        # so keep this path slightly more permissive than steady-state gating.
-        self._enrolled_onset_gate_threshold = float(
-            acfg.get(
-                "enrolled_onset_gate_threshold",
-                min(self._enrolled_mix_gate_threshold, 0.01),
-            )
-        )
-        self._enrolled_onset_gate_collar_sec = float(
-            acfg.get(
-                "enrolled_onset_gate_collar_sec",
-                max(self._enrolled_mix_gate_collar_sec, 0.30),
+                "enrolled_onset_activity_threshold",
+                acfg.get("enrolled_onset_gate_threshold", 0.01),
             )
         )
         # pyannote's SpeechSeparation pipeline has a leakage-removal stage that
         # zeroes separated sources when the aligned speaker diarization is
-        # inactive. Keep a causal approximation here so ``enrolled_live_mix:
-        # false`` (and unknown-lane output) is not just raw unmasked PixIT audio.
+        # inactive. Keep a causal approximation for unknown-lane output, but do
+        # not apply it to enrolled packets after identity is already decided.
         self._separated_leakage_removal = bool(
             acfg.get("separated_leakage_removal", True)
         )
@@ -511,23 +497,17 @@ class RealtimePipeline:
                 min(self._enrolled_min_activity, 0.02),
             )
         )
-        self._enrolled_onset_fade_sec = float(
-            acfg.get("enrolled_onset_fade_sec", 0.03)
-        )
         log.info(
             "Separated-audio output latency: %.3fs (%d step%s)",
             self._output_latency_sec,
             self._output_latency_steps,
             "" if self._output_latency_steps == 1 else "s",
         )
-        self._audio_aggregation = DelayedAggregation(
+        self._latent_aggregation = DelayedAggregation(
             self.step_duration,
             latency=self._output_latency_sec,
-            strategy="first",
-            cropping_mode="center",
-        )
-        self._separated_hamming_window = np.hamming(self.chunk_samples).astype(
-            np.float32
+            strategy="hamming",
+            cropping_mode="loose",
         )
         # Audio gating must use a prediction track aligned to the SAME delayed
         # step as emitted audio. Using the 2.0 s UI/activity aggregation here
@@ -539,12 +519,15 @@ class RealtimePipeline:
             strategy="hamming",
             cropping_mode="loose",
         )
-        self._audio_buffer: List[SlidingWindowFeature] = []
-        self._mix_buffer: List[SlidingWindowFeature] = []
+        self._latent_buffer: List[SlidingWindowFeature] = []
+        self._latent_valid_buffer: List[SlidingWindowFeature] = []
         self._emit_pred_buffer: List[SlidingWindowFeature] = []
         self._emit_meta_buffer: List[tuple[int, List[Dict[str, Any]]]] = []
-        self._emit_track_buffer: List[tuple[int, np.ndarray]] = []
         self._last_emitted_step_by_global: Dict[int, int] = {}
+        self._latent_filters = 0
+        self._latent_frames_per_chunk = 0
+        self._latent_step_frames = 0
+        self._pixit_dtype = torch.float16
         self._adaptive_profile_streaks: Dict[int, int] = {}
         self._adaptive_profile_last_add_step: Dict[int, int] = {}
         if self._step_perf_log and self._step_perf_path is not None:
@@ -564,6 +547,16 @@ class RealtimePipeline:
         dummy_fp32 = dummy_fp16.float()
         with torch.inference_mode():
             self._pixit_wrapper(dummy_fp16)       # PixIT is fp16
+            if self._pixit_wrapper.last_masked_tf_rep is None:
+                raise RuntimeError("PixIT wrapper did not expose masked latent features")
+            latent_shape = self._pixit_wrapper.last_masked_tf_rep.shape
+            self._latent_filters = int(latent_shape[2])
+            self._latent_frames_per_chunk = int(latent_shape[3])
+            self._latent_step_frames = max(
+                1,
+                int(round(self._latent_frames_per_chunk * self.step_duration / self.duration)),
+            )
+            self._pixit_dtype = self._pixit_wrapper.last_masked_tf_rep.dtype
             d = self._emb_model(dummy_fp32)
             self._emb_dim = d.shape[-1]
             dummy_waveform = torch.randn(
@@ -574,7 +567,12 @@ class RealtimePipeline:
             )
             self._oa_emb(dummy_waveform, dummy_seg)
         torch.cuda.synchronize(self.device)
-        log.info("Pipeline ready (emb_dim=%d).", self._emb_dim)
+        log.info(
+            "Pipeline ready (emb_dim=%d, latent=%d filters x %d frames).",
+            self._emb_dim,
+            self._latent_filters,
+            self._latent_frames_per_chunk,
+        )
 
     def _perf_log_append(self, payload: dict) -> None:
         if not self._step_perf_log or self._step_perf_path is None:
@@ -849,49 +847,107 @@ class RealtimePipeline:
             "strong_candidates": strong_candidates,
         }
 
-    def _aggregate_audio_chunk(self, step_idx: int, chunk_sources: np.ndarray) -> np.ndarray:
-        """Extract one delayed interior slice from the current separated chunk.
+    def _aggregate_latent_chunk(
+        self,
+        step_idx: int,
+        chunk_latent: np.ndarray,
+    ) -> np.ndarray:
+        """Aggregate global masked latent features over overlapping windows."""
+        latent = np.asarray(chunk_latent, dtype=np.float32)
+        if latent.ndim != 3 or latent.shape[0] != self._latent_frames_per_chunk:
+            return np.zeros(
+                (
+                    self._latent_step_frames,
+                    self.clustering.max_speakers,
+                    self._latent_filters,
+                ),
+                dtype=np.float32,
+            )
 
-        Offline pyannote reconstructs full-file sources by overlap-adding many
-        chunk estimates. In this live pipeline that turned out to be the wrong
-        thing to do: independent PixIT windows often produce slightly different
-        phase/amplitude estimates for the same speaker, and summing them caused
-        real speech to collapse even while the assigned speaker track remained
-        active. Using a single delayed interior slice avoids those cancellations
-        while still keeping the packet away from the newest unstable chunk edge.
-        """
-        chunk_sources = np.asarray(chunk_sources, dtype=np.float32)
-        num_speakers = int(chunk_sources.shape[1]) if chunk_sources.ndim == 2 else 0
-        if chunk_sources.ndim != 2 or num_speakers == 0:
-            return np.zeros((self.step_samples, 0), dtype=np.float32)
-
-        delay_samples = int(round(self._output_latency_sec * self.sample_rate))
-        start = max(0, self.chunk_samples - delay_samples)
-        end = min(chunk_sources.shape[0], start + self.step_samples)
-
-        delayed = np.zeros((self.step_samples, num_speakers), dtype=np.float32)
-        if end > start:
-            delayed[: end - start] = chunk_sources[start:end]
-        return delayed
-
-    def _aggregate_mix_chunk(self, step_idx: int, chunk_waveform: np.ndarray) -> np.ndarray:
-        """Aggregate one mono chunk with the same delay policy as speaker audio."""
-        audio_sw = SlidingWindow(
+        latent_sw = SlidingWindow(
             start=self._chunk_start_time(step_idx),
-            duration=1.0 / float(self.sample_rate),
-            step=1.0 / float(self.sample_rate),
+            duration=self.duration / float(self._latent_frames_per_chunk),
+            step=self.duration / float(self._latent_frames_per_chunk),
         )
-        mono = np.asarray(chunk_waveform, dtype=np.float32).reshape(-1, 1)
-        self._mix_buffer.append(SlidingWindowFeature(mono, audio_sw))
-        agg_audio = self._audio_aggregation(self._mix_buffer)
-        if len(self._mix_buffer) == self._audio_aggregation.num_overlapping_windows:
-            self._mix_buffer = self._mix_buffer[1:]
+        flat = latent.reshape(self._latent_frames_per_chunk, -1)
+        valid = (
+            np.sqrt(np.mean(latent.astype(np.float64) ** 2, axis=2)) > 1e-8
+        ).astype(np.float32)
+        valid_flat = np.repeat(valid[:, :, np.newaxis], self._latent_filters, axis=2).reshape(
+            self._latent_frames_per_chunk,
+            -1,
+        )
+        self._latent_buffer.append(SlidingWindowFeature(flat, latent_sw))
+        self._latent_valid_buffer.append(SlidingWindowFeature(valid_flat, latent_sw))
+        agg_latent = self._latent_aggregation(self._latent_buffer)
+        agg_valid = self._latent_aggregation(self._latent_valid_buffer)
+        if len(self._latent_buffer) == self._latent_aggregation.num_overlapping_windows:
+            self._latent_buffer = self._latent_buffer[1:]
+            self._latent_valid_buffer = self._latent_valid_buffer[1:]
 
-        audio = np.asarray(agg_audio.data, dtype=np.float32).reshape(-1)
-        if audio.shape[0] < self.step_samples:
-            audio = np.pad(audio, (0, self.step_samples - audio.shape[0]))
-        elif audio.shape[0] > self.step_samples:
-            audio = audio[: self.step_samples]
+        data_flat = np.asarray(agg_latent.data, dtype=np.float32)
+        valid_mean_flat = np.asarray(agg_valid.data, dtype=np.float32)
+        if data_flat.shape[0] < self._latent_step_frames:
+            data_flat = np.pad(
+                data_flat,
+                ((0, self._latent_step_frames - data_flat.shape[0]), (0, 0)),
+                mode="constant",
+            )
+            valid_mean_flat = np.pad(
+                valid_mean_flat,
+                ((0, self._latent_step_frames - valid_mean_flat.shape[0]), (0, 0)),
+                mode="constant",
+            )
+        elif data_flat.shape[0] > self._latent_step_frames:
+            data_flat = data_flat[: self._latent_step_frames]
+            valid_mean_flat = valid_mean_flat[: self._latent_step_frames]
+
+        data = data_flat.reshape(
+            self._latent_step_frames,
+            self.clustering.max_speakers,
+            self._latent_filters,
+        )
+        valid_mean = valid_mean_flat.reshape(
+            self._latent_step_frames,
+            self.clustering.max_speakers,
+            self._latent_filters,
+        )
+        for global_idx in range(self.clustering.max_speakers):
+            if not self.clustering.is_enrolled(int(global_idx)):
+                continue
+            denom = np.maximum(valid_mean[:, global_idx, :], 1e-6)
+            data[:, global_idx, :] = np.divide(
+                data[:, global_idx, :],
+                denom,
+                out=np.zeros_like(data[:, global_idx, :]),
+                where=valid_mean[:, global_idx, :] > 1e-6,
+            )
+        return data
+
+    def _decode_aggregated_latent_step(
+        self,
+        aggregated_latent: np.ndarray,
+    ) -> np.ndarray:
+        """Decode one aggregated latent step back to waveform."""
+        latent = np.asarray(aggregated_latent, dtype=np.float32)
+        if latent.ndim != 3:
+            return np.zeros((self.step_samples, self.clustering.max_speakers), dtype=np.float32)
+
+        latent_t = torch.from_numpy(
+            np.transpose(latent, (1, 2, 0))
+        ).unsqueeze(0).to(device=self.device, dtype=self._pixit_dtype)
+        with torch.inference_mode():
+            decoded = self._pixit_wrapper.decode_masked_tf_rep(
+                latent_t,
+                self.step_samples,
+            )
+        audio = decoded[0].float().cpu().numpy().astype(np.float32, copy=False)
+        latent_energy = np.sqrt(
+            np.mean(np.asarray(latent, dtype=np.float64) ** 2, axis=(0, 2))
+        )
+        silent_globals = np.where(latent_energy < 1e-8)[0]
+        if silent_globals.size:
+            audio[:, silent_globals] = 0.0
         return audio
 
     def _step_track_mask(
@@ -947,31 +1003,6 @@ class RealtimePipeline:
             mask = np.resize(mask, audio.shape[0]).astype(np.float32)
         return (audio * mask).astype(np.float32, copy=False)
 
-    def _apply_packet_fade_in(
-        self,
-        samples: np.ndarray,
-        fade_sec: float,
-    ) -> np.ndarray:
-        """Soften abrupt packet starts without changing steady-state level."""
-        audio = np.asarray(samples, dtype=np.float32).reshape(-1).copy()
-        if audio.size == 0 or fade_sec <= 0.0:
-            return audio
-
-        fade_samples = min(
-            audio.size,
-            max(1, int(round(float(fade_sec) * float(self.sample_rate)))),
-        )
-        nz = np.flatnonzero(np.abs(audio) > 1e-5)
-        if nz.size == 0:
-            return audio
-        start = int(nz[0])
-        end = min(audio.size, start + fade_samples)
-        if end <= start:
-            return audio
-        ramp = np.linspace(0.0, 1.0, end - start, dtype=np.float32)
-        audio[start:end] *= ramp
-        return audio
-
     def _candidate_emit_globals(
         self,
         delayed_meta_by_global: Dict[int, Dict[str, Any]],
@@ -1009,7 +1040,7 @@ class RealtimePipeline:
             ).reshape(-1)
             if (
                 global_track.size
-                and float(np.max(global_track)) >= self._enrolled_onset_gate_threshold
+                and float(np.max(global_track)) >= self._enrolled_onset_activity_threshold
             ):
                 candidate_globals.add(int(global_idx))
         return candidate_globals
@@ -1176,7 +1207,7 @@ class RealtimePipeline:
         out_pairs.append((best_local, anchor_idx))
         return out_pairs, 1
 
-    def _compose_enrolled_chunk_source(
+    def _compose_enrolled_chunk_latent(
         self,
         assigned_local: int,
         anchor_idx: int,
@@ -1184,27 +1215,27 @@ class RealtimePipeline:
         embeddings: torch.Tensor,
         source_stats: List[Dict[str, float]],
         segmentation: np.ndarray,
-        sources_np: np.ndarray,
+        masked_tf_np: np.ndarray,
     ) -> np.ndarray:
-        """Compose enrolled chunk audio from very-near locals without summing.
+        """Compose enrolled chunk latent features from very-near locals.
 
         The root problem is not just thresholding: blind separation can split
         one real speaker across more than one local channel in the same chunk.
-        If we emit only the assigned local, speech can vanish when PixIT flips
-        energy into a nearby unknown local. If we sum those locals, the
-        waveforms interfere. Use a delayed block-wise winner across locals that
-        are still close enough to the same enrolled anchor instead.
+        If we keep only the assigned local, speech can vanish when PixIT flips
+        energy into a nearby unknown local. If we sum locals after decode, the
+        waveforms interfere. Instead, pick a block-wise latent winner across
+        locals that are still close enough to the same enrolled anchor.
         """
         assigned_local = int(assigned_local)
-        base = np.asarray(sources_np[:, assigned_local], dtype=np.float32)
+        base = np.asarray(masked_tf_np[assigned_local], dtype=np.float32)
         if not active_indices:
-            return base
+            return np.transpose(base, (1, 0))
 
         assigned_emb = (
             embeddings[assigned_local].detach().cpu().numpy().astype(np.float64, copy=False)
         )
         if np.isnan(assigned_emb).any():
-            return base
+            return np.transpose(base, (1, 0))
 
         assigned_dist = float(self.clustering.enrolled_distance(anchor_idx, assigned_emb))
         max_dist = max(
@@ -1230,32 +1261,28 @@ class RealtimePipeline:
             dist_by_local[local_idx] = dist
 
         if len(eligible) == 1:
-            return base
-
-        delay_samples = int(round(self._output_latency_sec * self.sample_rate))
-        start = max(0, self.chunk_samples - delay_samples)
-        end = min(self.chunk_samples, start + self.step_samples)
-        if end <= start:
-            return base
+            return np.transpose(base, (1, 0))
 
         composed = base.copy()
         prev_local = assigned_local
         block_samples = max(
-            1, int(round(self._enrolled_merge_block_sec * float(self.sample_rate)))
+            1,
+            int(round(self._enrolled_merge_block_sec * float(self._latent_frames_per_chunk) / float(self.duration))),
         )
-        num_frames = max(1, int(segmentation.shape[0]))
+        seg_frames = max(1, int(segmentation.shape[0]))
+        latent_frames = max(1, int(base.shape[-1]))
 
-        for block_start in range(start, end, block_samples):
-            block_end = min(end, block_start + block_samples)
-            frame_start = min(
-                num_frames - 1,
-                int(np.floor(block_start * num_frames / float(self.chunk_samples))),
+        for block_start in range(0, latent_frames, block_samples):
+            block_end = min(latent_frames, block_start + block_samples)
+            seg_start = min(
+                seg_frames - 1,
+                int(np.floor(block_start * seg_frames / float(latent_frames))),
             )
-            frame_end = max(
-                frame_start + 1,
+            seg_end = max(
+                seg_start + 1,
                 min(
-                    num_frames,
-                    int(np.ceil(block_end * num_frames / float(self.chunk_samples))),
+                    seg_frames,
+                    int(np.ceil(block_end * seg_frames / float(latent_frames))),
                 ),
             )
 
@@ -1264,19 +1291,20 @@ class RealtimePipeline:
             best_score = -1.0
             for local_idx in eligible:
                 block = np.asarray(
-                    sources_np[block_start:block_end, local_idx], dtype=np.float32
+                    masked_tf_np[local_idx, :, block_start:block_end],
+                    dtype=np.float32,
                 )
                 if block.size == 0:
                     continue
-                block_rms = float(np.sqrt(np.mean(block.astype(np.float64) ** 2)))
-                if block_rms < self._enrolled_merge_min_block_rms:
+                block_energy = float(np.sqrt(np.mean(block.astype(np.float64) ** 2)))
+                if block_energy < self._enrolled_merge_min_block_rms:
                     continue
                 seg_mean = float(
-                    np.mean(segmentation[frame_start:frame_end, local_idx])
+                    np.mean(segmentation[seg_start:seg_end, local_idx])
                 )
                 # Small distance bias keeps us from grabbing merely loud nearby
                 # contamination when two locals are not equally Michel-like.
-                score = (block_rms * max(seg_mean, 1e-3)) / (
+                score = (block_energy * max(seg_mean, 1e-3)) / (
                     1.0 + dist_by_local[local_idx]
                 )
                 scores[local_idx] = score
@@ -1292,10 +1320,12 @@ class RealtimePipeline:
             ):
                 best_local = prev_local
 
-            composed[block_start:block_end] = sources_np[block_start:block_end, best_local]
+            composed[:, block_start:block_end] = masked_tf_np[
+                best_local, :, block_start:block_end
+            ]
             prev_local = best_local
 
-        return composed.astype(np.float32, copy=False)
+        return np.transpose(composed.astype(np.float32, copy=False), (1, 0))
 
     def _prune_profile_rows(
         self,
@@ -1593,12 +1623,12 @@ class RealtimePipeline:
     def step(self, waveform: np.ndarray) -> StepResult:
         """Run one pipeline step on a 5 s audio chunk.
 
-        Output audio path: local separated sources are first mapped to global
-        speakers for the current chunk, then those chunk-level global sources
-        are overlap-added across the recent rolling buffer. The emitted audio is
-        the exact current ``step_samples`` slice of that aggregated global
-        source, which is more stable than stitching raw tails from one PixIT
-        window at a time.
+        Output audio path: local masked latent features are first mapped to
+        global speakers for the current chunk, then those chunk-level global
+        latents are Hamming-aggregated across the recent rolling buffer. The
+        emitted audio is decoded only after that aggregation, which is more
+        stable than stitching raw decoded tails from one PixIT window at a
+        time.
 
         Parameters
         ----------
@@ -1637,6 +1667,9 @@ class RealtimePipeline:
         t1 = tc()
         seg_np = diarization_t[0].float().cpu().numpy()   # (624, 3) ensure fp32
         sources = self._pixit_wrapper.last_sources.float()  # (1, 80000, 3) GPU fp32
+        masked_tf_rep = self._pixit_wrapper.last_masked_tf_rep
+        if masked_tf_rep is None:
+            raise RuntimeError("PixIT wrapper did not provide masked latent features")
 
         # One GPU→CPU sync for per-local tail RMS (reconcile dedupe + holdover used to
         # slice each lane and call .cpu() separately → several syncs per step when
@@ -1737,11 +1770,10 @@ class RealtimePipeline:
         emit_step_scores = np.asarray(emit_agg_permuted.data, dtype=np.float32)
 
         t4 = tc()
-        # ── 4. Map sources to global speakers (single window) ──
-        # One PixIT forward per step; we only read the current ``sources`` tail.
-        # Multi-window overlap-add on *waveforms* was reverted: misaligned
-        # windows summed wrong phases → echo/buildup.  DelayedAggregation above
-        # only smooths *segmentation* for activity/UI, not separated audio.
+        # ── 4. Map source latents to global speakers (single window) ──
+        # One PixIT forward per step; we keep the masked latent features for
+        # each local source, align them to global speakers, aggregate them over
+        # overlapping windows, and decode only the emitted delayed step.
 
         results = []
         pairs: List[tuple[int, int]] = []
@@ -1779,11 +1811,15 @@ class RealtimePipeline:
 
         pairs_after_reconcile = int(len(pairs))
         unknown_pairs_dropped = 0
-        sources_np: Optional[np.ndarray] = None
+        masked_tf_np: Optional[np.ndarray] = None
 
         t5 = tc()
-        chunk_global = np.zeros(
-            (self.chunk_samples, self.clustering.max_speakers),
+        chunk_global_latent = np.zeros(
+            (
+                self._latent_frames_per_chunk,
+                self.clustering.max_speakers,
+                self._latent_filters,
+            ),
             dtype=np.float32,
         )
         emit_pairs: List[tuple[int, int, float, bool]] = []
@@ -1818,27 +1854,33 @@ class RealtimePipeline:
                         if nearest_enrolled <= (self.clustering.delta_enrolled + 0.03):
                             unknown_pairs_dropped += 1
                             continue
-                if sources_np is None:
-                    sources_np = (
-                        sources[0].detach().cpu().numpy().astype(np.float32, copy=False)
+                if masked_tf_np is None:
+                    masked_tf_np = (
+                        masked_tf_rep[0].detach().float().cpu().numpy().astype(
+                            np.float32,
+                            copy=False,
+                        )
                     )
-                src = np.asarray(sources_np[:, local_idx], dtype=np.float32)
+                latent_chunk = np.transpose(
+                    np.asarray(masked_tf_np[local_idx], dtype=np.float32),
+                    (1, 0),
+                )
                 if is_enrolled:
-                    src = self._compose_enrolled_chunk_source(
+                    latent_chunk = self._compose_enrolled_chunk_latent(
                         local_idx,
                         global_idx,
                         active_indices,
                         embeddings,
                         source_stats,
                         seg_np,
-                        sources_np,
+                        masked_tf_np,
                     )
-                chunk_global[:, global_idx] = src
+                chunk_global_latent[:, global_idx, :] = latent_chunk
                 step_track = seg_np[-local_step_frames:, local_idx]
                 emit_pairs.append((local_idx, global_idx, activity, is_enrolled))
 
-        delayed_audio = self._aggregate_audio_chunk(self._step_idx, chunk_global)
-        delayed_mix_audio = self._aggregate_mix_chunk(self._step_idx, waveform)
+        delayed_latent = self._aggregate_latent_chunk(self._step_idx, chunk_global_latent)
+        delayed_audio = self._decode_aggregated_latent_step(delayed_latent)
         current_emit_meta: List[Dict[str, Any]] = []
         for local_idx, global_idx, activity, is_enrolled in emit_pairs:
             label = self.clustering.get_label(global_idx)
@@ -1862,30 +1904,14 @@ class RealtimePipeline:
             )
 
         self._emit_meta_buffer.append((self._step_idx, current_emit_meta))
-        if len(self._emit_meta_buffer) > self._audio_aggregation.num_overlapping_windows:
-            self._emit_meta_buffer = self._emit_meta_buffer[-self._audio_aggregation.num_overlapping_windows :]
-        raw_emit_tracks = np.asarray(
-            permuted_seg.data[-local_step_frames:, :],
-            dtype=np.float32,
-        )
-        self._emit_track_buffer.append((self._step_idx, raw_emit_tracks.copy()))
-        if len(self._emit_track_buffer) > self._audio_aggregation.num_overlapping_windows:
-            self._emit_track_buffer = self._emit_track_buffer[
-                -self._audio_aggregation.num_overlapping_windows :
-            ]
-
+        if len(self._emit_meta_buffer) > self._output_latency_steps:
+            self._emit_meta_buffer = self._emit_meta_buffer[-self._output_latency_steps :]
         emit_step_idx = self._step_idx - self._output_latency_steps + 1
         delayed_emit_meta: List[Dict[str, Any]] = []
         for hist_step_idx, hist_meta in reversed(self._emit_meta_buffer):
             if hist_step_idx == emit_step_idx:
                 delayed_emit_meta = hist_meta
                 break
-        delayed_emit_tracks: Optional[np.ndarray] = None
-        for hist_step_idx, hist_tracks in reversed(self._emit_track_buffer):
-            if hist_step_idx == emit_step_idx:
-                delayed_emit_tracks = hist_tracks
-                break
-
         delayed_meta_by_global: Dict[int, Dict[str, Any]] = {
             int(meta["global_idx"]): meta for meta in delayed_emit_meta
         }
@@ -1930,35 +1956,7 @@ class RealtimePipeline:
                 if is_onset_packet
                 else self._enrolled_min_activity
             )
-            mix_gate_threshold = (
-                self._enrolled_onset_gate_threshold
-                if is_onset_packet
-                else self._enrolled_mix_gate_threshold
-            )
-            mix_gate_collar_sec = (
-                self._enrolled_onset_gate_collar_sec
-                if is_onset_packet
-                else self._enrolled_mix_gate_collar_sec
-            )
             separated_gate_track = global_track
-            mix_gate_track = global_track
-            if (
-                global_idx in delayed_meta_by_global
-                and delayed_emit_tracks is not None
-                and delayed_emit_tracks.ndim == 2
-                and global_idx < delayed_emit_tracks.shape[1]
-            ):
-                mix_gate_track = delayed_emit_tracks[:, global_idx]
-            elif (
-                delayed_emit_tracks is not None
-                and delayed_emit_tracks.ndim == 2
-                and global_idx < delayed_emit_tracks.shape[1]
-            ):
-                # Current-step enrolled fallback exists to rescue onsets that
-                # were not assigned yet in the delayed packet. Keep the smoother
-                # aggregated track for that case; otherwise the raw delayed track
-                # would zero the very packet we are trying to rescue.
-                mix_gate_track = global_track
 
             audio = delayed_audio[:, global_idx].astype(np.float32, copy=False)
             # Verification gate: suppress enrolled audio when identity is weak
@@ -1969,48 +1967,18 @@ class RealtimePipeline:
                 if activity < activity_floor:
                     emit_enrolled_activity_rejects += 1
                     continue
-            apply_separated_gate = self._separated_leakage_removal and not (
-                is_enrolled and self._enrolled_live_mix
-            )
-            # If the user explicitly wants separated model output for enrolled
-            # speakers, avoid a second hard activity gate on top of the
-            # separator. Packet-level assignment/identity gating is already in
-            # place above, and the extra binary sample gate is the main source
-            # of clipped first syllables and abrupt packet starts.
-            if is_enrolled and (not self._enrolled_live_mix):
-                apply_separated_gate = False
+            apply_separated_gate = self._separated_leakage_removal and not is_enrolled
             if apply_separated_gate:
                 separated_gate_threshold = self._separated_gate_threshold
                 separated_gate_collar_sec = self._separated_leakage_collar_sec
-                if is_enrolled and is_onset_packet:
-                    separated_gate_threshold = min(
-                        separated_gate_threshold,
-                        self._enrolled_onset_gate_threshold,
-                    )
-                    separated_gate_collar_sec = max(
-                        separated_gate_collar_sec,
-                        self._enrolled_onset_gate_collar_sec,
-                    )
                 audio = self._apply_step_track_gate(
                     audio,
                     separated_gate_track,
                     separated_gate_collar_sec,
                     separated_gate_threshold,
                 )
-            if is_enrolled and self._enrolled_live_mix:
-                audio = self._apply_step_track_gate(
-                    delayed_mix_audio,
-                    mix_gate_track,
-                    mix_gate_collar_sec,
-                    mix_gate_threshold,
-                )
             if is_enrolled and self._df_output_enrolled:
                 audio = self._enhance_enrolled_audio(audio, global_idx)
-            if is_enrolled and (not self._enrolled_live_mix) and is_onset_packet:
-                audio = self._apply_packet_fade_in(
-                    audio,
-                    self._enrolled_onset_fade_sec,
-                )
             audio = np.clip(audio, -1.0, 1.0)
             packet_rms = float(
                 np.sqrt(np.mean(audio.astype(np.float64) ** 2))
@@ -2145,12 +2113,12 @@ class RealtimePipeline:
     def reset(self) -> None:
         """Reset pipeline state for a new session."""
         self._step_idx = 0
-        self._audio_buffer.clear()
-        self._mix_buffer.clear()
+        self._latent_buffer.clear()
+        self._latent_valid_buffer.clear()
         self._emit_meta_buffer.clear()
-        self._emit_track_buffer.clear()
         self._pred_seg_buffer.clear()
         self._emit_pred_buffer.clear()
+        self._last_emitted_step_by_global.clear()
         self._df_output_states.clear()
         # Re-create clustering with same params, re-inject enrolled centroids
         clust_cfg = self.cfg["clustering"]

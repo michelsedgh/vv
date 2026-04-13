@@ -1,8 +1,9 @@
 audio:
-  output_latency_sec: 1.5
-  enrolled_mix_gate_threshold: 0.02
-  enrolled_mix_gate_collar_sec: 0.18
+  output_latency_sec: 2.0
+  enrolled_min_similarity: 0.2
   enrolled_min_activity: 0.05
 clustering:
   tau_active: 0.24
-  enrolled_continuity_max_gap: 1
+  delta_enrolled: 0.8
+  enrolled_continuity_margin: 0.2
+  enrolled_continuity_max_gap: 2
