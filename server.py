@@ -9,7 +9,7 @@ FastAPI backend that:
   - Broadcasts per-speaker audio + metadata over WebSocket
   - Handles speaker enrollment (record → extract WeSpeaker embedding → save)
 
-Playback continuity (crossfade, holdover, tau_active tuning) is implemented
+Playback continuity (crossfade, continuity rescue, tau_active tuning) is implemented
 inside ``RealtimePipeline.step()`` — this server only feeds fixed-size chunks
 and forwards ``StepResult`` frames; see ``pipeline.py`` module docstring.
 
@@ -32,9 +32,11 @@ import asyncio
 from copy import deepcopy
 import json
 import logging
+import re
 import struct
 import threading
 import time
+import shutil
 import uuid
 from datetime import datetime
 from pathlib import Path
@@ -51,6 +53,13 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse
 from pydantic import BaseModel, Field
 
+from embedding_runtime import EMBEDDING_MODEL_OPTIONS
+from enrollment_store import (
+    embedding_cache_path,
+    rebuild_enrollment_cache,
+    rebuild_speaker_embedding_cache,
+    reference_paths,
+)
 from pipeline import RealtimePipeline
 
 # ─── Globals ──────────────────────────────────────────────────────
@@ -97,6 +106,60 @@ def load_config() -> dict:
     base = load_base_config()
     overrides = load_override_config()
     return _deep_merge(base, overrides)
+
+
+def _sanitize_slug(value: str, default: str = "clip") -> str:
+    slug = re.sub(r"[^a-zA-Z0-9]+", "_", value.strip()).strip("_").lower()
+    return slug or default
+
+
+def _timestamp_suffix_removed(stem: str) -> str:
+    return re.sub(r"_(\d{8}_\d{6})$", "", stem)
+
+
+def _clip_label_from_name(path: Path, prefix: str = "") -> str:
+    stem = path.stem
+    if prefix and stem.startswith(prefix):
+        stem = stem[len(prefix):]
+        if stem.startswith("_"):
+            stem = stem[1:]
+    stem = _timestamp_suffix_removed(stem)
+    return stem or "base"
+
+
+def _clip_duration_sec(path: Path) -> float:
+    try:
+        info = sf.info(str(path))
+        if not info.samplerate:
+            return 0.0
+        return float(info.frames) / float(info.samplerate)
+    except Exception:
+        return 0.0
+
+
+def _serialize_clip(path: Path, prefix: str = "") -> dict:
+    stat = path.stat()
+    return {
+        "name": path.name,
+        "label": _clip_label_from_name(path, prefix),
+        "size": stat.st_size,
+        "duration_sec": round(_clip_duration_sec(path), 3),
+        "modified_at": datetime.fromtimestamp(stat.st_mtime).isoformat(timespec="seconds"),
+    }
+
+
+def _speaker_reference_path(
+    speaker_dir: Path,
+    reference_label: Optional[str],
+) -> Path:
+    label = (reference_label or "").strip()
+    if label:
+        return speaker_dir / f"reference_{_sanitize_slug(label)}.wav"
+    existing = reference_paths(speaker_dir)
+    if not existing:
+        return speaker_dir / "reference.wav"
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    return speaker_dir / f"reference_{timestamp}.wav"
 
 
 def _config_get(cfg: dict, path: str) -> Any:
@@ -206,6 +269,46 @@ CONFIG_EDITOR_FIELDS: List[dict] = [
         step=0.01,
     ),
     _field(
+        "audio.enrolled_onset_gate_threshold",
+        "Onset Gate Threshold",
+        "Audio",
+        "More permissive gate threshold used only when an enrolled speaker is recognized one step later than the delayed packet being emitted. Lower values help recover clipped first syllables.",
+        "number",
+        min=0.0,
+        max=1.0,
+        step=0.01,
+    ),
+    _field(
+        "audio.enrolled_onset_gate_collar_sec",
+        "Onset Gate Collar",
+        "Audio",
+        "Extra collar used only for late-recognized enrolled onsets. Increase this to recover more of the first word at the cost of more room bleed right before speech starts.",
+        "number",
+        min=0.0,
+        max=1.0,
+        step=0.01,
+    ),
+    _field(
+        "audio.enrolled_onset_min_activity",
+        "Onset Min Activity",
+        "Audio",
+        "Reduced activity floor used only for late-recognized enrolled onsets. Lower values help the first part of a word come through when the speaker map stabilizes one step late.",
+        "number",
+        min=0.0,
+        max=1.0,
+        step=0.01,
+    ),
+    _field(
+        "audio.enrolled_onset_fade_sec",
+        "Onset Fade",
+        "Audio",
+        "Short fade-in applied only to newly emitted enrolled separated packets. This softens abrupt starts when using model output instead of live mix.",
+        "number",
+        min=0.0,
+        max=0.25,
+        step=0.005,
+    ),
+    _field(
         "audio.separated_leakage_removal",
         "Separated Leakage Removal",
         "Audio",
@@ -271,6 +374,18 @@ CONFIG_EDITOR_FIELDS: List[dict] = [
         min=0.5,
         max=5.0,
         step=0.1,
+    ),
+    _field(
+        "embedding.model",
+        "Embedding Model",
+        "Embedding",
+        "Speaker embedding backend used for enrollment rebuilds and live ID. WeSpeaker is the correct overlap-aware live path. TitaNet remains experimental here because its native API is full-utterance embedding, not diart-style weighted pooling.",
+        "select",
+        options=list(EMBEDDING_MODEL_OPTIONS),
+        option_labels={
+            "pyannote/wespeaker-voxceleb-resnet34-LM": "WeSpeaker (recommended)",
+            "nvidia/speakerverification_en_titanet_large": "TitaNet (experimental)",
+        },
     ),
     _field(
         "embedding.source_seg_threshold",
@@ -714,15 +829,8 @@ def get_enrollment_dir(cfg: dict) -> Path:
 
 
 def load_enrolled_embeddings(cfg: dict) -> Dict[str, np.ndarray]:
-    """Load all enrolled speaker embeddings from disk."""
-    enroll_dir = get_enrollment_dir(cfg)
-    enrolled = {}
-    if enroll_dir.exists():
-        for speaker_dir in sorted(enroll_dir.iterdir()):
-            emb_path = speaker_dir / "embedding.npy"
-            if speaker_dir.is_dir() and emb_path.exists():
-                enrolled[speaker_dir.name] = np.load(emb_path)
-    return enrolled
+    """Rebuild and load enrolled speaker embeddings from reference audio."""
+    return rebuild_enrollment_cache(get_enrollment_dir(cfg), cfg)
 
 
 def list_speakers(cfg: dict) -> List[dict]:
@@ -731,14 +839,23 @@ def list_speakers(cfg: dict) -> List[dict]:
     speakers = []
     if enroll_dir.exists():
         for speaker_dir in sorted(enroll_dir.iterdir()):
-            if speaker_dir.is_dir():
-                has_emb = (speaker_dir / "embedding.npy").exists()
-                has_wav = (speaker_dir / "reference.wav").exists()
-                speakers.append({
-                    "name": speaker_dir.name,
-                    "has_embedding": has_emb,
-                    "has_audio": has_wav,
-                })
+            if not speaker_dir.is_dir():
+                continue
+            refs = reference_paths(speaker_dir)
+            if not refs:
+                continue
+            references = [_serialize_clip(path, prefix="reference") for path in refs]
+            speakers.append({
+                "name": speaker_dir.name,
+                "has_embedding": embedding_cache_path(speaker_dir).exists(),
+                "has_audio": True,
+                "reference_count": len(refs),
+                "total_reference_sec": round(
+                    sum(item["duration_sec"] for item in references),
+                    3,
+                ),
+                "references": references,
+            })
     return speakers
 
 
@@ -1005,8 +1122,13 @@ def _run_diarization_monitor():
 _enroll_state: Dict[str, dict] = {}
 
 
-def _do_enrollment(name: str, duration_sec: int, cfg: dict):
-    """Record mic audio and extract WeSpeaker embedding for enrollment."""
+def _do_enrollment(
+    name: str,
+    duration_sec: int,
+    reference_label: Optional[str],
+    cfg: dict,
+):
+    """Record mic audio and rebuild the speaker cache from reference audio."""
     enroll_id = str(uuid.uuid4())[:8]
     _enroll_state[name] = {"status": "recording", "id": enroll_id}
 
@@ -1014,9 +1136,11 @@ def _do_enrollment(name: str, duration_sec: int, cfg: dict):
     device_index = cfg["audio"]["device_index"]
     speaker_dir = get_enrollment_dir(cfg) / name
     speaker_dir.mkdir(parents=True, exist_ok=True)
+    wav_path = _speaker_reference_path(speaker_dir, reference_label)
+    label_suffix = f" [{reference_label.strip()}]" if (reference_label or "").strip() else ""
 
     ws_event("enrollment", name=name, status="recording",
-             message=f"Recording {duration_sec}s...")
+             message=f"Recording {duration_sec}s for '{name}'{label_suffix}...")
 
     try:
         # Record
@@ -1032,42 +1156,19 @@ def _do_enrollment(name: str, duration_sec: int, cfg: dict):
         audio = audio.flatten()
 
         # Save reference wav
-        wav_path = speaker_dir / "reference.wav"
         sf.write(str(wav_path), audio, sample_rate)
         log.info("Saved reference audio: %s", wav_path)
 
         ws_event("enrollment", name=name, status="extracting",
-                 message="Extracting embedding...")
+                 message=f"Rebuilding enrollment cache for {name}...")
 
-        # Extract embedding using the same pyannote model as the live pipeline
-        from pyannote.audio import Model as PyanModel
-        device = torch.device(cfg["device"])
-        emb_model = PyanModel.from_pretrained(cfg["embedding"]["model"]).to(device)
-        emb_model.eval()
-
-        # Peak-normalize + extract (same logic as pipeline.extract_embedding)
-        peak = np.max(np.abs(audio))
-        if peak > 1e-6:
-            audio_norm = audio / peak
-        else:
-            audio_norm = audio
-        waveform = torch.from_numpy(audio_norm).float().unsqueeze(0).unsqueeze(0).to(device)
-        with torch.no_grad():
-            embedding = emb_model(waveform)  # (1, emb_dim)
-
-        embedding = embedding.squeeze(0).cpu().numpy().astype(np.float64)
-        norm = np.linalg.norm(embedding)
-        if norm > 0:
-            embedding = embedding / norm
-
-        # Save
-        emb_path = speaker_dir / "embedding.npy"
-        np.save(emb_path, embedding)
-        log.info("Saved embedding: %s (dim=%d)", emb_path, len(embedding))
+        embedding = rebuild_speaker_embedding_cache(speaker_dir, cfg)
+        if embedding is None:
+            raise RuntimeError("No usable reference audio found after enrollment")
 
         _enroll_state[name] = {"status": "done", "id": enroll_id}
         ws_event("enrollment", name=name, status="done",
-                 message=f"Enrolled '{name}' successfully.")
+                 message=f"Saved {wav_path.name} for '{name}'.")
 
     except Exception as e:
         log.error("Enrollment failed for '%s': %s", name, e, exc_info=True)
@@ -1089,11 +1190,18 @@ class ConfigUpdateRequest(BaseModel):
 class EnrollRequest(BaseModel):
     name: str
     duration: int = 30
+    reference_label: str | None = None
 
 
 class DiagRecordRequest(BaseModel):
     label: str
     duration: int = 5
+
+
+class PromoteDiagRequest(BaseModel):
+    speaker_name: str
+    clip_name: str
+    reference_label: str | None = None
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -1145,9 +1253,34 @@ async def api_delete_speaker(name: str):
     speaker_dir = get_enrollment_dir(cfg) / name
     if not speaker_dir.exists():
         raise HTTPException(404, f"Speaker '{name}' not found")
-    import shutil
     shutil.rmtree(speaker_dir)
     return {"status": "deleted", "name": name}
+
+
+@app.delete("/api/speakers/{name}/references/{filename}")
+async def api_delete_reference(name: str, filename: str):
+    if monitor.running:
+        raise HTTPException(400, "Stop the monitor before editing references")
+    cfg = load_config()
+    speaker_dir = get_enrollment_dir(cfg) / name
+    ref_path = speaker_dir / filename
+    if not speaker_dir.exists() or not ref_path.exists():
+        raise HTTPException(404, f"Reference '{filename}' for '{name}' not found")
+    if ref_path.suffix.lower() != ".wav" or not ref_path.name.startswith("reference"):
+        raise HTTPException(404, f"Reference '{filename}' for '{name}' not found")
+    ref_path.unlink()
+    rebuilt = rebuild_speaker_embedding_cache(speaker_dir, cfg)
+    if rebuilt is None:
+        cache_path = embedding_cache_path(speaker_dir)
+        if cache_path.exists():
+            cache_path.unlink()
+        if speaker_dir.exists() and not any(speaker_dir.iterdir()):
+            speaker_dir.rmdir()
+    return {
+        "status": "deleted",
+        "speaker_name": name,
+        "reference_name": filename,
+    }
 
 
 @app.post("/api/diag/record")
@@ -1194,10 +1327,49 @@ async def api_diag_clips():
     diag_dir = BASE_DIR / "diagnostic_clips"
     if not diag_dir.exists():
         return []
-    clips = []
-    for f in sorted(diag_dir.glob("*.wav")):
-        clips.append({"name": f.name, "size": f.stat().st_size})
-    return clips
+    return [_serialize_clip(path) for path in sorted(diag_dir.glob("*.wav"))]
+
+
+@app.delete("/api/diag/clips/{name}")
+async def api_delete_diag_clip(name: str):
+    if monitor.running:
+        raise HTTPException(400, "Stop the monitor before editing diagnostic clips")
+    diag_dir = BASE_DIR / "diagnostic_clips"
+    path = diag_dir / name
+    if not path.exists():
+        raise HTTPException(404, f"Diagnostic clip '{name}' not found")
+    path.unlink()
+    return {"status": "deleted", "name": name}
+
+
+@app.post("/api/diag/promote")
+async def api_diag_promote(req: PromoteDiagRequest):
+    if monitor.running:
+        raise HTTPException(400, "Stop the monitor before editing references")
+    speaker_name = req.speaker_name.strip()
+    if not speaker_name:
+        raise HTTPException(400, "Speaker name is required")
+
+    diag_dir = BASE_DIR / "diagnostic_clips"
+    source_path = diag_dir / req.clip_name
+    if not source_path.exists():
+        raise HTTPException(404, f"Diagnostic clip '{req.clip_name}' not found")
+
+    cfg = load_config()
+    speaker_dir = get_enrollment_dir(cfg) / speaker_name
+    speaker_dir.mkdir(parents=True, exist_ok=True)
+    effective_label = (req.reference_label or "").strip() or _clip_label_from_name(source_path)
+    target_path = _speaker_reference_path(speaker_dir, effective_label)
+    shutil.copy2(source_path, target_path)
+    rebuilt = rebuild_speaker_embedding_cache(speaker_dir, cfg)
+    if rebuilt is None:
+        raise HTTPException(500, "Failed to rebuild speaker cache from references")
+    return {
+        "status": "promoted",
+        "speaker_name": speaker_name,
+        "reference_name": target_path.name,
+        "source_clip": req.clip_name,
+    }
 
 
 @app.post("/api/enroll")
@@ -1207,11 +1379,16 @@ async def api_enroll(req: EnrollRequest):
     cfg = load_config()
     thread = threading.Thread(
         target=_do_enrollment,
-        args=(req.name, req.duration, cfg),
+        args=(req.name, req.duration, req.reference_label, cfg),
         daemon=True,
     )
     thread.start()
-    return {"status": "enrolling", "name": req.name, "duration": req.duration}
+    return {
+        "status": "enrolling",
+        "name": req.name,
+        "duration": req.duration,
+        "reference_label": req.reference_label,
+    }
 
 
 @app.get("/api/enroll/status/{name}")

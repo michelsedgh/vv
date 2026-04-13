@@ -97,6 +97,8 @@ class EnrolledSpeakerClustering(OnlineSpeakerClustering):
         # strict match, not keep refreshing itself from previous rescues.
         self._last_enrolled_assignment_step: Dict[int, int] = {}
         self._direct_enrolled_matches: set[int] = set()
+        # Diagnostic: min enrolled distance per anchor per step (populated by identify)
+        self._last_enrolled_distances: Dict[int, Dict[str, float]] = {}
 
     # ─── Enrollment ──────────────────────────────────────────────
 
@@ -173,14 +175,11 @@ class EnrolledSpeakerClustering(OnlineSpeakerClustering):
         anchor = self._anchors[anchor_idx].reshape(1, -1)
         anchor_dist = float(cdist(emb, anchor, metric=self.metric)[0, 0])
         profile = self._profiles.get(anchor_idx)
-        # Profile rows can refine a clearly-close anchor, but they must not
-        # rescue a match the frozen anchor itself already rejects.
-        if (
-            profile is None
-            or profile.size == 0
-            or anchor_dist > self.delta_enrolled
-        ):
+        if profile is None or profile.size == 0:
             return anchor_dist
+        # Profile rows match independently of the anchor. With multi-position
+        # enrollment (close + far), the anchor might be from a very different
+        # acoustic condition. Any profile row close enough should qualify.
         profile_dist = float(cdist(emb, profile, metric=self.metric).min())
         return min(anchor_dist, profile_dist)
 
@@ -222,11 +221,27 @@ class EnrolledSpeakerClustering(OnlineSpeakerClustering):
         taken_enrolled: set[int] = set()
         taken_local: set[int] = set()
         candidates = []
+        diag_distances: Dict[int, Dict[str, float]] = {}
         for anchor_idx in sorted(self._anchors):
+            local_dists = []
             for local_spk in active_speakers:
                 dist = self.enrolled_distance(anchor_idx, embeddings[int(local_spk)])
+                local_dists.append((float(dist), int(local_spk)))
                 if dist <= self.delta_enrolled:
                     candidates.append((float(dist), int(local_spk), int(anchor_idx)))
+            if local_dists:
+                best_dist, best_local = min(local_dists, key=lambda x: x[0])
+                diag_distances[anchor_idx] = {
+                    "min_dist": round(best_dist, 4),
+                    "best_local": best_local,
+                    "matched": best_dist <= self.delta_enrolled,
+                    "n_active": len(local_dists),
+                }
+            else:
+                diag_distances[anchor_idx] = {
+                    "min_dist": -1.0, "best_local": -1, "matched": False, "n_active": 0
+                }
+        self._last_enrolled_distances = diag_distances
         for dist, local_spk, anchor_idx in sorted(candidates, key=lambda x: x[0]):
             if local_spk in taken_local or anchor_idx in taken_enrolled:
                 continue
@@ -288,11 +303,11 @@ class EnrolledSpeakerClustering(OnlineSpeakerClustering):
                     ),
                 )
                 min_dist = self.enrolled_distance(closest, embeddings[local_spk])
-                if min_dist <= max(
-                    self.leakage_delta,
-                    self.delta_enrolled,
-                    enrolled_assignment_dist.get(closest, 0.0) + 0.10,
-                ):
+                # Use leakage_delta only — this should NOT be inflated by
+                # delta_enrolled. The leakage threshold detects when PixIT
+                # splits one speaker across multiple locals (very close
+                # embeddings), not when a somewhat-similar speaker appears.
+                if min_dist <= self.leakage_delta:
                     enrolled_leakage.add(local_spk)
 
         # 3. Plain vanilla matching for the rest.
@@ -339,15 +354,7 @@ class EnrolledSpeakerClustering(OnlineSpeakerClustering):
                     ),
                 )
                 min_dist = self.enrolled_distance(min_anchor, embeddings[spk])
-                if (
-                    min_anchor in taken_enrolled
-                    and min_dist
-                    <= max(
-                        self.leakage_delta,
-                        self.delta_enrolled,
-                        enrolled_assignment_dist.get(min_anchor, 0.0) + 0.10,
-                    )
-                ):
+                if min_anchor in taken_enrolled and min_dist <= self.leakage_delta:
                     continue
 
             assigned_globals = {

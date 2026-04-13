@@ -213,11 +213,12 @@
               </div>
             </div>
             <div class="inline-form">
-              <input id="enroll-name" type="text" placeholder="Speaker name">
-              <input id="enroll-duration" type="number" min="3" max="30" value="30">
-              <button class="btn btn-secondary btn-small" id="btn-enroll">Record</button>
+              <input class="input-grow" id="enroll-name" type="text" placeholder="Speaker name">
+              <input class="input-medium" id="enroll-reference-label" type="text" placeholder="Reference label / position">
+              <input class="input-short" id="enroll-duration" type="number" min="3" max="30" value="30">
+              <button class="btn btn-secondary btn-small" id="btn-enroll">Record Ref</button>
             </div>
-            <p class="helper-line" id="enroll-status">Ready.</p>
+            <p class="helper-line" id="enroll-status">Record one clip per real listening spot: close, desk, couch, kitchen, far corner.</p>
             <div class="list-stack" id="enrolled-list"></div>
           </section>
 
@@ -229,9 +230,13 @@
               </div>
             </div>
             <div class="inline-form">
-              <input id="diag-label" type="text" placeholder="Clip label">
-              <input id="diag-duration" type="number" min="2" max="15" value="5">
+              <input class="input-grow" id="diag-label" type="text" placeholder="Clip label">
+              <input class="input-short" id="diag-duration" type="number" min="2" max="15" value="5">
               <button class="btn btn-secondary btn-small" id="btn-diag">Record</button>
+            </div>
+            <div class="inline-form inline-form-secondary">
+              <input class="input-grow" id="diag-target-speaker" type="text" placeholder="Speaker for Add buttons">
+              <input class="input-medium" id="diag-reference-label" type="text" placeholder="Optional reference label override">
             </div>
             <p class="helper-line" id="diag-status">Stop Voice before recording.</p>
             <div class="list-stack compact" id="diag-clips"></div>

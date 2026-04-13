@@ -1,2 +1,8 @@
-denoiser:
-  enhance_enrolled_output: true
+audio:
+  output_latency_sec: 1.5
+  enrolled_mix_gate_threshold: 0.02
+  enrolled_mix_gate_collar_sec: 0.18
+  enrolled_min_activity: 0.05
+clustering:
+  tau_active: 0.24
+  enrolled_continuity_max_gap: 1

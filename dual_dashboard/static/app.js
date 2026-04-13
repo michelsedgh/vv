@@ -121,6 +121,34 @@ function fmtPct(value) {
   return `${Number(value).toFixed(0)}%`;
 }
 
+function fmtSeconds(value) {
+  if (value == null || Number.isNaN(value)) return "-";
+  const sec = Number(value);
+  if (sec >= 10) return `${sec.toFixed(0)}s`;
+  return `${sec.toFixed(1)}s`;
+}
+
+function fmtBytes(value) {
+  if (value == null || Number.isNaN(value)) return "-";
+  const bytes = Number(value);
+  if (bytes >= 1024 * 1024) {
+    return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+  }
+  return `${Math.max(1, Math.round(bytes / 1024))} KB`;
+}
+
+function fmtStamp(value) {
+  if (!value) return "";
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return "";
+  return date.toLocaleString([], {
+    month: "short",
+    day: "numeric",
+    hour: "numeric",
+    minute: "2-digit",
+  });
+}
+
 function normalizeSource(value) {
   if (value === "voice") return "voice";
   if (value === "poguise" || value === "pog") return "poguise";
@@ -329,7 +357,7 @@ function renderEditor(editor) {
       for (const optionValue of field.options || []) {
         const option = document.createElement("option");
         option.value = optionValue;
-        option.textContent = optionValue;
+        option.textContent = field.option_labels?.[optionValue] || optionValue;
         if (String(optionValue) === String(currentValue)) option.selected = true;
         input.appendChild(option);
       }
@@ -1032,17 +1060,47 @@ function renderSpeakers(list) {
     return;
   }
   for (const sp of list) {
-    const row = document.createElement("div");
-    row.className = "list-item";
-    row.innerHTML = `
+    const card = document.createElement("section");
+    card.className = "speaker-library-card";
+
+    const head = document.createElement("div");
+    head.className = "speaker-library-head";
+    head.innerHTML = `
       <div>
-        <strong>${sp.name}</strong>
-        <div class="subtle">${sp.has_embedding ? "embedding ready" : "missing embedding"}</div>
+        <strong>${escapeHtml(sp.name)}</strong>
+        <div class="subtle">
+          ${sp.reference_count || 0} refs • ${fmtSeconds(sp.total_reference_sec || 0)} • ${sp.has_embedding ? "embedding ready" : "missing embedding"}
+        </div>
       </div>
-      <button class="btn btn-ghost btn-small">Delete</button>
+      <button class="btn btn-ghost btn-small" type="button">Delete Speaker</button>
     `;
-    row.querySelector("button").addEventListener("click", () => deleteSpeaker(sp.name));
-    root.appendChild(row);
+    head.querySelector("button").addEventListener("click", () => deleteSpeaker(sp.name));
+    card.appendChild(head);
+
+    const clips = document.createElement("div");
+    clips.className = "clip-list";
+    const refs = sp.references || [];
+    if (!refs.length) {
+      clips.innerHTML = '<div class="list-item empty">No reference clips yet.</div>';
+    } else {
+      for (const ref of refs) {
+        const row = document.createElement("div");
+        row.className = "clip-row";
+        row.innerHTML = `
+          <div class="clip-info">
+            <div class="clip-title">${escapeHtml(ref.label || ref.name)}</div>
+            <div class="clip-meta">${escapeHtml(ref.name)} • ${fmtSeconds(ref.duration_sec)} • ${fmtBytes(ref.size)}${fmtStamp(ref.modified_at) ? ` • ${escapeHtml(fmtStamp(ref.modified_at))}` : ""}</div>
+          </div>
+          <div class="clip-actions">
+            <button class="btn btn-ghost btn-small" type="button">Delete</button>
+          </div>
+        `;
+        row.querySelector("button").addEventListener("click", () => deleteReference(sp.name, ref.name));
+        clips.appendChild(row);
+      }
+    }
+    card.appendChild(clips);
+    root.appendChild(card);
   }
 }
 
@@ -1055,13 +1113,20 @@ function renderDiagClips(list) {
   }
   for (const clip of list) {
     const row = document.createElement("div");
-    row.className = "list-item";
+    row.className = "clip-row";
     row.innerHTML = `
-      <div>
-        <strong>${clip.name}</strong>
-        <div class="subtle">${Math.round(clip.size / 1024)} KB</div>
+      <div class="clip-info">
+        <div class="clip-title">${escapeHtml(clip.label || clip.name)}</div>
+        <div class="clip-meta">${escapeHtml(clip.name)} • ${fmtSeconds(clip.duration_sec)} • ${fmtBytes(clip.size)}${fmtStamp(clip.modified_at) ? ` • ${escapeHtml(fmtStamp(clip.modified_at))}` : ""}</div>
+      </div>
+      <div class="clip-actions">
+        <button class="btn btn-secondary btn-small" type="button">Add As Ref</button>
+        <button class="btn btn-ghost btn-small" type="button">Delete</button>
       </div>
     `;
+    const [promoteBtn, deleteBtn] = row.querySelectorAll("button");
+    promoteBtn.addEventListener("click", () => addDiagClipAsReference(clip));
+    deleteBtn.addEventListener("click", () => deleteDiagClip(clip.name));
     root.appendChild(row);
   }
 }
@@ -1259,6 +1324,7 @@ async function stopAll() {
 
 async function enrollSpeaker() {
   const name = $("enroll-name").value.trim();
+  const referenceLabel = $("enroll-reference-label").value.trim();
   const duration = parseInt($("enroll-duration").value, 10);
   if (!name) {
     logEvent("voice", "Enter a speaker name first.", { isError: true });
@@ -1269,7 +1335,7 @@ async function enrollSpeaker() {
   await fetchJson("/api/voice/enroll", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ name, duration }),
+    body: JSON.stringify({ name, duration, reference_label: referenceLabel || null }),
   });
 }
 
@@ -1294,6 +1360,50 @@ async function deleteSpeaker(name) {
   await fetchJson(`/api/voice/speakers/${encodeURIComponent(name)}`, { method: "DELETE" });
   logEvent("voice", `Deleted speaker ${name}`);
   refreshSpeakers();
+}
+
+async function deleteReference(speakerName, filename) {
+  if (!confirm(`Delete reference "${filename}" from "${speakerName}"?`)) return;
+  await fetchJson(
+    `/api/voice/speakers/${encodeURIComponent(speakerName)}/references/${encodeURIComponent(filename)}`,
+    { method: "DELETE" },
+  );
+  logEvent("voice", `Deleted ${filename} from ${speakerName}`);
+  refreshSpeakers();
+}
+
+async function deleteDiagClip(filename) {
+  if (!confirm(`Delete diagnostic clip "${filename}"?`)) return;
+  await fetchJson(`/api/voice/diag/clips/${encodeURIComponent(filename)}`, { method: "DELETE" });
+  logEvent("voice", `Deleted diagnostic clip ${filename}`);
+  refreshDiagClips();
+}
+
+async function addDiagClipAsReference(clip) {
+  const fallbackSpeaker = $("diag-target-speaker").value.trim() || $("enroll-name").value.trim();
+  if (!fallbackSpeaker) {
+    logEvent("voice", "Enter a speaker in the diagnostic target field first.", { isError: true });
+    return;
+  }
+  const referenceLabel = $("diag-reference-label").value.trim() || clip.label || "";
+  await fetchJson("/api/voice/diag/promote", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      speaker_name: fallbackSpeaker,
+      clip_name: clip.name,
+      reference_label: referenceLabel || null,
+    }),
+  });
+  logEvent(
+    "voice",
+    `Added ${clip.name} to ${fallbackSpeaker}${referenceLabel ? ` as ${referenceLabel}` : ""}`,
+  );
+  $("diag-target-speaker").value = fallbackSpeaker;
+  if (!($("diag-reference-label").value || "").trim()) {
+    $("diag-reference-label").value = referenceLabel;
+  }
+  await refreshSpeakers();
 }
 
 async function toggleHeatmap() {

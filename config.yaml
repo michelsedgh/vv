@@ -57,6 +57,12 @@ audio:
   enrolled_live_mix: false
   enrolled_mix_gate_threshold: 0.05
   enrolled_mix_gate_collar_sec: 0.10
+  # Onset fallback only applies when an enrolled speaker is recognized one
+  # step later than the delayed packet being emitted. Keep it slightly more
+  # permissive than the steady-state live-mix gate to avoid clipped first
+  # syllables without opening the lane all the time.
+  enrolled_onset_gate_threshold: 0.01
+  enrolled_onset_gate_collar_sec: 0.30
   # Approximate pyannote SpeechSeparation leakage-removal on emitted separated
   # packets: zero audio when the aligned speaker track is inactive. This does
   # not denoise speech while the speaker is active; it just removes clearly
@@ -66,6 +72,12 @@ audio:
   # Too-high values here can punch holes into syllables on separated playback.
   separated_gate_threshold: 0.01
   separated_leakage_collar_sec: 0.10
+  # Verification gates: enrolled audio is only emitted when both identity
+  # similarity and activity exceed these thresholds. This prevents false-
+  # positive enrolled audio when clustering makes a marginal distance match.
+  enrolled_min_similarity: 0.25
+  enrolled_min_activity: 0.10
+  enrolled_onset_min_activity: 0.02
 
 device: cuda               # torch device
 
@@ -92,6 +104,9 @@ pixit:
   aggregation_latency_sec: 2.0
 
 embedding:
+  # Supported live backends in this repo:
+  #   pyannote/wespeaker-voxceleb-resnet34-LM
+  #   nvidia/speakerverification_en_titanet_large
   model: pyannote/wespeaker-voxceleb-resnet34-LM
   # Identity uses diart's official mixed-waveform + segmentation-weight path
   # for both enrollment rebuilds and live matching. The recent window keeps
@@ -118,7 +133,7 @@ clustering:
   tau_active: 0.28        # practical range ~0.22–0.30
   rho_update: 0.3         # usually keep at 0.3
   delta_new: 0.62         # practical range ~0.60–0.68
-  delta_enrolled: 0.70    # practical range ~0.68–0.72
+  delta_enrolled: 0.75    # practical range ~0.70–0.80
   max_speakers: 8         # session-level global speaker budget
   leakage_delta: 0.55     # practical range ~0.50–0.58
   # Continuity rescue is disabled. With max_gap: 0 these are effectively no-op.

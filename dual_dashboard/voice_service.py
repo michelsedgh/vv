@@ -5,12 +5,13 @@ import ctypes
 import gc
 import json
 import queue
+import re
 import shutil
 import threading
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Optional, Set
+from typing import Any, Dict, List, Optional, Set
 
 import numpy as np
 import sounddevice as sd
@@ -18,6 +19,11 @@ import soundfile as sf
 import torch
 from fastapi import WebSocket, WebSocketDisconnect
 
+from enrollment_store import (
+    embedding_cache_path,
+    rebuild_speaker_embedding_cache,
+    reference_paths,
+)
 import server as voice_source
 from pipeline import RealtimePipeline
 
@@ -145,10 +151,89 @@ class VoiceService:
             "last_capture_dir": self.monitor.last_capture_dir,
         }
 
+    def _sanitize_slug(self, value: str, default: str = "clip") -> str:
+        slug = re.sub(r"[^a-zA-Z0-9]+", "_", value.strip()).strip("_").lower()
+        return slug or default
+
+    def _timestamp_suffix_removed(self, stem: str) -> str:
+        return re.sub(r"_(\d{8}_\d{6})$", "", stem)
+
+    def _clip_label_from_name(self, path: Path, prefix: str = "") -> str:
+        stem = path.stem
+        if prefix and stem.startswith(prefix):
+            stem = stem[len(prefix):]
+            if stem.startswith("_"):
+                stem = stem[1:]
+        stem = self._timestamp_suffix_removed(stem)
+        return stem or "base"
+
+    def _clip_duration_sec(self, path: Path) -> float:
+        try:
+            info = sf.info(str(path))
+            if not info.samplerate:
+                return 0.0
+            return float(info.frames) / float(info.samplerate)
+        except Exception:
+            return 0.0
+
+    def _serialize_clip(self, path: Path, prefix: str = "") -> dict:
+        stat = path.stat()
+        return {
+            "name": path.name,
+            "label": self._clip_label_from_name(path, prefix),
+            "size": stat.st_size,
+            "duration_sec": round(self._clip_duration_sec(path), 3),
+            "modified_at": datetime.fromtimestamp(stat.st_mtime).isoformat(timespec="seconds"),
+        }
+
+    def _speaker_reference_path(
+        self,
+        speaker_dir: Path,
+        reference_label: Optional[str],
+    ) -> Path:
+        label = (reference_label or "").strip()
+        if label:
+            return speaker_dir / f"reference_{self._sanitize_slug(label)}.wav"
+        existing = sorted(speaker_dir.glob("reference*.wav"))
+        if not existing:
+            return speaker_dir / "reference.wav"
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        return speaker_dir / f"reference_{timestamp}.wav"
+
     def list_speakers(self) -> list[dict]:
-        return voice_source.list_speakers(voice_source.load_config())
+        cfg = voice_source.load_config()
+        enroll_dir = voice_source.get_enrollment_dir(cfg)
+        speakers: List[dict] = []
+        if not enroll_dir.exists():
+            return speakers
+
+        for speaker_dir in sorted(enroll_dir.iterdir()):
+            if not speaker_dir.is_dir():
+                continue
+            ref_files = reference_paths(speaker_dir)
+            if not ref_files:
+                continue
+            references = [
+                self._serialize_clip(path, prefix="reference")
+                for path in ref_files
+            ]
+            has_emb = embedding_cache_path(speaker_dir).exists()
+            speakers.append({
+                "name": speaker_dir.name,
+                "has_embedding": has_emb,
+                "has_audio": bool(references),
+                "reference_count": len(references),
+                "total_reference_sec": round(
+                    sum(item["duration_sec"] for item in references),
+                    3,
+                ),
+                "references": references,
+            })
+        return speakers
 
     def delete_speaker(self, name: str) -> dict:
+        if self.monitor.running:
+            raise ValueError("Stop Voice before deleting speakers")
         cfg = voice_source.load_config()
         speaker_dir = voice_source.get_enrollment_dir(cfg) / name
         if not speaker_dir.exists():
@@ -156,14 +241,83 @@ class VoiceService:
         shutil.rmtree(speaker_dir)
         return {"status": "deleted", "name": name}
 
+    def delete_reference(self, speaker_name: str, filename: str) -> dict:
+        if self.monitor.running:
+            raise ValueError("Stop Voice before editing references")
+        cfg = voice_source.load_config()
+        speaker_dir = voice_source.get_enrollment_dir(cfg) / speaker_name
+        ref_path = speaker_dir / filename
+        if not speaker_dir.exists() or not ref_path.exists():
+            raise FileNotFoundError(f"Reference '{filename}' for '{speaker_name}' not found")
+        if ref_path.suffix.lower() != ".wav" or not ref_path.name.startswith("reference"):
+            raise FileNotFoundError(f"Reference '{filename}' for '{speaker_name}' not found")
+        ref_path.unlink()
+        rebuilt = rebuild_speaker_embedding_cache(speaker_dir, cfg)
+        if rebuilt is None:
+            cache_path = embedding_cache_path(speaker_dir)
+            if cache_path.exists():
+                cache_path.unlink()
+            if not any(speaker_dir.iterdir()):
+                speaker_dir.rmdir()
+        return {
+            "status": "deleted",
+            "speaker_name": speaker_name,
+            "reference_name": filename,
+        }
+
     def diag_clips(self) -> list[dict]:
         diag_dir = voice_source.BASE_DIR / "diagnostic_clips"
         if not diag_dir.exists():
             return []
         return [
-            {"name": path.name, "size": path.stat().st_size}
+            self._serialize_clip(path)
             for path in sorted(diag_dir.glob("*.wav"))
         ]
+
+    def delete_diag_clip(self, name: str) -> dict:
+        if self.monitor.running:
+            raise ValueError("Stop Voice before editing diagnostic clips")
+        diag_dir = voice_source.BASE_DIR / "diagnostic_clips"
+        path = diag_dir / name
+        if not path.exists():
+            raise FileNotFoundError(name)
+        path.unlink()
+        return {"status": "deleted", "name": name}
+
+    def promote_diag_clip(
+        self,
+        speaker_name: str,
+        clip_name: str,
+        reference_label: Optional[str] = None,
+    ) -> dict:
+        if self.monitor.running:
+            raise ValueError("Stop Voice before editing references")
+        speaker_name = speaker_name.strip()
+        if not speaker_name:
+            raise ValueError("Speaker name is required")
+
+        diag_dir = voice_source.BASE_DIR / "diagnostic_clips"
+        source_path = diag_dir / clip_name
+        if not source_path.exists():
+            raise FileNotFoundError(f"Diagnostic clip '{clip_name}' not found")
+
+        cfg = voice_source.load_config()
+        speaker_dir = voice_source.get_enrollment_dir(cfg) / speaker_name
+        speaker_dir.mkdir(parents=True, exist_ok=True)
+
+        effective_label = (reference_label or "").strip() or self._clip_label_from_name(source_path)
+        target_path = self._speaker_reference_path(speaker_dir, effective_label)
+        shutil.copy2(source_path, target_path)
+
+        rebuilt = rebuild_speaker_embedding_cache(speaker_dir, cfg)
+        if rebuilt is None:
+            raise RuntimeError("Failed to rebuild speaker cache from references")
+        return {
+            "status": "promoted",
+            "speaker_name": speaker_name,
+            "reference_name": target_path.name,
+            "source_clip": clip_name,
+        }
 
     def record_diag(self, label: str, duration: int) -> dict:
         cfg = voice_source.load_config()
@@ -209,22 +363,38 @@ class VoiceService:
         threading.Thread(target=_record, daemon=True).start()
         return {"status": "recording", "label": safe_label, "duration": duration}
 
-    def enroll(self, name: str, duration: int) -> dict:
+    def enroll(
+        self,
+        name: str,
+        duration: int,
+        reference_label: Optional[str] = None,
+    ) -> dict:
         if self.monitor.running:
             raise ValueError("Stop Voice before enrolling")
         cfg = voice_source.load_config()
         thread = threading.Thread(
             target=self._do_enrollment,
-            args=(name, duration, cfg),
+            args=(name, duration, reference_label, cfg),
             daemon=True,
         )
         thread.start()
-        return {"status": "enrolling", "name": name, "duration": duration}
+        return {
+            "status": "enrolling",
+            "name": name,
+            "duration": duration,
+            "reference_label": reference_label,
+        }
 
     def enroll_status(self, name: str) -> dict:
         return self._enroll_state.get(name, {"status": "unknown"})
 
-    def _do_enrollment(self, name: str, duration_sec: int, cfg: dict) -> None:
+    def _do_enrollment(
+        self,
+        name: str,
+        duration_sec: int,
+        reference_label: Optional[str],
+        cfg: dict,
+    ) -> None:
         enroll_id = str(voice_source.uuid.uuid4())[:8]
         self._enroll_state[name] = {"status": "recording", "id": enroll_id}
 
@@ -232,12 +402,14 @@ class VoiceService:
         device_index = cfg["audio"]["device_index"]
         speaker_dir = voice_source.get_enrollment_dir(cfg) / name
         speaker_dir.mkdir(parents=True, exist_ok=True)
+        wav_path = self._speaker_reference_path(speaker_dir, reference_label)
+        label_suffix = f" [{reference_label.strip()}]" if (reference_label or "").strip() else ""
 
         self.ws_event(
             "enrollment",
             name=name,
             status="recording",
-            message=f"Recording {duration_sec}s...",
+            message=f"Recording {duration_sec}s for '{name}'{label_suffix}...",
         )
 
         try:
@@ -251,47 +423,25 @@ class VoiceService:
             sd.wait()
             audio = audio.flatten()
 
-            wav_path = speaker_dir / "reference.wav"
             sf.write(str(wav_path), audio, sample_rate)
 
             self.ws_event(
                 "enrollment",
                 name=name,
                 status="extracting",
-                message="Extracting embedding...",
+                message=f"Rebuilding enrollment cache for {name}...",
             )
 
-            from pyannote.audio import Model as PyanModel
-
-            device = torch.device(cfg["device"])
-            emb_model = PyanModel.from_pretrained(cfg["embedding"]["model"]).to(device)
-            emb_model.eval()
-
-            peak = np.max(np.abs(audio))
-            audio_norm = audio / peak if peak > 1e-6 else audio
-            waveform = (
-                torch.from_numpy(audio_norm)
-                .float()
-                .unsqueeze(0)
-                .unsqueeze(0)
-                .to(device)
-            )
-            with torch.no_grad():
-                embedding = emb_model(waveform)
-
-            embedding = embedding.squeeze(0).cpu().numpy().astype(np.float64)
-            norm = np.linalg.norm(embedding)
-            if norm > 0:
-                embedding = embedding / norm
-
-            np.save(speaker_dir / "embedding.npy", embedding)
+            rebuilt = rebuild_speaker_embedding_cache(speaker_dir, cfg)
+            if rebuilt is None:
+                raise RuntimeError("Failed to rebuild speaker cache from references")
 
             self._enroll_state[name] = {"status": "done", "id": enroll_id}
             self.ws_event(
                 "enrollment",
                 name=name,
                 status="done",
-                message=f"Enrolled '{name}' successfully.",
+                message=f"Saved {wav_path.name} for '{name}'.",
             )
         except Exception as exc:
             self._enroll_state[name] = {

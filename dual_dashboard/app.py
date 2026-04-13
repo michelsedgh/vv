@@ -50,11 +50,18 @@ class ConfigUpdateRequest(BaseModel):
 class EnrollRequest(BaseModel):
     name: str
     duration: int = 30
+    reference_label: str | None = None
 
 
 class DiagRecordRequest(BaseModel):
     label: str
     duration: int = 5
+
+
+class PromoteDiagRequest(BaseModel):
+    speaker_name: str
+    clip_name: str
+    reference_label: str | None = None
 
 
 def _raise_bad_request(exc: Exception):
@@ -168,6 +175,14 @@ async def api_voice_delete_speaker(name: str):
         raise HTTPException(404, f"Speaker '{name}' not found")
 
 
+@app.delete("/api/voice/speakers/{name}/references/{filename}")
+async def api_voice_delete_reference(name: str, filename: str):
+    try:
+        return voice_service.delete_reference(name, filename)
+    except FileNotFoundError as exc:
+        raise HTTPException(404, str(exc))
+
+
 @app.get("/api/voice/config/editor")
 async def api_voice_editor():
     return voice_service.config_payload()
@@ -192,7 +207,7 @@ async def api_voice_reset_config():
 @app.post("/api/voice/enroll")
 async def api_voice_enroll(req: EnrollRequest):
     try:
-        return voice_service.enroll(req.name, req.duration)
+        return voice_service.enroll(req.name, req.duration, req.reference_label)
     except Exception as exc:
         _raise_bad_request(exc)
 
@@ -210,6 +225,26 @@ async def api_voice_diag_record(req: DiagRecordRequest):
 @app.get("/api/voice/diag/clips")
 async def api_voice_diag_clips():
     return voice_service.diag_clips()
+
+
+@app.post("/api/voice/diag/promote")
+async def api_voice_diag_promote(req: PromoteDiagRequest):
+    try:
+        return voice_service.promote_diag_clip(
+            req.speaker_name,
+            req.clip_name,
+            req.reference_label,
+        )
+    except Exception as exc:
+        _raise_bad_request(exc)
+
+
+@app.delete("/api/voice/diag/clips/{name}")
+async def api_voice_delete_diag(name: str):
+    try:
+        return voice_service.delete_diag_clip(name)
+    except FileNotFoundError:
+        raise HTTPException(404, f"Diagnostic clip '{name}' not found")
 
 
 @app.websocket("/ws/live")
