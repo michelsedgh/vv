@@ -70,6 +70,31 @@ audio:
   # Fresh recovered onsets can use a slightly lower activity floor than steady
   # state, but the audio itself still comes from pure latent reconstruction.
   enrolled_onset_min_activity: 0.02
+  # Tail-RMS gate: suppresses enrolled emission when the PixIT-separated source
+  # RMS at the emitted step is below this floor. Unlike the PixIT activity score
+  # (which lags ~4 steps after speech stops due to the 5s context window), the
+  # separated-source RMS drops the moment the user stops speaking. Set to 0.0
+  # to disable. Typical active-speech RMS: 0.06-0.20; tail RMS: 0.03-0.05.
+  # Raise toward 0.05 to trim tail more aggressively; stop before it punches
+  # holes in quiet speech (watch for dropouts during soft-spoken phrases).
+  enrolled_tail_rms_gate: 0.0
+
+  # Raw-mic step gate: suppresses enrolled emission when the raw microphone
+  # RMS for the emitted step's 500 ms window is below this floor. Unlike the
+  # PixIT activity score or the PixIT-separated-source RMS (both of which
+  # retain ~0.10-0.15 ambient noise energy in the enrolled channel regardless
+  # of whether the user is speaking), the raw mic drops immediately to room-
+  # noise level the moment the user stops talking. This cleanly cuts the
+  # PixIT 5s-window tail (typically 4-9 extra steps) without needing a high
+  # threshold that would risk punching holes in quiet speech.
+  # Set to 0.0 to disable. Typical far-field speech RMS (3-4 m): 0.020-0.035;
+  # room-noise floor: 0.007-0.010. A value of 0.012 cuts cleanly between them.
+  enrolled_mic_gate: 0.0
+  # Holdover after mic gate: number of steps to keep the gate open after the
+  # last speech-detected step. 1 = 500 ms grace period at word endings, which
+  # prevents the final syllable from being clipped when the mic RMS drops just
+  # below the threshold at the trailing edge of a phrase. 0 = hard gate.
+  enrolled_mic_gate_holdover_steps: 1
 
 device: cuda               # torch device
 

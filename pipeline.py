@@ -497,6 +497,15 @@ class RealtimePipeline:
                 min(self._enrolled_min_activity, 0.02),
             )
         )
+        self._enrolled_tail_rms_gate = float(
+            acfg.get("enrolled_tail_rms_gate", 0.0)
+        )
+        self._enrolled_mic_gate = float(
+            acfg.get("enrolled_mic_gate", 0.0)
+        )
+        self._enrolled_mic_gate_holdover = max(
+            0, int(acfg.get("enrolled_mic_gate_holdover_steps", 1))
+        )
         log.info(
             "Separated-audio output latency: %.3fs (%d step%s)",
             self._output_latency_sec,
@@ -530,6 +539,7 @@ class RealtimePipeline:
         self._pixit_dtype = torch.float16
         self._adaptive_profile_streaks: Dict[int, int] = {}
         self._adaptive_profile_last_add_step: Dict[int, int] = {}
+        self._mic_step_rms_buffer: Dict[int, float] = {}
         if self._step_perf_log and self._step_perf_path is not None:
             log.info(
                 "Step perf trace enabled: %s (every_step=%s, spike>=%.1f ms)",
@@ -1652,6 +1662,19 @@ class RealtimePipeline:
             f"Expected {self.chunk_samples} samples, got {waveform.shape[0]}"
         )
 
+        # Raw-mic step RMS: the last step_samples of waveform is the newest
+        # 500 ms of mic audio, which is exactly what will be emitted one step
+        # later (output_latency_steps=2 → emitting step_idx-1 whose newest
+        # 500 ms corresponds to waveform[-step_samples:] stored at step_idx-1).
+        # Store keyed by current step_idx so we can look it up at emit time.
+        _mic_step_rms = float(
+            np.sqrt(np.mean(waveform[-self.step_samples:].astype(np.float64) ** 2))
+        )
+        self._mic_step_rms_buffer[self._step_idx] = _mic_step_rms
+        _mic_prune_before = self._step_idx - self._output_latency_steps - 4
+        for _k in [k for k in self._mic_step_rms_buffer if k < _mic_prune_before]:
+            del self._mic_step_rms_buffer[_k]
+
         # ── 1. PixIT: direct GPU call (bypass SpeakerSegmentation formatter) ──
         wav_gpu = torch.from_numpy(waveform).to(
             device=self.device, dtype=torch.float16     # permanent fp16 model
@@ -1900,6 +1923,7 @@ class RealtimePipeline:
                     "activity": float(activity),
                     "is_enrolled": bool(is_enrolled),
                     "identity_similarity": id_sim,
+                    "tail_rms": float(step_tail_rms_np[local_idx]),
                 }
             )
 
@@ -1959,6 +1983,26 @@ class RealtimePipeline:
             separated_gate_track = global_track
 
             audio = delayed_audio[:, global_idx].astype(np.float32, copy=False)
+            # Raw-mic gate: if the microphone was silent at the emitted step
+            # the enrolled speaker cannot have been talking. This cuts the
+            # PixIT-window tail without relying on PixIT source energy, which
+            # stays elevated (~0.10-0.15) at the ambient noise floor even after
+            # speech ends and therefore cannot discriminate silence reliably.
+            if is_enrolled and self._enrolled_mic_gate > 0.0:
+                emit_mic_rms = self._mic_step_rms_buffer.get(emit_step_idx, 1.0)
+                if emit_mic_rms < self._enrolled_mic_gate:
+                    # Backward holdover: if speech was detected within the last
+                    # holdover_steps steps, pass this step too. This prevents
+                    # the last syllable of a phrase from being clipped when the
+                    # mic RMS drops just below threshold at the trailing edge.
+                    hold_ok = any(
+                        self._mic_step_rms_buffer.get(emit_step_idx - j, 0.0)
+                        >= self._enrolled_mic_gate
+                        for j in range(1, self._enrolled_mic_gate_holdover + 1)
+                    )
+                    if not hold_ok:
+                        emit_enrolled_activity_rejects += 1
+                        continue
             # Verification gate: suppress enrolled audio when identity is weak
             if is_enrolled and id_sim is not None:
                 if id_sim < self._enrolled_min_similarity:
@@ -1967,6 +2011,15 @@ class RealtimePipeline:
                 if activity < activity_floor:
                     emit_enrolled_activity_rejects += 1
                     continue
+                # Tail-RMS gate: the separated-source RMS for the emitted step
+                # drops immediately when speech ends, while PixIT activity lags
+                # ~4 steps due to the 5s context window. Gate suppresses emission
+                # when the source was quiet at the emitted step.
+                if self._enrolled_tail_rms_gate > 0.0:
+                    tail_rms = float(meta.get("tail_rms", 1.0)) if meta is not None else 1.0
+                    if tail_rms < self._enrolled_tail_rms_gate:
+                        emit_enrolled_activity_rejects += 1
+                        continue
             apply_separated_gate = self._separated_leakage_removal and not is_enrolled
             if apply_separated_gate:
                 separated_gate_threshold = self._separated_gate_threshold
@@ -2120,6 +2173,7 @@ class RealtimePipeline:
         self._emit_pred_buffer.clear()
         self._last_emitted_step_by_global.clear()
         self._df_output_states.clear()
+        self._mic_step_rms_buffer.clear()
         # Re-create clustering with same params, re-inject enrolled centroids
         clust_cfg = self.cfg["clustering"]
         old_anchors = {
