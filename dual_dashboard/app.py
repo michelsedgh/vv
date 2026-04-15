@@ -111,6 +111,7 @@ def _brain_snapshot(count: int = 36) -> Dict[str, Any]:
         "world": decision_system.get_world_state(),
         "rules": decision_system.get_rules(),
         "traces": decision_system.get_traces(count),
+        "queue": decision_system.get_queue_state(),
         "events": event_bus.recent_events(count=count),
         "actions": decision_system.get_action_log(),
         "fire_history": decision_system.get_fire_history(),
@@ -132,6 +133,7 @@ async def on_startup() -> None:
     poguise_service.set_loop(loop)
 
     async def publish_bus_event(event: Event) -> None:
+        await decision_system.note_event_enqueued(event)
         await brain_stream.publish({
             "type": "bus_event",
             "event": event.to_dict(),
@@ -569,6 +571,7 @@ async def brain_clear():
     """Clear event history and traces."""
     event_bus.clear_history()
     decision_system._traces.clear()
+    decision_system._queue_items.clear()
     await brain_stream.publish({"type": "bootstrap", **_brain_snapshot()})
     return {"ok": True}
 

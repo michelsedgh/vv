@@ -93,6 +93,7 @@ const state = {
   status: null,
   world: null,
   rules: [],
+  queue: { pending_count: 0, active_count: 0, queue_depth: 0, items: [] },
   traces: [],
   traceMap: new Map(),
   events: [],
@@ -140,6 +141,41 @@ function clamp(value, min, max) {
 
 function deepClone(value) {
   return JSON.parse(JSON.stringify(value));
+}
+
+function queueEntry(eventId) {
+  if (!eventId) return null;
+  return (state.queue?.items || []).find((item) => item.event_id === eventId) || null;
+}
+
+function selectedQueueEntry() {
+  return queueEntry(state.selectedTraceId)
+    || (state.queue?.items || []).find((item) => item.status === "processing")
+    || state.queue?.items?.[0]
+    || null;
+}
+
+function elapsedSeconds(timestamp) {
+  if (!timestamp) return "-";
+  return `${Math.max(0, (Date.now() / 1000) - Number(timestamp)).toFixed(1)}s`;
+}
+
+function stageLabel(stageId) {
+  if (!stageId) return "Waiting";
+  if (stageId === "queued") return "Queued";
+  return STAGE_META[stageId]?.title || String(stageId).replaceAll("_", " ");
+}
+
+function llmPhaseLabel(phase) {
+  return String(phase || "idle").replaceAll("_", " ");
+}
+
+function queueItemStuck(item) {
+  if (!item || item.status !== "processing") return false;
+  const stageStarted = item.stage_started_ts || item.started_ts;
+  if (!stageStarted) return false;
+  const seconds = (Date.now() / 1000) - Number(stageStarted);
+  return seconds > (item.current_stage === "llm_reasoner" ? 8 : 5);
 }
 
 function fmtMs(value) {
@@ -290,6 +326,7 @@ function applySnapshot(payload) {
   state.status = payload.status || state.status;
   state.world = payload.world || state.world;
   state.rules = payload.rules || state.rules;
+  state.queue = payload.queue || state.queue;
   state.actions = payload.actions || state.actions;
   state.pending = payload.pending || state.pending;
   state.fireHistory = payload.fire_history || state.fireHistory;
@@ -325,6 +362,26 @@ function upsertEvent(event) {
   state.events = Array.from(state.eventMap.values())
     .sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0))
     .slice(0, 120);
+}
+
+function makePendingTrace(event) {
+  return {
+    event,
+    start_time: event?.timestamp || Date.now() / 1000,
+    total_ms: 0,
+    layers: [
+      {
+        layer: "event_bus",
+        status: "received",
+        details: `Event: ${event?.type || "unknown"}`,
+        data: event || {},
+        timestamp: event?.timestamp || Date.now() / 1000,
+        elapsed_ms: 0,
+      },
+    ],
+    final_decision: "pending",
+    provisional: true,
+  };
 }
 
 function metricChip(label, value) {
@@ -792,6 +849,8 @@ function buildReasonerStage(trace) {
   const llmLayers = allLayers(trace, "llm_reasoner");
   const llmLast = llmLayers[llmLayers.length - 1] || null;
   const llmStatus = state.status?.llm || {};
+  const liveQueue = queueEntry(trace.event.event_id);
+  const liveLlm = liveQueue?.llm || {};
   const event = trace.event;
   if (event.type !== "speech_text") {
     const option = makeOption(
@@ -812,6 +871,39 @@ function buildReasonerStage(trace) {
       tone: STAGE_META.llm_reasoner.tone,
       status: "bypassed",
       summary: "This trace skipped the LLM.",
+      primaryOptionId: option.id,
+      options: [option],
+    };
+  }
+  if (liveLlm.active || liveLlm.stream_text || liveLlm.latest_output) {
+    const liveText = liveLlm.stream_text || liveLlm.latest_output || "";
+    const latency = liveLlm.active ? ((Date.now() / 1000) - Number(liveLlm.phase_started_ts || Date.now() / 1000)) * 1000 : liveLlm.latency_ms;
+    const option = makeOption(
+      `llm-live:${liveLlm.phase || "stream"}`,
+      liveLlm.active ? `Streaming · ${llmPhaseLabel(liveLlm.phase)}` : llmPhaseLabel(liveLlm.phase || "complete"),
+      liveText ? truncate(liveText, 220) : "Waiting for the LLM to emit output.",
+      {
+        selected: true,
+        meta: [llmStatus.model || "model unknown", fmtMs(latency)],
+        chips: [
+          { label: liveLlm.active ? "streaming" : (liveLlm.status || "complete"), tone: liveLlm.active ? "blue" : "gold" },
+          ...(liveLlm.phase ? [{ label: llmPhaseLabel(liveLlm.phase), tone: "gold" }] : []),
+        ],
+        details: [
+          { label: "Transcript", value: trace.event.data?.text || "(empty)" },
+          { label: "Phase", value: llmPhaseLabel(liveLlm.phase) },
+          { label: "Elapsed", value: fmtMs(latency) },
+          { label: "Chunks", value: fmtCount(liveLlm.chunks || 0) },
+          { label: "Live Output", value: liveText || "(no tokens yet)" },
+        ],
+        raw: { event, llm_live: liveLlm, llm_layer: llmLast, llm_status: llmStatus },
+      },
+    );
+    return {
+      id: "llm_reasoner",
+      tone: STAGE_META.llm_reasoner.tone,
+      status: liveLlm.active ? "streaming" : (liveLlm.status || llmLast?.status || "complete"),
+      summary: liveLlm.active ? `Streaming ${llmPhaseLabel(liveLlm.phase)}.` : "Latest LLM output is available.",
       primaryOptionId: option.id,
       options: [option],
     };
@@ -1059,11 +1151,13 @@ function renderStatusStrip() {
   const world = status.world_state || state.world || {};
   const llm = status.llm || {};
   const rules = status.rules || {};
+  const queue = state.queue || {};
   byId("status-strip").innerHTML = `
     <span class="status-chip" data-state="${statusTone(status.running)}">Brain <strong>${status.running ? "Live" : "Idle"}</strong></span>
     <span class="status-chip" data-state="${statusTone(world.voice_running)}">Voice <strong>${world.voice_running ? "On" : "Off"}</strong></span>
     <span class="status-chip" data-state="${statusTone(world.vision_running)}">Vision <strong>${world.vision_running ? "On" : "Off"}</strong></span>
     <span class="status-chip" data-state="${statusTone(!!llm.available, !llm.available)}">LLM <strong>${llm.available ? "Ready" : "Offline"}</strong></span>
+    <span class="status-chip" data-state="${queue.pending_count ? "warn" : "idle"}">Queue <strong>${fmtCount(queue.pending_count || 0)} waiting</strong></span>
     <span class="status-chip" data-state="${statusTone(state.streamConnected, !state.streamConnected)}">Stream <strong>${state.streamConnected ? "Linked" : "Retrying"}</strong></span>
     <span class="status-chip" data-state="${(rules.pending_confirmations || 0) ? "warn" : "idle"}">Pending <strong>${fmtCount(rules.pending_confirmations || 0)}</strong></span>
   `;
@@ -1184,6 +1278,110 @@ function renderQuickActions() {
     });
     root.appendChild(button);
   }
+}
+
+function renderQueuePanel() {
+  const root = byId("queue-list");
+  const meta = byId("queue-meta");
+  const queue = state.queue || {};
+  const items = queue.items || [];
+  meta.textContent = `${fmtCount(queue.active_count || 0)} active • ${fmtCount(queue.pending_count || 0)} queued • depth ${fmtCount(queue.queue_depth || 0)}`;
+  if (!items.length) {
+    root.innerHTML = '<div class="empty-state">No queued or running events right now.</div>';
+    return;
+  }
+  root.innerHTML = "";
+  for (const item of items.slice(0, 14)) {
+    const selected = item.event_id === state.selectedTraceId;
+    const stuck = queueItemStuck(item);
+    const card = document.createElement("article");
+    card.className = `queue-item${selected ? " is-selected" : ""}${item.status === "processing" ? " is-active" : ""}${stuck ? " is-stuck" : ""}`;
+    const llm = item.llm || {};
+    const stageTime = item.status === "queued" ? elapsedSeconds(item.queued_ts) : elapsedSeconds(item.stage_started_ts || item.started_ts);
+    const statusTone = stuck ? "red" : (item.status === "processing" ? "blue" : item.status === "queued" ? "gold" : "gold");
+    card.innerHTML = `
+      <div class="queue-head">
+        <div class="queue-copy">
+          <strong>${escapeHtml(eventTitle(item.event))}</strong>
+          <p>${escapeHtml(item.details || previewData(item.event?.data))}</p>
+        </div>
+        <span class="queue-pill" data-tone="${escapeHtml(statusTone)}">${escapeHtml(statusLabel(item.status))}</span>
+      </div>
+      <div class="queue-row">
+        <span>Stage <strong>${escapeHtml(stageLabel(item.current_stage))}</strong></span>
+        <span>Stage Time <strong>${escapeHtml(stageTime)}</strong></span>
+        ${item.started_ts ? `<span>Total <strong>${escapeHtml(elapsedSeconds(item.started_ts))}</strong></span>` : ""}
+      </div>
+      <div class="queue-pill-row">
+        <span class="queue-pill" data-tone="gold">${escapeHtml(statusLabel(item.stage_status || item.status))}</span>
+        ${llm.phase ? `<span class="queue-pill" data-tone="blue">${escapeHtml(llmPhaseLabel(llm.phase))}</span>` : ""}
+        ${llm.phase_started_ts ? `<span class="queue-pill" data-tone="blue">${escapeHtml(fmtMs(llm.active ? ((Date.now() / 1000) - Number(llm.phase_started_ts)) * 1000 : llm.latency_ms))}</span>` : ""}
+        ${stuck ? '<span class="queue-pill" data-tone="red">watching for stall</span>' : ""}
+      </div>
+    `;
+    card.addEventListener("click", () => {
+      if (!state.traceMap.has(item.event_id)) upsertTrace(makePendingTrace(item.event));
+      state.selectedTraceId = item.event_id;
+      state.selectedStageId = item.current_stage && STAGE_ORDER.includes(item.current_stage) ? item.current_stage : "start";
+      state.selectedOptionId = null;
+      state.detailOpen = true;
+      rebuildStageModels();
+      renderAll();
+      if (item.current_stage && STAGE_ORDER.includes(item.current_stage)) showProgressThroughStage(item.current_stage);
+    });
+    root.appendChild(card);
+  }
+}
+
+function renderLlmLivePanel() {
+  const root = byId("llm-live");
+  const meta = byId("llm-live-meta");
+  const queueItem = selectedQueueEntry();
+  const llm = queueItem?.llm || null;
+  const trace = primaryTrace();
+  const llmLayers = allLayers(trace, "llm_reasoner");
+  const lastLlmLayer = llmLayers[llmLayers.length - 1] || null;
+
+  if (!llm && !lastLlmLayer) {
+    meta.textContent = "No active LLM work";
+    root.innerHTML = '<div class="empty-state">Speech traces will stream the LLM output here while they run.</div>';
+    return;
+  }
+
+  const liveText = llm?.stream_text || llm?.latest_output || lastLlmLayer?.data?._raw_response || JSON.stringify(lastLlmLayer?.data || {}, null, 2);
+  const liveLatency = llm?.phase_started_ts
+    ? (llm.active ? ((Date.now() / 1000) - Number(llm.phase_started_ts)) * 1000 : llm.latency_ms)
+    : (lastLlmLayer?.data?._latency_ms || state.status?.llm?.last_latency_ms);
+  meta.textContent = `${llmPhaseLabel(llm?.phase || lastLlmLayer?.status || "complete")} • ${fmtMs(liveLatency)}`;
+
+  const phases = llm?.history?.length
+    ? llm.history
+    : llmLayers.map((layer) => ({
+        phase: layer.status,
+        status: layer.status,
+        text: layer.data?._raw_response || JSON.stringify(layer.data || {}, null, 2),
+        latency_ms: layer.data?._latency_ms || null,
+        updated_ts: layer.timestamp || null,
+      }));
+
+  root.innerHTML = `
+    <article class="llm-live-card">
+      <strong>${escapeHtml(trace?.event ? eventTitle(trace.event) : eventTitle(queueItem?.event))}</strong>
+      <p>${escapeHtml(queueItem?.status === "processing" ? `Currently in ${stageLabel(queueItem?.current_stage)}.` : "Latest LLM output for the selected trace.")}</p>
+      <pre>${escapeHtml(liveText || "(no LLM tokens yet)")}</pre>
+      <div class="llm-phase-list">
+        ${phases.map((phase) => `
+          <div class="llm-phase">
+            <div class="llm-phase-head">
+              <strong>${escapeHtml(llmPhaseLabel(phase.phase || phase.status))}</strong>
+              <span>${escapeHtml(fmtMs(phase.latency_ms || (phase.started_ts ? ((Date.now() / 1000) - Number(phase.started_ts)) * 1000 : null)))}</span>
+            </div>
+            <p>${escapeHtml(truncate(phase.text || "(no output)", 220))}</p>
+          </div>
+        `).join("")}
+      </div>
+    </article>
+  `;
 }
 
 function renderRulesPanel() {
@@ -1431,6 +1629,8 @@ function renderAll() {
   renderHeroMetrics();
   renderStageCards();
   renderProgress();
+  renderQueuePanel();
+  renderLlmLivePanel();
   renderTraceHistory();
   renderRulesPanel();
   renderRuleLibraryManager();
@@ -1601,6 +1801,35 @@ function stageProgressPoints() {
     points.push(best);
   }
   return points;
+}
+
+function showPendingTracePreview() {
+  const total = pathLength();
+  if (!total) {
+    state.replay.progress = 0;
+    updateProgressVisuals();
+    return;
+  }
+  const breakpoints = stageProgressPoints();
+  const previewDistance = breakpoints[1] ?? total * 0.18;
+  state.replay.lastBurstIndex = -1;
+  state.replay.progress = clamp(previewDistance / total, 0, 1);
+  updateProgressVisuals();
+}
+
+function showProgressThroughStage(stageId) {
+  const total = pathLength();
+  if (!total) {
+    state.replay.progress = 0;
+    updateProgressVisuals();
+    return;
+  }
+  const index = Math.max(0, STAGE_ORDER.indexOf(stageId));
+  const breakpoints = stageProgressPoints();
+  const previewDistance = breakpoints[index] ?? total;
+  state.replay.lastBurstIndex = -1;
+  state.replay.progress = clamp(previewDistance / total, 0, 1);
+  updateProgressVisuals();
 }
 
 function burstAt(stageId) {
@@ -1915,7 +2144,42 @@ function connectStream() {
     }
     if (payload.type === "bus_event" && payload.event) {
       upsertEvent(payload.event);
-      renderWorldState();
+      if ((state.autoFollow || !state.selectedTraceId) && !state.traceMap.has(payload.event.event_id)) {
+        upsertTrace(makePendingTrace(payload.event));
+        state.selectedTraceId = payload.event.event_id;
+        state.selectedStageId = "start";
+        state.selectedOptionId = null;
+        rebuildStageModels();
+        renderAll();
+        showPendingTracePreview();
+      } else {
+        renderWorldState();
+      }
+      return;
+    }
+    if (payload.type === "queue") {
+      state.queue = payload.queue || state.queue;
+      rebuildStageModels();
+      renderStatusStrip();
+      renderQueuePanel();
+      renderLlmLivePanel();
+      return;
+    }
+    if (payload.type === "trace_progress" && payload.trace) {
+      upsertTrace(payload.trace);
+      state.queue = payload.queue || state.queue;
+      if (state.autoFollow || !state.selectedTraceId || state.selectedTraceId === payload.trace.event.event_id) {
+        state.selectedTraceId = payload.trace.event.event_id;
+        if (payload.progress?.current_stage && STAGE_ORDER.includes(payload.progress.current_stage)) {
+          state.selectedStageId = payload.progress.current_stage;
+        }
+        if (!state.detailOpen) state.selectedOptionId = null;
+      }
+      rebuildStageModels();
+      renderAll();
+      if (payload.progress?.current_stage && STAGE_ORDER.includes(payload.progress.current_stage)) {
+        showProgressThroughStage(payload.progress.current_stage);
+      }
       return;
     }
     if (payload.type === "trace" && payload.trace) {
@@ -1925,6 +2189,7 @@ function connectStream() {
       state.actions = payload.actions || state.actions;
       state.pending = payload.pending || state.pending;
       state.fireHistory = payload.fire_history || state.fireHistory;
+      state.queue = payload.queue || state.queue;
       if (state.autoFollow || !state.selectedTraceId) {
         state.selectedTraceId = payload.trace.event.event_id;
         state.selectedStageId = "start";
@@ -2013,6 +2278,10 @@ async function boot() {
   animateTrace(true);
   bootAnimation();
   window.addEventListener("resize", handleResize);
+  window.setInterval(() => {
+    renderQueuePanel();
+    renderLlmLivePanel();
+  }, 500);
   window.requestAnimationFrame(animateParticles);
 }
 

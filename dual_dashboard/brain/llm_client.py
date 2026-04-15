@@ -11,10 +11,11 @@ All prompts return structured JSON for reliable machine parsing.
 """
 from __future__ import annotations
 
+import inspect
 import json
 import logging
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Awaitable, Callable, Dict, List, Optional
 
 import httpx
 
@@ -183,7 +184,23 @@ class LLMClient:
             self._available = False
         return False
 
-    async def _chat(self, system: str, user: str) -> Optional[str]:
+    async def _emit_delta(
+        self,
+        callback: Optional[Callable[[str], Awaitable[None] | None]],
+        chunk: str,
+    ) -> None:
+        if not callback or not chunk:
+            return
+        result = callback(chunk)
+        if inspect.isawaitable(result):
+            await result
+
+    async def _chat(
+        self,
+        system: str,
+        user: str,
+        on_delta: Optional[Callable[[str], Awaitable[None] | None]] = None,
+    ) -> Optional[dict]:
         """Make a chat completion request to LM Studio."""
         t0 = time.time()
         self._call_count += 1
@@ -195,19 +212,55 @@ class LLMClient:
             ],
             "temperature": self.temperature,
             "max_tokens": self.max_tokens,
-            "stream": False,
+            "stream": bool(on_delta),
         }
         if self.model:
             payload["model"] = self.model
 
         try:
-            resp = await self._client.post(
-                f"{self.base_url}/v1/chat/completions",
-                json=payload,
-            )
-            resp.raise_for_status()
-            data = resp.json()
-            content = data["choices"][0]["message"]["content"].strip()
+            content = ""
+            if on_delta:
+                parts: List[str] = []
+                async with self._client.stream(
+                    "POST",
+                    f"{self.base_url}/v1/chat/completions",
+                    json=payload,
+                ) as resp:
+                    resp.raise_for_status()
+                    async for line in resp.aiter_lines():
+                        if not line:
+                            continue
+                        if line.startswith("data: "):
+                            raw = line[6:].strip()
+                            if raw == "[DONE]":
+                                break
+                            try:
+                                data = json.loads(raw)
+                            except json.JSONDecodeError:
+                                continue
+                            choice = (data.get("choices") or [{}])[0]
+                            delta = choice.get("delta") or {}
+                            piece = (
+                                delta.get("content")
+                                or delta.get("reasoning_content")
+                                or delta.get("text")
+                            )
+                            if piece:
+                                parts.append(piece)
+                                await self._emit_delta(on_delta, piece)
+                        else:
+                            # Fallback for non-streaming-compatible gateways.
+                            content = line.strip()
+                    if not content:
+                        content = "".join(parts).strip()
+            else:
+                resp = await self._client.post(
+                    f"{self.base_url}/v1/chat/completions",
+                    json=payload,
+                )
+                resp.raise_for_status()
+                data = resp.json()
+                content = data["choices"][0]["message"]["content"].strip()
 
             latency = time.time() - t0
             self._last_latency = latency
@@ -216,7 +269,10 @@ class LLMClient:
             self._available = True
 
             log.debug("LLM response (%.1fs): %s", latency, content[:200])
-            return content
+            return {
+                "text": content,
+                "latency_ms": round(latency * 1000, 1),
+            }
 
         except Exception as exc:
             latency = time.time() - t0
@@ -258,6 +314,7 @@ class LLMClient:
         text: str,
         speaker: str,
         context: str,
+        on_delta: Optional[Callable[[str], Awaitable[None] | None]] = None,
     ) -> Dict[str, Any]:
         """Classify user speech intent."""
         prompt = INTENT_CLASSIFICATION_PROMPT.format(
@@ -268,12 +325,22 @@ class LLMClient:
         response = await self._chat(
             "You are a precise intent classifier. Always respond with valid JSON only.",
             prompt,
+            on_delta=on_delta,
         )
-        result = self._parse_json(response)
+        raw_text = response["text"] if response else None
+        result = self._parse_json(raw_text)
         if result and "intent" in result:
+            result["_raw_response"] = raw_text or ""
+            result["_latency_ms"] = response["latency_ms"] if response else round(self._last_latency * 1000, 1)
             return result
         # Fallback
-        return {"intent": "conversation", "confidence": 0.5, "reasoning": "Failed to classify"}
+        return {
+            "intent": "conversation",
+            "confidence": 0.5,
+            "reasoning": "Failed to classify",
+            "_raw_response": raw_text or "",
+            "_latency_ms": response["latency_ms"] if response else round(self._last_latency * 1000, 1),
+        }
 
     async def parse_rule(
         self,
@@ -281,6 +348,7 @@ class LLMClient:
         speaker: str,
         world_state: str,
         existing_rules: str,
+        on_delta: Optional[Callable[[str], Awaitable[None] | None]] = None,
     ) -> Optional[dict]:
         """Parse user speech into a structured rule."""
         prompt = RULE_CREATION_PROMPT.format(
@@ -292,14 +360,21 @@ class LLMClient:
         response = await self._chat(
             "You are a smart home automation designer. Always respond with valid JSON only.",
             prompt,
+            on_delta=on_delta,
         )
-        return self._parse_json(response)
+        raw_text = response["text"] if response else None
+        result = self._parse_json(raw_text)
+        if result is not None:
+            result["_raw_response"] = raw_text or ""
+            result["_latency_ms"] = response["latency_ms"] if response else round(self._last_latency * 1000, 1)
+        return result
 
     async def parse_override(
         self,
         text: str,
         speaker: str,
         rules: str,
+        on_delta: Optional[Callable[[str], Awaitable[None] | None]] = None,
     ) -> Optional[dict]:
         """Parse a rule modification command."""
         prompt = OVERRIDE_PROMPT.format(
@@ -310,14 +385,21 @@ class LLMClient:
         response = await self._chat(
             "You are a smart home rule editor. Always respond with valid JSON only.",
             prompt,
+            on_delta=on_delta,
         )
-        return self._parse_json(response)
+        raw_text = response["text"] if response else None
+        result = self._parse_json(raw_text)
+        if result is not None:
+            result["_raw_response"] = raw_text or ""
+            result["_latency_ms"] = response["latency_ms"] if response else round(self._last_latency * 1000, 1)
+        return result
 
     async def should_fire(
         self,
         rule_description: str,
         event: dict,
         world_state: Dict[str, Any],
+        on_delta: Optional[Callable[[str], Awaitable[None] | None]] = None,
     ) -> Dict[str, Any]:
         """Ask LLM if a rule should fire given ambiguous context."""
         prompt = AMBIGUITY_PROMPT.format(
@@ -334,11 +416,21 @@ class LLMClient:
         response = await self._chat(
             "You are a smart home decision engine. Always respond with valid JSON only.",
             prompt,
+            on_delta=on_delta,
         )
-        result = self._parse_json(response)
+        raw_text = response["text"] if response else None
+        result = self._parse_json(raw_text)
         if result and "should_fire" in result:
+            result["_raw_response"] = raw_text or ""
+            result["_latency_ms"] = response["latency_ms"] if response else round(self._last_latency * 1000, 1)
             return result
-        return {"should_fire": False, "confidence": 0.0, "reasoning": "Failed to evaluate"}
+        return {
+            "should_fire": False,
+            "confidence": 0.0,
+            "reasoning": "Failed to evaluate",
+            "_raw_response": raw_text or "",
+            "_latency_ms": response["latency_ms"] if response else round(self._last_latency * 1000, 1),
+        }
 
     def stats(self) -> Dict[str, Any]:
         """Get LLM client stats for dashboard."""
