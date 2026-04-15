@@ -22,16 +22,22 @@ if __package__ in (None, ""):
     from dual_dashboard.policy import SharedInferencePolicy
     from dual_dashboard.poguise_service import PoguiseService
     from dual_dashboard.voice_service import VoiceService
+    from dual_dashboard.brain.event_bus import Event, EventBus
+    from dual_dashboard.brain.decision_loop import DecisionSystem
 else:
     from . import settings
     from .policy import SharedInferencePolicy
     from .poguise_service import PoguiseService
     from .voice_service import VoiceService
+    from .brain.event_bus import Event, EventBus
+    from .brain.decision_loop import DecisionSystem
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
+BRAIN_DIR = Path(__file__).resolve().parent / "brain_dashboard"
 
 app = FastAPI(title="Voice + PO-GUISE Dual Dashboard")
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
+app.mount("/brain-static", StaticFiles(directory=str(BRAIN_DIR)), name="brain-static")
 
 gpu_lock = threading.Lock()
 policy = SharedInferencePolicy(settings.load_section_config("scheduler"))
@@ -40,6 +46,14 @@ poguise_service = PoguiseService(
     gpu_lock,
     policy,
     voice_running_getter=lambda: voice_service.monitor.running,
+)
+
+# ── Brain Decision System ──────────────────────────────────────
+event_bus = EventBus()
+decision_system = DecisionSystem(
+    bus=event_bus,
+    rules_path=str(Path(__file__).resolve().parent / "rules.yaml"),
+    lm_studio_url="http://192.168.1.198:1234",
 )
 
 
@@ -71,10 +85,12 @@ def _raise_bad_request(exc: Exception):
 @app.on_event("startup")
 async def on_startup() -> None:
     voice_service.set_loop(asyncio.get_running_loop())
+    await decision_system.start()
 
 
 @app.on_event("shutdown")
 async def on_shutdown() -> None:
+    await decision_system.stop()
     poguise_service.shutdown(timeout=20.0)
     voice_service.shutdown(timeout=20.0)
 
@@ -348,6 +364,94 @@ async def api_scheduler_reset():
 @app.get("/healthz")
 async def healthz():
     return JSONResponse({"ok": True})
+
+
+# ── Brain API ──────────────────────────────────────────────────
+
+@app.get("/brain/dashboard")
+async def brain_dashboard():
+    """Serve the Brain Dashboard UI."""
+    return FileResponse(BRAIN_DIR / "index.html")
+
+
+@app.get("/api/brain/status")
+async def brain_status():
+    """Get full brain decision system status."""
+    return decision_system.get_system_status()
+
+
+@app.get("/api/brain/traces")
+async def brain_traces(count: int = 30):
+    """Get recent decision traces."""
+    return decision_system.get_traces(count)
+
+
+@app.get("/api/brain/rules")
+async def brain_rules():
+    """Get all rules."""
+    return decision_system.get_rules()
+
+
+@app.post("/api/brain/rules/{rule_id}/toggle")
+async def brain_toggle_rule(rule_id: str):
+    """Toggle a rule's active state."""
+    result = decision_system.rules.toggle_rule(rule_id)
+    if result is None:
+        raise HTTPException(404, f"Rule {rule_id} not found")
+    return result
+
+
+@app.get("/api/brain/actions")
+async def brain_actions():
+    """Get executor action log."""
+    return decision_system.get_action_log()
+
+
+class InjectEventRequest(BaseModel):
+    type: str
+    data: Dict[str, Any] = Field(default_factory=dict)
+
+
+@app.post("/api/brain/inject")
+async def brain_inject(req: InjectEventRequest):
+    """Inject a test event into the decision system."""
+    result = await decision_system.inject_event(req.type, req.data)
+    return result
+
+
+@app.post("/api/brain/clear")
+async def brain_clear():
+    """Clear event history and traces."""
+    event_bus.clear_history()
+    decision_system._traces.clear()
+    return {"ok": True}
+
+
+@app.get("/api/brain/world")
+async def brain_world():
+    """Get current world state."""
+    return decision_system.get_world_state()
+
+
+@app.get("/api/brain/pending")
+async def brain_pending():
+    """Get pending confirmations."""
+    return decision_system.rules.get_pending_confirmations()
+
+
+class ConfirmRequest(BaseModel):
+    approved: bool
+
+
+@app.post("/api/brain/confirm/{rule_id}")
+async def brain_confirm(rule_id: str, req: ConfirmRequest):
+    """Respond to a pending confirmation."""
+    result = decision_system.rules.confirm_pending(rule_id, req.approved)
+    if result is None:
+        raise HTTPException(404, "No pending confirmation for this rule")
+    if result.get("approved") and result.get("action"):
+        await decision_system.executor.execute(result["action"], rule_id)
+    return result
 
 
 def main() -> None:

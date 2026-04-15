@@ -1,0 +1,140 @@
+rules:
+- id: dinner_lights
+  description: Dim lights when eating at table in the evening
+  trigger:
+    type: action_changed
+    action: Eat.Attable
+    conditions:
+    - time_of_day:
+      - evening
+      - night
+    - people_present_any: true
+  action:
+    type: smart_home
+    command: dim_lights
+    params:
+      brightness: 40
+      area: dining
+  permission: notify
+  active: true
+  cooldown_sec: 300
+  expires: null
+  created_by: system
+  created_at: '2026-04-14T17:42:00'
+- id: leave_lights_off
+  description: Turn off all lights when everyone leaves
+  trigger:
+    type: person_left
+    conditions:
+    - people_present_count: 0
+  action:
+    type: smart_home
+    command: lights_off
+    params: {}
+  permission: auto
+  active: true
+  cooldown_sec: 60
+  expires: null
+  created_by: system
+  created_at: '2026-04-14T17:42:00'
+- id: cooking_ventilation
+  description: Turn on kitchen ventilation when cooking
+  trigger:
+    type: action_changed
+    action_in:
+    - Cook.Stir
+    - Cook.Usestove
+    - Cook.Cut
+    conditions: []
+  action:
+    type: smart_home
+    command: ventilation_on
+    params:
+      area: kitchen
+  permission: notify
+  active: true
+  cooldown_sec: 600
+  expires: null
+  created_by: system
+  created_at: '2026-04-14T17:42:00'
+- id: tv_ambiance
+  description: Set TV ambiance lighting when watching TV in the evening
+  trigger:
+    type: action_changed
+    action: WatchTV
+    conditions:
+    - time_of_day:
+      - evening
+      - night
+  action:
+    type: smart_home
+    command: scene_activate
+    params:
+      scene: tv_ambiance
+  permission: suggest
+  active: true
+  cooldown_sec: 600
+  expires: null
+  created_by: system
+  created_at: '2026-04-14T17:42:00'
+- id: reading_light
+  description: Adjust reading lamp when someone reads a book
+  trigger:
+    type: action_changed
+    action: Readbook
+    conditions:
+    - time_of_day:
+      - afternoon
+      - evening
+      - night
+  action:
+    type: smart_home
+    command: reading_light_on
+    params:
+      brightness: 80
+  permission: auto
+  active: true
+  cooldown_sec: 300
+  expires: null
+  created_by: system
+  created_at: '2026-04-14T17:42:00'
+- id: rule_turn_off_lights_on_leave
+  description: Turn off all lights when a person leaves.
+  trigger:
+    type: person_left
+    action: person_left
+    who: michel
+    conditions:
+    - time_of_day:
+      - evening
+      - night
+  action:
+    type: smart_home
+    command: turn_off_all_lights
+    params: {}
+  permission: auto
+  cooldown_sec: 60
+  expires: null
+  created_by: michel
+  active: true
+  created_at: '2026-04-14T18:03:49'
+- id: rule_turn_off_lights_on_leave_6223
+  description: Turn off all lights when a person leaves.
+  trigger:
+    type: person_left
+    action: person_left
+    who: michel
+    conditions:
+    - time_of_day:
+      - evening
+      - night
+  action:
+    type: smart_home
+    command: turn_off_all_lights
+    params: {}
+  permission: auto
+  cooldown_sec: 60
+  expires: null
+  created_by: michel
+  active: true
+  created_at: '2026-04-14T18:13:40'
