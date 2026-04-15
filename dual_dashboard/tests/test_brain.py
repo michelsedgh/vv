@@ -32,6 +32,7 @@ from dual_dashboard.brain.rule_engine import RuleEngine
 from dual_dashboard.brain.llm_client import LLMClient
 from dual_dashboard.brain.executor import ActionExecutor
 from dual_dashboard.brain.decision_loop import DecisionSystem
+from dual_dashboard.brain.dashboard_stream import DashboardStreamHub
 
 
 # ─── Fixtures ──────────────────────────────────────────────────────
@@ -138,6 +139,43 @@ class TestEventBus:
         assert d["data"]["who"] == "michel"
         assert "event_id" in d
         assert "iso_time" in d
+
+
+class TestDashboardStreaming:
+    """Dashboard stream and callback payload tests."""
+
+    @pytest.mark.asyncio
+    async def test_dashboard_stream_hub_broadcasts(self):
+        hub = DashboardStreamHub()
+        queue = hub.subscribe()
+        payload = {"type": "trace", "value": 1}
+
+        await hub.publish(payload)
+        received = await asyncio.wait_for(queue.get(), timeout=1.0)
+
+        assert received == payload
+
+    @pytest.mark.asyncio
+    async def test_decision_system_emits_trace_callback(self, tmp_path):
+        bus = EventBus()
+        system = DecisionSystem(
+            bus,
+            rules_path=str(tmp_path / "rules.yaml"),
+            lm_studio_url="http://fake:1234",
+        )
+        system.llm._available = False
+        pushed = []
+
+        async def callback(payload):
+            pushed.append(payload)
+
+        system.set_dashboard_callback(callback)
+        await system._process_event(Event(type="speaker_active", data={"who": "michel", "enrolled": True}))
+
+        assert pushed
+        assert pushed[-1]["type"] == "trace"
+        assert pushed[-1]["trace"]["event"]["type"] == "speaker_active"
+        assert pushed[-1]["world"]["people_count"] == 1
 
 
 # ─── World State Tests ─────────────────────────────────────────────

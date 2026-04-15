@@ -26,6 +26,7 @@ from enrollment_store import (
 )
 import server as voice_source
 from pipeline import RealtimePipeline
+from .brain.event_bus import Event, EventBus
 
 
 try:
@@ -49,14 +50,48 @@ class VoiceService:
         self.policy = policy
         self.monitor = voice_source.MonitorState()
         self.loop: Optional[asyncio.AbstractEventLoop] = None
+        self.event_bus: Optional[EventBus] = None
         self.ws_clients: Set[WebSocket] = set()
         self._enroll_state: Dict[str, dict] = {}
         self._pipeline = None
         self._mic_stream = None
         self._cleanup_lock = threading.Lock()
+        self._brain_active_speakers: Set[str] = set()
 
     def set_loop(self, loop: asyncio.AbstractEventLoop) -> None:
         self.loop = loop
+
+    def set_event_bus(self, bus: EventBus) -> None:
+        self.event_bus = bus
+
+    def _publish_brain_event(self, event_type: str, data: Dict[str, Any]) -> None:
+        if self.event_bus is None:
+            return
+        self.event_bus.publish_sync(Event(type=event_type, data=data), loop=self.loop)
+
+    def _sync_brain_speakers(self, speakers: List[dict]) -> None:
+        active_now: Set[str] = set()
+        for speaker in speakers:
+            if not speaker.get("active"):
+                continue
+            who = str(speaker.get("label") or "unknown").strip() or "unknown"
+            active_now.add(who)
+            self._publish_brain_event(
+                "speaker_active",
+                {
+                    "who": who,
+                    "enrolled": bool(speaker.get("enrolled")),
+                    "confidence": float(
+                        speaker.get("identity_similarity")
+                        if speaker.get("identity_similarity") is not None
+                        else speaker.get("activity", 0.0)
+                    ),
+                },
+            )
+
+        for who in sorted(self._brain_active_speakers - active_now):
+            self._publish_brain_event("speaker_silent", {"who": who})
+        self._brain_active_speakers = active_now
 
     async def connect_ws(self, ws: WebSocket) -> None:
         await ws.accept()
@@ -459,8 +494,10 @@ class VoiceService:
     def start(self) -> dict:
         if self.monitor.running:
             raise ValueError("Voice is already running")
+        self._brain_active_speakers.clear()
         self.monitor.reset()
         self.monitor.running = True
+        self._publish_brain_event("system_status", {"voice_running": True})
         self.monitor.thread = threading.Thread(target=self._run_monitor, daemon=True)
         self.monitor.thread.start()
         return {"status": "started"}
@@ -554,6 +591,7 @@ class VoiceService:
         except Exception as exc:
             self.ws_event("error", message=f"Voice init failed: {exc}")
             self.monitor.running = False
+            self._publish_brain_event("system_status", {"voice_running": False})
             self._finalize_runtime_refs()
             return
 
@@ -581,6 +619,7 @@ class VoiceService:
         except Exception as exc:
             self.ws_event("error", message=f"Voice mic failed: {exc}")
             self.monitor.running = False
+            self._publish_brain_event("system_status", {"voice_running": False})
             self._finalize_runtime_refs()
             return
 
@@ -643,6 +682,7 @@ class VoiceService:
                 },
                 audio_packets,
             )
+            self._sync_brain_speakers(speakers_data)
 
         try:
             while not self.monitor.stop_event.is_set():
@@ -687,6 +727,10 @@ class VoiceService:
                 self.monitor.last_capture_dir = str(saved_dir)
                 self.ws_event("status", message=f"Voice capture saved: {saved_dir.name}")
             self.monitor.running = False
+            for who in sorted(self._brain_active_speakers):
+                self._publish_brain_event("speaker_silent", {"who": who})
+            self._brain_active_speakers.clear()
+            self._publish_brain_event("system_status", {"voice_running": False})
             self._pipeline = None
             self._mic_stream = None
             self._finalize_runtime_refs()

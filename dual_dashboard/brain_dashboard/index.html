@@ -1,0 +1,226 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Brain Flow Studio</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=Sora:wght@500;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/brain-static/styles.css">
+  <script src="https://cdn.jsdelivr.net/npm/gsap@3.12.7/dist/gsap.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/interactjs/dist/interact.min.js"></script>
+  <script defer src="/brain-static/app.js"></script>
+</head>
+<body>
+  <div class="page-shell">
+    <header class="panel topbar">
+      <div>
+        <p class="eyebrow">Decision Studio</p>
+        <h1>Brain Flow</h1>
+        <p class="subtle">Start event, five systems, chosen route, and a real smart-home rules surface.</p>
+      </div>
+      <div class="topbar-side">
+        <div class="status-strip" id="status-strip"></div>
+        <div class="button-row">
+          <button class="btn btn-ghost" id="btn-autofollow">Auto Follow On</button>
+          <button class="btn btn-secondary" id="btn-refresh">Refresh</button>
+          <button class="btn btn-danger" id="btn-clear">Clear</button>
+          <a class="btn btn-primary" href="/">Dual Runtime</a>
+        </div>
+      </div>
+    </header>
+
+    <section class="panel workspace-panel">
+      <div class="panel-head">
+        <div>
+          <p class="eyebrow">Live Workspace</p>
+          <h2>Event Route Through The Five Systems</h2>
+        </div>
+        <div class="metrics-row" id="hero-metrics"></div>
+      </div>
+
+      <div class="progress-shell">
+        <div class="progress-copy">
+          <p class="progress-label">Trace Progress</p>
+          <strong id="progress-title">Waiting for a live event</strong>
+        </div>
+        <div class="progress-bar">
+          <div class="progress-fill" id="progress-fill"></div>
+          <div class="progress-spark" id="progress-spark"></div>
+        </div>
+        <div class="progress-steps" id="progress-steps"></div>
+      </div>
+
+      <div class="workspace" id="workspace">
+        <svg class="flow-lines" id="flow-lines" aria-hidden="true"></svg>
+        <canvas class="flow-canvas" id="flow-canvas"></canvas>
+        <aside class="detail-drawer" id="detail-drawer">
+          <div class="drawer-head">
+            <div>
+              <p class="eyebrow">Detail View</p>
+              <h3 id="detail-title">Nothing selected</h3>
+            </div>
+            <button class="btn btn-ghost btn-small" id="btn-detail-close">Close</button>
+          </div>
+          <div class="drawer-body" id="detail-body"></div>
+        </aside>
+      </div>
+    </section>
+
+    <section class="panel history-panel">
+      <div class="panel-head">
+        <div>
+          <p class="eyebrow">History</p>
+          <h2>Recent Trace Queue</h2>
+        </div>
+        <div class="quick-actions" id="quick-actions"></div>
+      </div>
+      <div class="history-stack" id="trace-history"></div>
+    </section>
+
+    <section class="rules-shell">
+      <section class="panel builder-panel">
+        <div class="panel-head">
+          <div>
+            <p class="eyebrow">Rule Builder</p>
+            <h2>Add Smart Home Rule</h2>
+          </div>
+        </div>
+        <form class="rule-form" id="rule-form">
+          <label class="field">
+            <span>Description</span>
+            <input id="rule-description" type="text" placeholder="Dim dining lights when dinner starts">
+          </label>
+
+          <div class="field-grid">
+            <label class="field">
+              <span>Trigger Type</span>
+              <select id="rule-trigger-type">
+                <option value="action_changed">Action Changed</option>
+                <option value="person_left">Person Left</option>
+                <option value="speaker_active">Speaker Active</option>
+                <option value="speech_text">Speech Text</option>
+              </select>
+            </label>
+            <label class="field">
+              <span>Permission</span>
+              <select id="rule-permission">
+                <option value="auto">Auto</option>
+                <option value="notify">Notify</option>
+                <option value="ask">Ask</option>
+                <option value="suggest">Suggest</option>
+              </select>
+            </label>
+          </div>
+
+          <div class="field-grid">
+            <label class="field">
+              <span>Action Match</span>
+              <input id="rule-action-match" type="text" placeholder="Eat.Attable or Cook.Stir, Cook.Cut">
+            </label>
+            <label class="field">
+              <span>Who Match</span>
+              <input id="rule-who-match" type="text" placeholder="michel">
+            </label>
+          </div>
+
+          <div class="field-grid">
+            <label class="field">
+              <span>Command</span>
+              <input id="rule-command" type="text" placeholder="dim_lights">
+            </label>
+            <label class="field">
+              <span>Area</span>
+              <input id="rule-area" type="text" placeholder="dining">
+            </label>
+          </div>
+
+          <div class="field-grid">
+            <label class="field">
+              <span>Scene</span>
+              <input id="rule-scene" type="text" placeholder="tv_ambiance">
+            </label>
+            <label class="field">
+              <span>Brightness</span>
+              <input id="rule-brightness" type="number" min="0" max="100" placeholder="40">
+            </label>
+          </div>
+
+          <div class="field-grid">
+            <label class="field">
+              <span>Cooldown Seconds</span>
+              <input id="rule-cooldown" type="number" min="0" value="60">
+            </label>
+            <label class="field toggle-field">
+              <span>Require Someone Present</span>
+              <input id="rule-presence" type="checkbox" checked>
+            </label>
+          </div>
+
+          <fieldset class="fieldset">
+            <legend>Time Of Day</legend>
+            <div class="checkbox-row">
+              <label><input class="rule-time" type="checkbox" value="morning"> Morning</label>
+              <label><input class="rule-time" type="checkbox" value="afternoon"> Afternoon</label>
+              <label><input class="rule-time" type="checkbox" value="evening"> Evening</label>
+              <label><input class="rule-time" type="checkbox" value="night"> Night</label>
+            </div>
+          </fieldset>
+
+          <div class="form-actions">
+            <button class="btn btn-primary" type="submit">Add Rule</button>
+            <button class="btn btn-ghost" type="button" id="btn-rule-reset">Reset</button>
+          </div>
+          <div class="form-status" id="rule-form-status">Build rules around actions, presence, time of day, and command output.</div>
+        </form>
+
+        <details class="library-toggle">
+          <summary>Manage full rule library</summary>
+          <div class="library-meta" id="rule-library-meta"></div>
+          <div class="rule-groups is-compact" id="rule-library-groups"></div>
+        </details>
+      </section>
+
+      <section class="panel rules-panel">
+        <div class="panel-head">
+          <div>
+            <p class="eyebrow">Trace Rules</p>
+            <h2>Rules Used On Selected Event</h2>
+          </div>
+          <div class="rules-meta" id="rules-meta"></div>
+        </div>
+        <div class="rule-groups" id="rule-groups"></div>
+      </section>
+    </section>
+
+    <section class="panel state-panel">
+      <div class="panel-head">
+        <div>
+          <p class="eyebrow">Context</p>
+          <h2>World State, Events, Actions, Pending</h2>
+        </div>
+        <div class="rules-meta" id="state-meta"></div>
+      </div>
+      <div class="state-grid">
+        <section class="state-card">
+          <h3>World Snapshot</h3>
+          <div id="world-summary"></div>
+        </section>
+        <section class="state-card">
+          <h3>Recent Events</h3>
+          <div class="feed-list" id="event-feed"></div>
+        </section>
+        <section class="state-card">
+          <h3>Actions</h3>
+          <div class="feed-list" id="action-feed"></div>
+        </section>
+        <section class="state-card">
+          <h3>Pending Confirmations</h3>
+          <div class="feed-list" id="pending-feed"></div>
+        </section>
+      </div>
+    </section>
+  </div>
+</body>
+</html>

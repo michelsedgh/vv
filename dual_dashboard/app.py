@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import logging
 import sys
 import threading
@@ -24,6 +25,7 @@ if __package__ in (None, ""):
     from dual_dashboard.voice_service import VoiceService
     from dual_dashboard.brain.event_bus import Event, EventBus
     from dual_dashboard.brain.decision_loop import DecisionSystem
+    from dual_dashboard.brain.dashboard_stream import DashboardStreamHub
 else:
     from . import settings
     from .policy import SharedInferencePolicy
@@ -31,6 +33,7 @@ else:
     from .voice_service import VoiceService
     from .brain.event_bus import Event, EventBus
     from .brain.decision_loop import DecisionSystem
+    from .brain.dashboard_stream import DashboardStreamHub
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 BRAIN_DIR = Path(__file__).resolve().parent / "brain_dashboard"
@@ -55,6 +58,9 @@ decision_system = DecisionSystem(
     rules_path=str(Path(__file__).resolve().parent / "rules.yaml"),
     lm_studio_url="http://192.168.1.198:1234",
 )
+brain_stream = DashboardStreamHub()
+voice_service.set_event_bus(event_bus)
+poguise_service.set_event_bus(event_bus)
 
 
 class ConfigUpdateRequest(BaseModel):
@@ -78,13 +84,61 @@ class PromoteDiagRequest(BaseModel):
     reference_label: str | None = None
 
 
+class InjectEventRequest(BaseModel):
+    type: str
+    data: Dict[str, Any] = Field(default_factory=dict)
+
+
+class ConfirmRequest(BaseModel):
+    approved: bool
+
+
+class RuleCreateRequest(BaseModel):
+    rule: Dict[str, Any] = Field(default_factory=dict)
+
+
+class RuleUpdateRequest(BaseModel):
+    changes: Dict[str, Any] = Field(default_factory=dict)
+
+
 def _raise_bad_request(exc: Exception):
     raise HTTPException(400, str(exc))
 
 
+def _brain_snapshot(count: int = 36) -> Dict[str, Any]:
+    return {
+        "status": decision_system.get_system_status(),
+        "world": decision_system.get_world_state(),
+        "rules": decision_system.get_rules(),
+        "traces": decision_system.get_traces(count),
+        "events": event_bus.recent_events(count=count),
+        "actions": decision_system.get_action_log(),
+        "fire_history": decision_system.get_fire_history(),
+        "pending": decision_system.rules.get_pending_confirmations(),
+        "layers": [
+            "event_bus",
+            "world_state",
+            "rule_engine",
+            "llm_reasoner",
+            "executor",
+        ],
+    }
+
+
 @app.on_event("startup")
 async def on_startup() -> None:
-    voice_service.set_loop(asyncio.get_running_loop())
+    loop = asyncio.get_running_loop()
+    voice_service.set_loop(loop)
+    poguise_service.set_loop(loop)
+
+    async def publish_bus_event(event: Event) -> None:
+        await brain_stream.publish({
+            "type": "bus_event",
+            "event": event.to_dict(),
+        })
+
+    event_bus.add_listener(publish_bus_event)
+    decision_system.set_dashboard_callback(brain_stream.publish)
     await decision_system.start()
 
 
@@ -374,6 +428,12 @@ async def brain_dashboard():
     return FileResponse(BRAIN_DIR / "index.html")
 
 
+@app.get("/api/brain/bootstrap")
+async def brain_bootstrap(count: int = 36):
+    """Get the full Brain dashboard payload in one request."""
+    return _brain_snapshot(count)
+
+
 @app.get("/api/brain/status")
 async def brain_status():
     """Get full brain decision system status."""
@@ -386,10 +446,44 @@ async def brain_traces(count: int = 30):
     return decision_system.get_traces(count)
 
 
+@app.get("/api/brain/events")
+async def brain_events(count: int = 50):
+    """Get recent raw bus events."""
+    return event_bus.recent_events(count)
+
+
 @app.get("/api/brain/rules")
 async def brain_rules():
     """Get all rules."""
     return decision_system.get_rules()
+
+
+@app.post("/api/brain/rules")
+async def brain_create_rule(req: RuleCreateRequest):
+    """Create a new rule."""
+    rule = decision_system.rules.add_rule(req.rule)
+    await brain_stream.publish({
+        "type": "rules",
+        "rules": decision_system.get_rules(),
+        "pending": decision_system.rules.get_pending_confirmations(),
+        "status": decision_system.get_system_status(),
+    })
+    return rule
+
+
+@app.put("/api/brain/rules/{rule_id}")
+async def brain_update_rule(rule_id: str, req: RuleUpdateRequest):
+    """Update an existing rule."""
+    result = decision_system.rules.update_rule(rule_id, req.changes)
+    if result is None:
+        raise HTTPException(404, f"Rule {rule_id} not found")
+    await brain_stream.publish({
+        "type": "rules",
+        "rules": decision_system.get_rules(),
+        "pending": decision_system.rules.get_pending_confirmations(),
+        "status": decision_system.get_system_status(),
+    })
+    return result
 
 
 @app.post("/api/brain/rules/{rule_id}/toggle")
@@ -398,7 +492,28 @@ async def brain_toggle_rule(rule_id: str):
     result = decision_system.rules.toggle_rule(rule_id)
     if result is None:
         raise HTTPException(404, f"Rule {rule_id} not found")
+    await brain_stream.publish({
+        "type": "rules",
+        "rules": decision_system.get_rules(),
+        "pending": decision_system.rules.get_pending_confirmations(),
+        "status": decision_system.get_system_status(),
+    })
     return result
+
+
+@app.delete("/api/brain/rules/{rule_id}")
+async def brain_delete_rule(rule_id: str):
+    """Delete a rule."""
+    deleted = decision_system.rules.delete_rule(rule_id)
+    if not deleted:
+        raise HTTPException(404, f"Rule {rule_id} not found")
+    await brain_stream.publish({
+        "type": "rules",
+        "rules": decision_system.get_rules(),
+        "pending": decision_system.rules.get_pending_confirmations(),
+        "status": decision_system.get_system_status(),
+    })
+    return {"ok": True, "rule_id": rule_id}
 
 
 @app.get("/api/brain/actions")
@@ -407,9 +522,39 @@ async def brain_actions():
     return decision_system.get_action_log()
 
 
-class InjectEventRequest(BaseModel):
-    type: str
-    data: Dict[str, Any] = Field(default_factory=dict)
+@app.get("/api/brain/fire-history")
+async def brain_fire_history():
+    """Get recent rule fire history."""
+    return decision_system.get_fire_history()
+
+
+@app.get("/api/brain/stream")
+async def brain_stream_events(count: int = 36):
+    """Server-sent events feed for the Brain dashboard."""
+    queue = brain_stream.subscribe()
+
+    async def event_generator():
+        try:
+            yield f"data: {json.dumps({'type': 'bootstrap', **_brain_snapshot(count)})}\n\n"
+            while True:
+                try:
+                    payload = await asyncio.wait_for(queue.get(), timeout=15.0)
+                except asyncio.TimeoutError:
+                    yield ": ping\n\n"
+                    continue
+                yield f"data: {json.dumps(payload)}\n\n"
+        finally:
+            brain_stream.unsubscribe(queue)
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 @app.post("/api/brain/inject")
@@ -424,6 +569,7 @@ async def brain_clear():
     """Clear event history and traces."""
     event_bus.clear_history()
     decision_system._traces.clear()
+    await brain_stream.publish({"type": "bootstrap", **_brain_snapshot()})
     return {"ok": True}
 
 
@@ -439,10 +585,6 @@ async def brain_pending():
     return decision_system.rules.get_pending_confirmations()
 
 
-class ConfirmRequest(BaseModel):
-    approved: bool
-
-
 @app.post("/api/brain/confirm/{rule_id}")
 async def brain_confirm(rule_id: str, req: ConfirmRequest):
     """Respond to a pending confirmation."""
@@ -451,6 +593,12 @@ async def brain_confirm(rule_id: str, req: ConfirmRequest):
         raise HTTPException(404, "No pending confirmation for this rule")
     if result.get("approved") and result.get("action"):
         await decision_system.executor.execute(result["action"], rule_id)
+    await brain_stream.publish({
+        "type": "pending",
+        "pending": decision_system.rules.get_pending_confirmations(),
+        "actions": decision_system.get_action_log(),
+        "status": decision_system.get_system_status(),
+    })
     return result
 
 

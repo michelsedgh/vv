@@ -19,6 +19,7 @@ import torch.nn.functional as F
 import torchvision
 
 from . import settings
+from .brain.event_bus import Event, EventBus
 
 try:
     LIBC = ctypes.CDLL("libc.so.6")
@@ -207,6 +208,8 @@ class PoguiseService:
         self.gpu_lock = gpu_lock
         self.policy = policy
         self.voice_running_getter = voice_running_getter
+        self.loop = None
+        self.event_bus: Optional[EventBus] = None
         self._lock = threading.Lock()
         self._show_heatmap = False
         self._latest_frame_jpeg = b""
@@ -218,6 +221,17 @@ class PoguiseService:
         self._model = None
         self._capture = None
         self._cleanup_lock = threading.Lock()
+
+    def set_loop(self, loop) -> None:
+        self.loop = loop
+
+    def set_event_bus(self, bus: EventBus) -> None:
+        self.event_bus = bus
+
+    def _publish_brain_event(self, event_type: str, data: Dict[str, Any]) -> None:
+        if self.event_bus is None:
+            return
+        self.event_bus.publish_sync(Event(type=event_type, data=data), loop=self.loop)
 
     def _fresh_stats(self) -> dict:
         return {
@@ -288,6 +302,7 @@ class PoguiseService:
             raise ValueError("PO-GUISE is already running")
         self.stop_event = threading.Event()
         self.running = True
+        self._publish_brain_event("system_status", {"vision_running": True})
         self.thread = threading.Thread(target=self._run, daemon=True)
         self.thread.start()
         return {"status": "started"}
@@ -369,6 +384,7 @@ class PoguiseService:
                 self._stats["phase"] = "error"
                 self._stats["status_message"] = f"Model init failed: {exc}"
             self.running = False
+            self._publish_brain_event("system_status", {"vision_running": False})
             self._finalize_runtime_refs()
             return
 
@@ -444,6 +460,7 @@ class PoguiseService:
 
                 cutoff_exact = t_now - CONTEXT_SECONDS
                 valid_frames = [frame for ts, frame in buffer if ts >= cutoff_exact]
+                inferred_this_loop = False
 
                 plan = self.policy.plan_poguise(
                     int(config["infer_every"]),
@@ -475,6 +492,7 @@ class PoguiseService:
                                         return_heatmap=want_heatmap,
                                     )
                                     inference_ms = (time.time() - t0) * 1000.0
+                                    inferred_this_loop = True
                                 finally:
                                     self.gpu_lock.release()
 
@@ -523,6 +541,14 @@ class PoguiseService:
                     top1_idx = int(np.argmax(smoothed_probs))
                     top1_prob = float(smoothed_probs[top1_idx])
                     top1_label = CS_CLASSES[top1_idx]
+                    if inferred_this_loop and top1_prob > float(config["confidence_threshold"]):
+                        self._publish_brain_event(
+                            "action_detected",
+                            {
+                                "action": top1_label,
+                                "confidence": top1_prob,
+                            },
+                        )
                     if top1_prob > float(config["confidence_threshold"]):
                         if top1_label == last_top_pred:
                             current_top_count += 1
@@ -595,6 +621,7 @@ class PoguiseService:
             except Exception:
                 pass
             self.running = False
+            self._publish_brain_event("system_status", {"vision_running": False})
             with self._lock:
                 self._stats = self._fresh_stats()
                 self._stats["checkpoint"] = config["checkpoint"]

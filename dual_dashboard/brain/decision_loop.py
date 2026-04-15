@@ -283,6 +283,17 @@ class DecisionSystem:
         if len(self._traces) > self._max_traces:
             self._traces = self._traces[-self._max_traces:]
 
+        if self._dashboard_callback:
+            await self._dashboard_callback({
+                "type": "trace",
+                "trace": trace.to_dict(),
+                "status": self.get_system_status(),
+                "world": self.get_world_state(),
+                "pending": self.rules.get_pending_confirmations(),
+                "actions": self.get_action_log(),
+                "fire_history": self.get_fire_history(),
+            })
+
     async def _handle_speech(self, event: Event, trace: DecisionTrace) -> None:
         """Process speech through the LLM for intent classification and rule management."""
         text = event.data.get("text", "")
