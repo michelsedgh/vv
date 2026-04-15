@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 from copy import deepcopy
 import logging
+import re
 import time
 from datetime import datetime
 from pathlib import Path
@@ -44,7 +45,7 @@ class DecisionTrace:
             "layer": layer,
             "status": status,
             "details": details,
-            "data": data or {},
+            "data": deepcopy(data) if data is not None else {},
             "timestamp": time.time(),
             "elapsed_ms": round((time.time() - self.start_time) * 1000, 1),
         })
@@ -100,6 +101,7 @@ class DecisionSystem:
         self._queue: Optional[asyncio.Queue] = None
         self._queue_items: Dict[str, Dict[str, Any]] = {}
         self._max_queue_items = 80
+        self._stream_progress_interval_sec = 0.18
 
     async def start(self) -> None:
         """Start the decision loop."""
@@ -155,6 +157,76 @@ class DecisionSystem:
             "updated_at": None,
             "history": [],
         }
+
+    def _fast_intent_guess(self, text: str) -> Optional[Dict[str, Any]]:
+        normalized = " ".join(text.lower().strip().split())
+        if not normalized:
+            return None
+
+        confirmation_values = {
+            "yes", "yeah", "yep", "sure", "ok", "okay", "no", "nope", "nah",
+            "go ahead", "do it", "cancel", "stop that", "not now",
+        }
+        if normalized in confirmation_values:
+            return {
+                "intent": "confirmation",
+                "confidence": 0.99,
+                "reasoning": "Matched a direct yes/no confirmation phrase.",
+                "_raw_response": "",
+                "_latency_ms": 0.0,
+                "_fast_path": True,
+            }
+
+        question_starts = ("what ", "why ", "how ", "which ", "when ", "who ", "is ", "are ", "do ", "does ", "did ", "can ", "could ", "would ", "will ")
+        if normalized.endswith("?") or normalized.startswith(question_starts):
+            return {
+                "intent": "question",
+                "confidence": 0.95,
+                "reasoning": "Matched a direct question pattern.",
+                "_raw_response": "",
+                "_latency_ms": 0.0,
+                "_fast_path": True,
+            }
+
+        modify_phrases = (
+            "disable rule", "pause rule", "resume rule", "delete rule", "remove rule",
+            "suspend rule", "turn that rule off", "dont do that anymore", "don't do that anymore",
+        )
+        if normalized.startswith(("disable ", "pause ", "resume ", "delete ", "remove ", "suspend ")) or any(phrase in normalized for phrase in modify_phrases):
+            return {
+                "intent": "modify_rule",
+                "confidence": 0.94,
+                "reasoning": "Matched a rule-management phrase.",
+                "_raw_response": "",
+                "_latency_ms": 0.0,
+                "_fast_path": True,
+            }
+
+        if normalized.startswith(("when ", "if ", "whenever ", "after ", "before ", "once ")) or re.search(r"\b(when|if|whenever|after i|before i|once|every time|any time)\b", normalized):
+            return {
+                "intent": "create_rule",
+                "confidence": 0.97,
+                "reasoning": "Matched an automation trigger phrase.",
+                "_raw_response": "",
+                "_latency_ms": 0.0,
+                "_fast_path": True,
+            }
+
+        direct_command_starts = (
+            "turn on ", "turn off ", "set ", "dim ", "brighten ", "open ", "close ",
+            "lock ", "unlock ", "activate ", "deactivate ", "play ",
+        )
+        if normalized.startswith(direct_command_starts) or normalized.endswith(" now") or " right now" in normalized:
+            return {
+                "intent": "direct_command",
+                "confidence": 0.92,
+                "reasoning": "Matched an immediate command phrase.",
+                "_raw_response": "",
+                "_latency_ms": 0.0,
+                "_fast_path": True,
+            }
+
+        return None
 
     def _ensure_queue_item(self, event: Event) -> Dict[str, Any]:
         entry = self._queue_items.get(event.event_id)
@@ -248,6 +320,7 @@ class DecisionSystem:
         llm_state["updated_ts"] = now
         llm_state["updated_at"] = self._iso(now)
         llm_state.setdefault("history", []).append(phase_entry)
+        entry["_last_stream_publish_ts"] = 0.0
         return entry
 
     def _append_llm_text(self, event: Event, chunk: str) -> Dict[str, Any]:
@@ -333,6 +406,15 @@ class DecisionSystem:
             },
             "queue": self.get_queue_state(),
         })
+
+    def _should_publish_stream_progress(self, event: Event, *, force: bool = False) -> bool:
+        entry = self._ensure_queue_item(event)
+        now = time.time()
+        last = float(entry.get("_last_stream_publish_ts") or 0.0)
+        if not force and (now - last) < self._stream_progress_interval_sec:
+            return False
+        entry["_last_stream_publish_ts"] = now
+        return True
 
     async def _record_layer(
         self,
@@ -597,31 +679,34 @@ class DecisionSystem:
         if not text or len(text.strip()) < 3:
             return
 
-        self._llm_calls += 1
-
         # Step 1: Classify intent
         context = self.world.get_llm_context()
-        self._start_llm_phase(event, "intent_classification")
-        await self._publish_trace_progress(trace, "llm_reasoner", "streaming", "LLM intent classification")
-
-        async def on_intent_delta(chunk: str) -> None:
-            self._append_llm_text(event, chunk)
+        intent_result = self._fast_intent_guess(text)
+        if intent_result is None:
+            self._llm_calls += 1
+            self._start_llm_phase(event, "intent_classification")
             await self._publish_trace_progress(trace, "llm_reasoner", "streaming", "LLM intent classification")
 
-        intent_result = await self.llm.classify_intent(text, speaker, context, on_delta=on_intent_delta)
-        self._finish_llm_phase(
-            event,
-            raw_output=intent_result.get("_raw_response", ""),
-            latency_ms=intent_result.get("_latency_ms"),
-        )
+            async def on_intent_delta(chunk: str) -> None:
+                self._append_llm_text(event, chunk)
+                if self._should_publish_stream_progress(event):
+                    await self._publish_trace_progress(trace, "llm_reasoner", "streaming", "LLM intent classification")
+
+            intent_result = await self.llm.classify_intent(text, speaker, context, on_delta=on_intent_delta)
+            self._finish_llm_phase(
+                event,
+                raw_output=intent_result.get("_raw_response", ""),
+                latency_ms=intent_result.get("_latency_ms"),
+            )
         intent = intent_result.get("intent", "conversation")
         confidence = intent_result.get("confidence", 0)
+        fast_path = bool(intent_result.get("_fast_path"))
 
         await self._record_layer(
             trace,
             "llm_reasoner",
             "intent_classified",
-            f"Intent: {intent} ({confidence:.0%})",
+            f"Intent: {intent} ({confidence:.0%}){' via fast-path' if fast_path else ''}",
             intent_result,
         )
 
@@ -630,17 +715,19 @@ class DecisionSystem:
 
         if intent == "create_rule":
             # Parse into a structured rule
+            self._llm_calls += 1
             self._start_llm_phase(event, "rule_creation")
             await self._publish_trace_progress(trace, "llm_reasoner", "streaming", "LLM rule creation")
 
             async def on_rule_delta(chunk: str) -> None:
                 self._append_llm_text(event, chunk)
-                await self._publish_trace_progress(trace, "llm_reasoner", "streaming", "LLM rule creation")
+                if self._should_publish_stream_progress(event):
+                    await self._publish_trace_progress(trace, "llm_reasoner", "streaming", "LLM rule creation")
 
             rule_result = await self.llm.parse_rule(
                 text, speaker,
                 self.world.get_llm_context(),
-                self.rules.rules_summary_for_llm(),
+                self.rules.rules_summary_for_llm(max_rules=8, unique_only=True),
                 on_delta=on_rule_delta,
             )
 
@@ -692,16 +779,18 @@ class DecisionSystem:
             )
 
         elif intent == "modify_rule":
+            self._llm_calls += 1
             self._start_llm_phase(event, "rule_override")
             await self._publish_trace_progress(trace, "llm_reasoner", "streaming", "LLM rule override")
 
             async def on_override_delta(chunk: str) -> None:
                 self._append_llm_text(event, chunk)
-                await self._publish_trace_progress(trace, "llm_reasoner", "streaming", "LLM rule override")
+                if self._should_publish_stream_progress(event):
+                    await self._publish_trace_progress(trace, "llm_reasoner", "streaming", "LLM rule override")
 
             change = await self.llm.parse_override(
                 text, speaker,
-                self.rules.rules_summary_for_llm(),
+                self.rules.rules_summary_for_llm(max_rules=12, unique_only=True),
                 on_delta=on_override_delta,
             )
 
@@ -750,17 +839,19 @@ class DecisionSystem:
 
         elif intent == "direct_command":
             # Try to parse as a direct action
+            self._llm_calls += 1
             self._start_llm_phase(event, "direct_command")
             await self._publish_trace_progress(trace, "llm_reasoner", "streaming", "LLM direct command parse")
 
             async def on_command_delta(chunk: str) -> None:
                 self._append_llm_text(event, chunk)
-                await self._publish_trace_progress(trace, "llm_reasoner", "streaming", "LLM direct command parse")
+                if self._should_publish_stream_progress(event):
+                    await self._publish_trace_progress(trace, "llm_reasoner", "streaming", "LLM direct command parse")
 
             rule_result = await self.llm.parse_rule(
                 text, speaker,
                 self.world.get_llm_context(),
-                self.rules.rules_summary_for_llm(),
+                self.rules.rules_summary_for_llm(max_rules=8, unique_only=True),
                 on_delta=on_command_delta,
             )
             latest_output = self._queue_items.get(event.event_id, {}).get("llm", {}).get("stream_text", "")

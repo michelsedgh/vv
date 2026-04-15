@@ -200,6 +200,7 @@ class LLMClient:
         system: str,
         user: str,
         on_delta: Optional[Callable[[str], Awaitable[None] | None]] = None,
+        max_tokens: Optional[int] = None,
     ) -> Optional[dict]:
         """Make a chat completion request to LM Studio."""
         t0 = time.time()
@@ -211,7 +212,7 @@ class LLMClient:
                 {"role": "user", "content": user},
             ],
             "temperature": self.temperature,
-            "max_tokens": self.max_tokens,
+            "max_tokens": max_tokens or self.max_tokens,
             "stream": bool(on_delta),
         }
         if self.model:
@@ -242,7 +243,6 @@ class LLMClient:
                             delta = choice.get("delta") or {}
                             piece = (
                                 delta.get("content")
-                                or delta.get("reasoning_content")
                                 or delta.get("text")
                             )
                             if piece:
@@ -326,6 +326,7 @@ class LLMClient:
             "You are a precise intent classifier. Always respond with valid JSON only.",
             prompt,
             on_delta=on_delta,
+            max_tokens=96,
         )
         raw_text = response["text"] if response else None
         result = self._parse_json(raw_text)
@@ -361,6 +362,7 @@ class LLMClient:
             "You are a smart home automation designer. Always respond with valid JSON only.",
             prompt,
             on_delta=on_delta,
+            max_tokens=320,
         )
         raw_text = response["text"] if response else None
         result = self._parse_json(raw_text)
@@ -386,6 +388,7 @@ class LLMClient:
             "You are a smart home rule editor. Always respond with valid JSON only.",
             prompt,
             on_delta=on_delta,
+            max_tokens=220,
         )
         raw_text = response["text"] if response else None
         result = self._parse_json(raw_text)
@@ -417,6 +420,7 @@ class LLMClient:
             "You are a smart home decision engine. Always respond with valid JSON only.",
             prompt,
             on_delta=on_delta,
+            max_tokens=96,
         )
         raw_text = response["text"] if response else None
         result = self._parse_json(raw_text)

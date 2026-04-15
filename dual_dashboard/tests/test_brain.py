@@ -1126,5 +1126,50 @@ class TestEdgeCases:
         assert snap["people_count"] == 0
 
 
+class TestLatencyGuards:
+    def test_fast_intent_guess_short_circuits_common_automation_phrase(self, tmp_path):
+        bus = EventBus()
+        system = DecisionSystem(bus, rules_path=str(tmp_path / "rules.yaml"), lm_studio_url="http://fake:1234")
+        result = system._fast_intent_guess("turn off all lights when I leave")
+        assert result is not None
+        assert result["intent"] == "create_rule"
+        assert result["_fast_path"] is True
+        assert result["_latency_ms"] == 0.0
+
+    def test_rules_summary_for_llm_can_compact_duplicates(self, tmp_path):
+        world = WorldState()
+        engine = RuleEngine(str(tmp_path / "rules.yaml"), world)
+        engine._rules = [
+            {
+                "id": "leave_lights_1",
+                "description": "Turn off all lights when michel leaves.",
+                "trigger": {"type": "person_left"},
+                "action": {"type": "smart_home", "command": "lights_off"},
+                "permission": "auto",
+                "active": True,
+            },
+            {
+                "id": "leave_lights_2",
+                "description": "Turn off all lights when michel leaves.",
+                "trigger": {"type": "person_left"},
+                "action": {"type": "smart_home", "command": "lights_off"},
+                "permission": "auto",
+                "active": True,
+            },
+            {
+                "id": "ventilation",
+                "description": "Turn on kitchen ventilation when cooking",
+                "trigger": {"type": "action_changed"},
+                "action": {"type": "smart_home", "command": "ventilation_on"},
+                "permission": "notify",
+                "active": True,
+            },
+        ]
+
+        summary = engine.rules_summary_for_llm(max_rules=8, unique_only=True)
+        assert summary.count("Turn off all lights when michel leaves.") == 1
+        assert "Turn on kitchen ventilation when cooking" in summary
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v", "--tb=short"])

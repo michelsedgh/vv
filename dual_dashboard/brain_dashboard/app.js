@@ -122,8 +122,45 @@ const state = {
   lastFrameAt: 0,
 };
 
+const renderQueueState = {
+  frame: 0,
+  full: false,
+  live: false,
+  animate: false,
+};
+
+const streamState = {
+  progressTimer: 0,
+  pendingProgress: null,
+};
+
+const STREAM_PROGRESS_RENDER_MS = 140;
+
 function byId(id) {
   return document.getElementById(id);
+}
+
+async function copyText(value) {
+  const text = String(value ?? "");
+  if (!text) return;
+  if (navigator.clipboard?.writeText) {
+    await navigator.clipboard.writeText(text);
+    return;
+  }
+  const probe = document.createElement("textarea");
+  probe.value = text;
+  probe.setAttribute("readonly", "readonly");
+  probe.style.position = "absolute";
+  probe.style.left = "-9999px";
+  document.body.appendChild(probe);
+  probe.select();
+  document.execCommand("copy");
+  document.body.removeChild(probe);
+}
+
+function hasActiveTextSelection() {
+  const selection = window.getSelection?.();
+  return !!selection && !selection.isCollapsed && String(selection).trim().length > 0;
 }
 
 function escapeHtml(value) {
@@ -155,9 +192,25 @@ function selectedQueueEntry() {
     || null;
 }
 
-function elapsedSeconds(timestamp) {
+function elapsedSeconds(timestamp, endTimestamp = null) {
   if (!timestamp) return "-";
-  return `${Math.max(0, (Date.now() / 1000) - Number(timestamp)).toFixed(1)}s`;
+  const end = endTimestamp == null ? (Date.now() / 1000) : Number(endTimestamp);
+  return `${Math.max(0, end - Number(timestamp)).toFixed(1)}s`;
+}
+
+function relativeSecondsAttrs(startTimestamp, endTimestamp = null) {
+  if (!startTimestamp) return "";
+  const attrs = [`data-elapsed-seconds-from="${escapeHtml(String(startTimestamp))}"`];
+  if (endTimestamp != null) attrs.push(`data-elapsed-seconds-to="${escapeHtml(String(endTimestamp))}"`);
+  return attrs.join(" ");
+}
+
+function relativeMsAttrs({ startTimestamp = null, fixedMs = null } = {}) {
+  if (!startTimestamp && fixedMs == null) return "";
+  const attrs = [];
+  if (startTimestamp) attrs.push(`data-elapsed-ms-from="${escapeHtml(String(startTimestamp))}"`);
+  if (fixedMs != null) attrs.push(`data-elapsed-ms-fixed="${escapeHtml(String(fixedMs))}"`);
+  return attrs.join(" ");
 }
 
 function stageLabel(stageId) {
@@ -1296,8 +1349,14 @@ function renderQueuePanel() {
     const stuck = queueItemStuck(item);
     const card = document.createElement("article");
     card.className = `queue-item${selected ? " is-selected" : ""}${item.status === "processing" ? " is-active" : ""}${stuck ? " is-stuck" : ""}`;
+    card.dataset.queueStatus = item.status || "";
+    card.dataset.currentStage = item.current_stage || "";
+    if (item.stage_started_ts || item.started_ts) card.dataset.stageStartedTs = String(item.stage_started_ts || item.started_ts);
     const llm = item.llm || {};
-    const stageTime = item.status === "queued" ? elapsedSeconds(item.queued_ts) : elapsedSeconds(item.stage_started_ts || item.started_ts);
+    const endedTs = item.status === "processing" || item.status === "queued" ? null : (item.completed_ts || item.updated_ts || null);
+    const stageTime = item.status === "queued"
+      ? elapsedSeconds(item.queued_ts, endedTs)
+      : elapsedSeconds(item.stage_started_ts || item.started_ts, endedTs);
     const statusTone = stuck ? "red" : (item.status === "processing" ? "blue" : item.status === "queued" ? "gold" : "gold");
     card.innerHTML = `
       <div class="queue-head">
@@ -1309,14 +1368,14 @@ function renderQueuePanel() {
       </div>
       <div class="queue-row">
         <span>Stage <strong>${escapeHtml(stageLabel(item.current_stage))}</strong></span>
-        <span>Stage Time <strong>${escapeHtml(stageTime)}</strong></span>
-        ${item.started_ts ? `<span>Total <strong>${escapeHtml(elapsedSeconds(item.started_ts))}</strong></span>` : ""}
+        <span>Stage Time <strong ${item.status === "queued" ? relativeSecondsAttrs(item.queued_ts, endedTs) : relativeSecondsAttrs(item.stage_started_ts || item.started_ts, endedTs)}>${escapeHtml(stageTime)}</strong></span>
+        ${item.started_ts ? `<span>Total <strong ${relativeSecondsAttrs(item.started_ts, endedTs)}>${escapeHtml(elapsedSeconds(item.started_ts, endedTs))}</strong></span>` : ""}
       </div>
       <div class="queue-pill-row">
         <span class="queue-pill" data-tone="gold">${escapeHtml(statusLabel(item.stage_status || item.status))}</span>
         ${llm.phase ? `<span class="queue-pill" data-tone="blue">${escapeHtml(llmPhaseLabel(llm.phase))}</span>` : ""}
-        ${llm.phase_started_ts ? `<span class="queue-pill" data-tone="blue">${escapeHtml(fmtMs(llm.active ? ((Date.now() / 1000) - Number(llm.phase_started_ts)) * 1000 : llm.latency_ms))}</span>` : ""}
-        ${stuck ? '<span class="queue-pill" data-tone="red">watching for stall</span>' : ""}
+        ${llm.phase_started_ts ? `<span class="queue-pill" data-tone="blue"><span ${relativeMsAttrs({ startTimestamp: llm.active ? llm.phase_started_ts : null, fixedMs: llm.active ? null : llm.latency_ms })}>${escapeHtml(fmtMs(llm.active ? ((Date.now() / 1000) - Number(llm.phase_started_ts)) * 1000 : llm.latency_ms))}</span></span>` : ""}
+        <span class="queue-pill" data-tone="red" data-stuck-pill ${stuck ? "" : "hidden"}>watching for stall</span>
       </div>
     `;
     card.addEventListener("click", () => {
@@ -1352,7 +1411,7 @@ function renderLlmLivePanel() {
   const liveLatency = llm?.phase_started_ts
     ? (llm.active ? ((Date.now() / 1000) - Number(llm.phase_started_ts)) * 1000 : llm.latency_ms)
     : (lastLlmLayer?.data?._latency_ms || state.status?.llm?.last_latency_ms);
-  meta.textContent = `${llmPhaseLabel(llm?.phase || lastLlmLayer?.status || "complete")} • ${fmtMs(liveLatency)}`;
+  meta.innerHTML = `${escapeHtml(llmPhaseLabel(llm?.phase || lastLlmLayer?.status || "complete"))} • <span ${relativeMsAttrs({ startTimestamp: llm?.active ? llm?.phase_started_ts : null, fixedMs: llm?.active ? null : liveLatency })}>${escapeHtml(fmtMs(liveLatency))}</span>`;
 
   const phases = llm?.history?.length
     ? llm.history
@@ -1366,7 +1425,10 @@ function renderLlmLivePanel() {
 
   root.innerHTML = `
     <article class="llm-live-card">
-      <strong>${escapeHtml(trace?.event ? eventTitle(trace.event) : eventTitle(queueItem?.event))}</strong>
+      <div class="detail-card-head">
+        <strong>${escapeHtml(trace?.event ? eventTitle(trace.event) : eventTitle(queueItem?.event))}</strong>
+        <button type="button" class="btn btn-ghost btn-small" data-copy-llm>Copy</button>
+      </div>
       <p>${escapeHtml(queueItem?.status === "processing" ? `Currently in ${stageLabel(queueItem?.current_stage)}.` : "Latest LLM output for the selected trace.")}</p>
       <pre>${escapeHtml(liveText || "(no LLM tokens yet)")}</pre>
       <div class="llm-phase-list">
@@ -1374,7 +1436,7 @@ function renderLlmLivePanel() {
           <div class="llm-phase">
             <div class="llm-phase-head">
               <strong>${escapeHtml(llmPhaseLabel(phase.phase || phase.status))}</strong>
-              <span>${escapeHtml(fmtMs(phase.latency_ms || (phase.started_ts ? ((Date.now() / 1000) - Number(phase.started_ts)) * 1000 : null)))}</span>
+              <span ${relativeMsAttrs({ startTimestamp: phase.latency_ms ? null : phase.started_ts, fixedMs: phase.latency_ms || null })}>${escapeHtml(fmtMs(phase.latency_ms || (phase.started_ts ? ((Date.now() / 1000) - Number(phase.started_ts)) * 1000 : null)))}</span>
             </div>
             <p>${escapeHtml(truncate(phase.text || "(no output)", 220))}</p>
           </div>
@@ -1382,6 +1444,13 @@ function renderLlmLivePanel() {
       </div>
     </article>
   `;
+  root.querySelector("[data-copy-llm]")?.addEventListener("click", async () => {
+    try {
+      await copyText(liveText || "");
+    } catch (error) {
+      console.error(error);
+    }
+  });
 }
 
 function renderRulesPanel() {
@@ -1592,6 +1661,7 @@ function renderDetailDrawer() {
 
   drawer.classList.add("is-open");
   byId("detail-title").textContent = `${STAGE_META[state.selectedStageId].title} · ${option.title}`;
+  const rawText = JSON.stringify(option.raw || {}, null, 2);
   byId("detail-body").innerHTML = `
     <section class="detail-card">
       <h3>Selection</h3>
@@ -1618,10 +1688,75 @@ function renderDetailDrawer() {
       ${detailRows}
     </section>
     <section class="detail-card">
-      <h3>Raw Data</h3>
-      <pre class="json-block">${escapeHtml(JSON.stringify(option.raw || {}, null, 2))}</pre>
+      <div class="detail-card-head">
+        <h3>Raw Data</h3>
+        <button type="button" class="btn btn-ghost btn-small" data-copy-detail>Copy</button>
+      </div>
+      <pre class="json-block">${escapeHtml(rawText)}</pre>
     </section>
   `;
+  drawer.querySelector("[data-copy-detail]")?.addEventListener("click", async () => {
+    try {
+      await copyText(rawText);
+    } catch (error) {
+      console.error(error);
+    }
+  });
+}
+
+function renderLiveShell() {
+  renderStatusStrip();
+  renderHeroMetrics();
+  renderStageCards();
+  renderProgress();
+  renderQueuePanel();
+  renderLlmLivePanel();
+  renderRulesPanel();
+  renderDetailDrawer();
+  updateCanvasSize();
+  drawConnections();
+  updateProgressVisuals();
+  refreshRelativeTimers();
+}
+
+function scheduleRender(mode = "full", { animate = false } = {}) {
+  if (mode === "full") renderQueueState.full = true;
+  else renderQueueState.live = true;
+  renderQueueState.animate = renderQueueState.animate || animate;
+  if (renderQueueState.frame) return;
+  renderQueueState.frame = window.requestAnimationFrame(() => {
+    renderQueueState.frame = 0;
+    const doFull = renderQueueState.full;
+    const doLive = renderQueueState.live;
+    const shouldAnimate = renderQueueState.animate;
+    renderQueueState.full = false;
+    renderQueueState.live = false;
+    renderQueueState.animate = false;
+    if (doFull) renderAll();
+    else if (doLive) renderLiveShell();
+    if (shouldAnimate && primaryTrace()) animateTrace(false);
+  });
+}
+
+function refreshRelativeTimers() {
+  for (const el of document.querySelectorAll("[data-elapsed-seconds-from]")) {
+    el.textContent = elapsedSeconds(el.dataset.elapsedSecondsFrom, el.dataset.elapsedSecondsTo || null);
+  }
+  for (const el of document.querySelectorAll("[data-elapsed-ms-from], [data-elapsed-ms-fixed]")) {
+    const fixed = el.dataset.elapsedMsFixed;
+    if (fixed != null && fixed !== "") {
+      el.textContent = fmtMs(Number(fixed));
+      continue;
+    }
+    el.textContent = fmtMs(((Date.now() / 1000) - Number(el.dataset.elapsedMsFrom || 0)) * 1000);
+  }
+  for (const item of document.querySelectorAll(".queue-item[data-queue-status='processing'][data-stage-started-ts]")) {
+    const stageStarted = Number(item.dataset.stageStartedTs || 0);
+    const currentStage = item.dataset.currentStage || "";
+    const stuck = stageStarted && ((Date.now() / 1000) - stageStarted) > (currentStage === "llm_reasoner" ? 8 : 5);
+    item.classList.toggle("is-stuck", !!stuck);
+    item.querySelector("[data-stuck-pill]")?.toggleAttribute("hidden", !stuck);
+  }
 }
 
 function renderAll() {
@@ -1639,6 +1774,7 @@ function renderAll() {
   updateCanvasSize();
   drawConnections();
   updateProgressVisuals();
+  refreshRelativeTimers();
 }
 
 function defaultLayout(width, height) {
@@ -1972,6 +2108,7 @@ function animateParticles(now) {
 
 function initializeInteractions() {
   interact(".stage-card").draggable({
+    allowFrom: ".stage-head",
     modifiers: [
       interact.modifiers.restrictRect({ restriction: "parent", endOnly: true }),
     ],
@@ -2119,6 +2256,35 @@ function resetRuleForm() {
   setFormStatus("Build rules around actions, presence, time of day, and command output.");
 }
 
+function applyTraceProgressUpdate(payload) {
+  if (!payload?.trace) return;
+  upsertTrace(payload.trace);
+  state.queue = payload.queue || state.queue;
+  if (state.autoFollow || !state.selectedTraceId || state.selectedTraceId === payload.trace.event.event_id) {
+    state.selectedTraceId = payload.trace.event.event_id;
+    if (payload.progress?.current_stage && STAGE_ORDER.includes(payload.progress.current_stage)) {
+      state.selectedStageId = payload.progress.current_stage;
+    }
+    if (!state.detailOpen) state.selectedOptionId = null;
+  }
+  rebuildStageModels();
+  scheduleRender("live");
+  if (payload.progress?.current_stage && STAGE_ORDER.includes(payload.progress.current_stage)) {
+    showProgressThroughStage(payload.progress.current_stage);
+  }
+}
+
+function queueTraceProgress(payload) {
+  streamState.pendingProgress = payload;
+  if (streamState.progressTimer) return;
+  streamState.progressTimer = window.setTimeout(() => {
+    streamState.progressTimer = 0;
+    const next = streamState.pendingProgress;
+    streamState.pendingProgress = null;
+    applyTraceProgressUpdate(next);
+  }, STREAM_PROGRESS_RENDER_MS);
+}
+
 function connectStream() {
   if (state.eventSource) state.eventSource.close();
   const source = new EventSource("/api/brain/stream");
@@ -2138,7 +2304,7 @@ function connectStream() {
     const payload = JSON.parse(message.data);
     if (payload.type === "bootstrap") {
       applySnapshot(payload);
-      renderAll();
+      scheduleRender("full");
       if (primaryTrace()) animateTrace(true);
       return;
     }
@@ -2150,39 +2316,29 @@ function connectStream() {
         state.selectedStageId = "start";
         state.selectedOptionId = null;
         rebuildStageModels();
-        renderAll();
+        scheduleRender("full");
         showPendingTracePreview();
       } else {
-        renderWorldState();
+        scheduleRender("full");
       }
       return;
     }
     if (payload.type === "queue") {
       state.queue = payload.queue || state.queue;
       rebuildStageModels();
-      renderStatusStrip();
-      renderQueuePanel();
-      renderLlmLivePanel();
+      scheduleRender("live");
       return;
     }
     if (payload.type === "trace_progress" && payload.trace) {
-      upsertTrace(payload.trace);
-      state.queue = payload.queue || state.queue;
-      if (state.autoFollow || !state.selectedTraceId || state.selectedTraceId === payload.trace.event.event_id) {
-        state.selectedTraceId = payload.trace.event.event_id;
-        if (payload.progress?.current_stage && STAGE_ORDER.includes(payload.progress.current_stage)) {
-          state.selectedStageId = payload.progress.current_stage;
-        }
-        if (!state.detailOpen) state.selectedOptionId = null;
-      }
-      rebuildStageModels();
-      renderAll();
-      if (payload.progress?.current_stage && STAGE_ORDER.includes(payload.progress.current_stage)) {
-        showProgressThroughStage(payload.progress.current_stage);
-      }
+      queueTraceProgress(payload);
       return;
     }
     if (payload.type === "trace" && payload.trace) {
+      if (streamState.progressTimer) {
+        window.clearTimeout(streamState.progressTimer);
+        streamState.progressTimer = 0;
+      }
+      streamState.pendingProgress = null;
       upsertTrace(payload.trace);
       state.status = payload.status || state.status;
       state.world = payload.world || state.world;
@@ -2196,8 +2352,7 @@ function connectStream() {
         state.selectedOptionId = null;
       }
       rebuildStageModels();
-      renderAll();
-      animateTrace(false);
+      scheduleRender("full", { animate: true });
       return;
     }
     if (payload.type === "rules") {
@@ -2205,7 +2360,7 @@ function connectStream() {
       state.pending = payload.pending || state.pending;
       state.status = payload.status || state.status;
       rebuildStageModels();
-      renderAll();
+      scheduleRender("full");
       return;
     }
     if (payload.type === "pending") {
@@ -2213,7 +2368,7 @@ function connectStream() {
       state.actions = payload.actions || state.actions;
       state.status = payload.status || state.status;
       rebuildStageModels();
-      renderAll();
+      scheduleRender("full");
     }
   };
 }
@@ -2274,13 +2429,12 @@ async function boot() {
   initializeInteractions();
   connectStream();
   await refreshDashboard(false);
-  renderAll();
   animateTrace(true);
   bootAnimation();
   window.addEventListener("resize", handleResize);
   window.setInterval(() => {
-    renderQueuePanel();
-    renderLlmLivePanel();
+    if (hasActiveTextSelection()) return;
+    refreshRelativeTimers();
   }, 500);
   window.requestAnimationFrame(animateParticles);
 }

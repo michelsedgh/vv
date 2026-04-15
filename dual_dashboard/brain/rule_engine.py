@@ -354,17 +354,38 @@ class RuleEngine:
         """Get recent rule fire history for dashboard."""
         return self._fire_history[-count:]
 
-    def rules_summary_for_llm(self) -> str:
+    def rules_summary_for_llm(self, *, max_rules: Optional[int] = None, unique_only: bool = False) -> str:
         """Format rules summary for LLM context."""
         if not self._rules:
             return "No rules defined yet."
+        rules = list(self._rules)
+        if unique_only:
+            seen = set()
+            unique_rules = []
+            for rule in rules:
+                fingerprint = (
+                    str(rule.get("description", "")).strip().lower(),
+                    str(rule.get("trigger", {}).get("type", "")).strip().lower(),
+                    str(rule.get("action", {}).get("command", "")).strip().lower(),
+                    str(rule.get("permission", "ask")).strip().lower(),
+                )
+                if fingerprint in seen:
+                    continue
+                seen.add(fingerprint)
+                unique_rules.append(rule)
+            rules = unique_rules
+        if max_rules is not None:
+            rules = rules[:max_rules]
         lines = []
-        for rule in self._rules:
+        for rule in rules:
             status = "active" if rule.get("active") else "disabled"
             lines.append(
                 f"- [{rule['id']}] {rule.get('description', 'no description')} "
                 f"(permission={rule.get('permission', 'ask')}, {status})"
             )
+        skipped = len(self._rules) - len(rules)
+        if skipped > 0:
+            lines.append(f"- ... {skipped} additional rules omitted for brevity")
         return "\n".join(lines)
 
     def _trigger_matches(self, trigger: dict, event: Event) -> bool:

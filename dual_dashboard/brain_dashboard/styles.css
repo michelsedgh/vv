@@ -409,8 +409,7 @@ body::after {
   box-shadow:
     inset 0 1px 0 rgba(255, 255, 255, 0.04),
     0 18px 50px rgba(0, 0, 0, 0.3);
-  user-select: none;
-  cursor: grab;
+  user-select: text;
   z-index: 2;
 }
 
@@ -428,7 +427,6 @@ body::after {
 }
 
 .stage-card.is-dragging {
-  cursor: grabbing;
   box-shadow:
     0 18px 58px rgba(0, 0, 0, 0.4),
     0 0 34px rgba(77, 184, 255, 0.18);
@@ -467,7 +465,8 @@ body::after {
 .trace-head,
 .rule-head,
 .feed-head,
-.drawer-head {
+.drawer-head,
+.detail-card-head {
   display: flex;
   justify-content: space-between;
   gap: 10px;
@@ -476,6 +475,12 @@ body::after {
 
 .stage-head {
   margin-bottom: 14px;
+  cursor: grab;
+  user-select: none;
+}
+
+.stage-card.is-dragging .stage-head {
+  cursor: grabbing;
 }
 
 .stage-kicker,

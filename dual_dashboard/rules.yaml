@@ -399,3 +399,149 @@ rules:
   created_by: michel
   active: true
   created_at: '2026-04-15T02:29:40'
+- id: rule_turn_off_lights_on_leave_michel_new_ff66
+  description: Turn off all lights when michel leaves.
+  trigger:
+    type: person_left
+    action: person_left
+    who: michel
+    conditions:
+    - time_of_day:
+      - night
+  action:
+    type: smart_home
+    command: turn_off_all_lights
+    params: {}
+  permission: auto
+  cooldown_sec: 60
+  expires: null
+  created_by: michel
+  active: true
+  created_at: '2026-04-15T02:34:58'
+- id: rule_turn_off_lights_on_leave_michel_new_b083
+  description: Turn off all lights when michel leaves.
+  trigger:
+    type: person_left
+    action: person_left
+    who: michel
+    conditions:
+    - time_of_day:
+      - night
+  action:
+    type: smart_home
+    command: turn_off_all_lights
+    params: {}
+  permission: auto
+  cooldown_sec: 60
+  expires: null
+  created_by: michel
+  active: true
+  created_at: '2026-04-15T02:37:35'
+- id: rule_turn_off_lights_on_leave_michel_6ac3
+  description: Turn off all lights when michel leaves.
+  trigger:
+    type: person_left
+    action: person_left
+    who: michel
+    conditions:
+    - time_of_day:
+      - night
+  action:
+    type: smart_home
+    command: turn_off_all_lights
+    params: {}
+  permission: auto
+  cooldown_sec: 60
+  expires: null
+  created_by: michel
+  active: true
+  created_at: '2026-04-15T02:40:45'
+- id: rule_turn_off_lights_when_michel_leaves
+  description: Turn off all lights when Michel leaves.
+  trigger:
+    type: person_left
+    action: leave
+    who: michel
+    conditions: []
+  action:
+    type: smart_home
+    command: turn_off_all_lights
+    params: {}
+  permission: auto
+  cooldown_sec: 60
+  expires: null
+  created_by: michel
+  active: true
+  created_at: '2026-04-15T02:46:34'
+- id: rule_turn_off_lights_when_michel_leaves_44f1
+  description: Turn off all lights when Michel leaves.
+  trigger:
+    type: person_left
+    action: leave
+    who: michel
+    conditions: []
+  action:
+    type: smart_home
+    command: turn_off_all_lights
+    params: {}
+  permission: auto
+  cooldown_sec: 60
+  expires: null
+  created_by: michel
+  active: true
+  created_at: '2026-04-15T02:54:53'
+- id: rule_turn_off_all_lights_when_michel_leaves
+  description: Turn off all lights when Michel leaves.
+  trigger:
+    type: person_left
+    action: leave
+    who: michel
+    conditions:
+    - time_of_day:
+      - night
+  action:
+    type: smart_home
+    command: turn_off_all_lights
+    params: {}
+  permission: auto
+  cooldown_sec: 60
+  expires: null
+  created_by: michel
+  active: true
+  created_at: '2026-04-15T03:02:11'
+- id: rule_turn_off_lights_on_leave_michel_repetition
+  description: Turn off all lights when Michel leaves (repetition of previous request)
+  trigger:
+    type: person_left
+    action: turn_off_all_lights
+    who: michel
+    conditions:
+    - time_of_day:
+      - night
+  action:
+    type: smart_home
+    command: turn_off_all_lights
+    params: {}
+  permission: auto
+  cooldown_sec: 60
+  expires: null
+  created_by: michel
+  active: true
+  created_at: '2026-04-15T03:02:22'
+- id: rule_turn_off_lights_on_leave_michel_new_e14f
+  description: Turn off all lights when Michel leaves.
+  trigger:
+    type: person_left
+    action: light_status_change
+    who: michel
+    conditions: []
+  action:
+    type: smart_home
+    command: turn_off_all_lights
+    params: {}
+  permission: auto
+  cooldown_sec: 60
+  expires: null
+  created_by: michel
+  active: true
+  created_at: '2026-04-15T10:33:11'
