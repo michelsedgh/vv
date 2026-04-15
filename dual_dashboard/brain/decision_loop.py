@@ -434,6 +434,88 @@ class DecisionSystem:
         )
         await self._publish_trace_progress(trace, layer, status, details)
 
+    async def _process_rule_results(self, trace: DecisionTrace, rule_results: List[dict]) -> None:
+        """Apply deterministic rule outcomes to the executor."""
+        for result in rule_results:
+            decision = result.get("decision", "")
+
+            if decision.startswith("fire_"):
+                permission = result.get("permission", "ask")
+                action = result.get("action", {})
+                rule_id = result.get("rule_id", "")
+                rule_desc = result.get("rule_description", "")
+
+                if permission == "auto":
+                    exec_result = await self.executor.execute(action, rule_id, rule_desc)
+                    await self._record_layer(
+                        trace,
+                        "executor",
+                        "executed",
+                        f"Auto-executed: {rule_desc}",
+                        exec_result,
+                    )
+                    self._rules_fired += 1
+
+                elif permission == "notify":
+                    exec_result = await self.executor.execute(action, rule_id, rule_desc)
+                    await self.executor.notify(f"✓ {rule_desc}")
+                    await self._record_layer(
+                        trace,
+                        "executor",
+                        "executed_notified",
+                        f"Executed with notification: {rule_desc}",
+                        exec_result,
+                    )
+                    self._rules_fired += 1
+
+                elif permission == "ask":
+                    self.rules.add_pending_confirmation(rule_id, action, rule_desc)
+                    await self.executor.ask(f"Should I {rule_desc.lower()}?", rule_id)
+                    await self._record_layer(
+                        trace,
+                        "executor",
+                        "asked",
+                        f"Asking user: {rule_desc}",
+                        {"rule_id": rule_id},
+                    )
+
+                elif permission == "suggest":
+                    await self.executor.notify(f"💡 Suggestion: {rule_desc}")
+                    await self._record_layer(
+                        trace,
+                        "executor",
+                        "suggested",
+                        f"Suggestion sent: {rule_desc}",
+                    )
+
+            elif decision == "cooldown":
+                await self._record_layer(
+                    trace,
+                    "rule_engine",
+                    "cooldown",
+                    f"Rule {result['rule_id']} in cooldown: {result.get('details', '')}",
+                )
+
+            elif decision == "conditions_not_met":
+                await self._record_layer(
+                    trace,
+                    "rule_engine",
+                    "conditions_unmet",
+                    f"Rule {result['rule_id']} conditions not met",
+                )
+
+    async def _handle_user_response(self, event: Event, trace: DecisionTrace) -> None:
+        """Resolve a pending ask/suggest style confirmation."""
+        rule_id = event.data.get("rule_id", "")
+        approved = event.data.get("answer", "").lower() in ("yes", "yeah", "yep", "go ahead", "do it", "sure", "ok")
+        result = self.rules.confirm_pending(rule_id, approved)
+        if result and result.get("approved") and result.get("action"):
+            exec_result = await self.executor.execute(result["action"], rule_id)
+            await self._record_layer(trace, "executor", "confirmed", f"User confirmed rule {rule_id}", exec_result)
+            self._rules_fired += 1
+        elif result:
+            await self._record_layer(trace, "executor", "rejected", f"User rejected rule {rule_id}")
+
     def _complete_queue_item(self, trace: DecisionTrace, status: str, details: str) -> None:
         entry = self._set_queue_stage(
             trace.event,
@@ -539,111 +621,39 @@ class DecisionSystem:
             derived_event = Event(type=de["type"], data=de.get("data", {}))
             await self.bus.publish(derived_event)
 
-        # ── Layer 3: Rule Engine ──
-        rule_results = self.rules.evaluate(event)
+        rule_results: List[dict] = []
 
-        # Also evaluate derived events
-        for de in derived_events:
-            derived_event = Event(type=de["type"], data=de.get("data", {}))
-            rule_results.extend(self.rules.evaluate(derived_event))
+        # Speech needs to be classified before generic rule evaluation.
+        if event.type == "speech_text":
+            if self.llm._available:
+                await self._handle_speech(event, trace)
+            else:
+                await self._record_layer(trace, "llm_reasoner", "offline", "Speech arrived, but the LLM is offline.")
 
-        if rule_results:
-            await self._record_layer(
-                trace,
-                "rule_engine",
-                "evaluated",
-                f"{len(rule_results)} rule(s) matched",
-                {"results": rule_results},
-            )
+        elif event.type == "user_response":
+            await self._handle_user_response(event, trace)
+
         else:
-            await self._record_layer(trace, "rule_engine", "no_match", "No rules triggered")
+            # ── Layer 3: Rule Engine ──
+            rule_results = self.rules.evaluate(event)
 
-        # ── Process rule results ──
-        for result in rule_results:
-            decision = result.get("decision", "")
+            # Also evaluate derived events
+            for de in derived_events:
+                derived_event = Event(type=de["type"], data=de.get("data", {}))
+                rule_results.extend(self.rules.evaluate(derived_event))
 
-            if decision.startswith("fire_"):
-                permission = result.get("permission", "ask")
-                action = result.get("action", {})
-                rule_id = result.get("rule_id", "")
-                rule_desc = result.get("rule_description", "")
-
-                if permission == "auto":
-                    exec_result = await self.executor.execute(action, rule_id, rule_desc)
-                    await self._record_layer(
-                        trace,
-                        "executor",
-                        "executed",
-                        f"Auto-executed: {rule_desc}",
-                        exec_result,
-                    )
-                    self._rules_fired += 1
-
-                elif permission == "notify":
-                    exec_result = await self.executor.execute(action, rule_id, rule_desc)
-                    await self.executor.notify(f"✓ {rule_desc}")
-                    await self._record_layer(
-                        trace,
-                        "executor",
-                        "executed_notified",
-                        f"Executed with notification: {rule_desc}",
-                        exec_result,
-                    )
-                    self._rules_fired += 1
-
-                elif permission == "ask":
-                    self.rules.add_pending_confirmation(rule_id, action, rule_desc)
-                    await self.executor.ask(f"Should I {rule_desc.lower()}?", rule_id)
-                    await self._record_layer(
-                        trace,
-                        "executor",
-                        "asked",
-                        f"Asking user: {rule_desc}",
-                        {"rule_id": rule_id},
-                    )
-
-                elif permission == "suggest":
-                    await self.executor.notify(f"💡 Suggestion: {rule_desc}")
-                    await self._record_layer(
-                        trace,
-                        "executor",
-                        "suggested",
-                        f"Suggestion sent: {rule_desc}",
-                    )
-
-            elif decision == "cooldown":
+            if rule_results:
                 await self._record_layer(
                     trace,
                     "rule_engine",
-                    "cooldown",
-                    f"Rule {result['rule_id']} in cooldown: {result.get('details', '')}",
+                    "evaluated",
+                    f"{len(rule_results)} rule(s) matched",
+                    {"results": rule_results},
                 )
+            else:
+                await self._record_layer(trace, "rule_engine", "no_match", "No rules triggered")
 
-            elif decision == "conditions_not_met":
-                await self._record_layer(
-                    trace,
-                    "rule_engine",
-                    "conditions_unmet",
-                    f"Rule {result['rule_id']} conditions not met",
-                )
-
-        # ── Layer 4: LLM (for speech events) ──
-        if event.type == "speech_text" and self.llm._available:
-            await self._handle_speech(event, trace)
-        elif event.type == "speech_text":
-            await self._record_layer(trace, "llm_reasoner", "offline", "Speech arrived, but the LLM is offline.")
-
-        # ── Handle user responses to confirmation requests ──
-        if event.type == "user_response":
-            rule_id = event.data.get("rule_id", "")
-            approved = event.data.get("answer", "").lower() in ("yes", "yeah", "yep", "go ahead", "do it", "sure", "ok")
-            result = self.rules.confirm_pending(rule_id, approved)
-            if result and result.get("approved") and result.get("action"):
-                exec_result = await self.executor.execute(result["action"], rule_id)
-                await self._record_layer(trace, "executor", "confirmed", f"User confirmed rule {rule_id}", exec_result)
-                self._rules_fired += 1
-            elif result:
-                await self._record_layer(trace, "executor", "rejected", f"User rejected rule {rule_id}")
+            await self._process_rule_results(trace, rule_results)
 
         # ── Finalize trace ──
         fired = any(r.get("decision", "").startswith("fire_") for r in rule_results)
@@ -651,6 +661,8 @@ class DecisionSystem:
             trace.final_decision = "rule_fired"
         elif event.type == "speech_text":
             trace.final_decision = "speech_processed"
+        elif event.type == "user_response":
+            trace.final_decision = "confirmation_processed"
         else:
             trace.final_decision = "state_updated"
 
@@ -767,16 +779,37 @@ class DecisionSystem:
             # Add as a new rule
             rule_result.pop("_raw_response", None)
             rule_result.pop("_latency_ms", None)
-            rule_result.setdefault("created_by", speaker)
-            new_rule = self.rules.add_rule(rule_result)
-            await self.executor.notify(f"✓ New rule created: {new_rule.get('description', '')}")
-            await self._record_layer(
-                trace,
-                "rule_engine",
-                "rule_created",
-                f"New rule: {new_rule.get('description', '')}",
-                new_rule,
-            )
+            upsert_result = self.rules.upsert_rule(rule_result, speaker=speaker, source_text=text)
+            final_rule = upsert_result.get("rule", {})
+            upsert_status = upsert_result.get("status", "created")
+
+            if upsert_status == "created":
+                await self.executor.notify(f"✓ New rule created: {final_rule.get('description', '')}")
+                await self._record_layer(
+                    trace,
+                    "rule_engine",
+                    "rule_created",
+                    f"New rule: {final_rule.get('description', '')}",
+                    {**upsert_result, "rule": final_rule},
+                )
+            elif upsert_status == "reactivated":
+                await self.executor.notify(f"✓ Existing rule reactivated: {final_rule.get('description', '')}")
+                await self._record_layer(
+                    trace,
+                    "rule_engine",
+                    "rule_reactivated",
+                    f"Existing rule reactivated: {final_rule.get('description', '')}",
+                    {**upsert_result, "rule": final_rule},
+                )
+            else:
+                await self.executor.notify(f"✓ Rule already existed: {final_rule.get('description', '')}")
+                await self._record_layer(
+                    trace,
+                    "rule_engine",
+                    "rule_existing",
+                    f"Matched existing rule: {final_rule.get('description', '')}",
+                    {**upsert_result, "rule": final_rule},
+                )
 
         elif intent == "modify_rule":
             self._llm_calls += 1

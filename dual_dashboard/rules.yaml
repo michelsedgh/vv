@@ -102,7 +102,6 @@ rules:
   description: Turn off all lights when a person leaves.
   trigger:
     type: person_left
-    action: person_left
     who: michel
     conditions:
     - time_of_day:
@@ -122,7 +121,6 @@ rules:
   description: Turn off all lights when a person leaves.
   trigger:
     type: person_left
-    action: person_left
     who: michel
     conditions:
     - time_of_day:
@@ -142,7 +140,6 @@ rules:
   description: Turn off all lights when michel leaves.
   trigger:
     type: person_left
-    action: michel
     conditions: []
   action:
     type: smart_home
@@ -158,9 +155,6 @@ rules:
   description: Turn off all lights when michel leaves.
   trigger:
     type: person_left
-    action: michel
-    action_in:
-    - rule_turn_off_lights_on_leave
     conditions: []
   action:
     type: smart_home
@@ -176,9 +170,6 @@ rules:
   description: Turn off all lights when michel leaves.
   trigger:
     type: person_left
-    action: michel
-    action_in:
-    - person_left
     conditions: []
   action:
     type: smart_home
@@ -194,7 +185,6 @@ rules:
   description: Turn off all lights when michel leaves.
   trigger:
     type: person_left
-    action: michel
     conditions:
     - people_present_any: false
   action:
@@ -211,9 +201,6 @@ rules:
   description: Turn off all lights when michel leaves.
   trigger:
     type: person_left
-    action: michel
-    action_in:
-    - rule_turn_off_lights_on_leave
     conditions:
     - time_of_day:
       - night
@@ -231,7 +218,6 @@ rules:
   description: Turn off all lights when michel leaves.
   trigger:
     type: person_left
-    action: person_left
     who: michel
     conditions:
     - time_of_day:
@@ -250,9 +236,6 @@ rules:
   description: Turn off all lights when michel leaves.
   trigger:
     type: person_left
-    action: michel
-    action_in:
-    - all_lights
     conditions:
     - time_of_day:
       - night
@@ -270,7 +253,6 @@ rules:
   description: Turn off all lights when michel leaves.
   trigger:
     type: person_left
-    action: person_left
     who: michel
     conditions:
     - time_of_day:
@@ -289,7 +271,6 @@ rules:
   description: Turn off all lights when michel leaves.
   trigger:
     type: person_left
-    action: person_left
     who: michel
     conditions:
     - time_of_day:
@@ -308,7 +289,6 @@ rules:
   description: Turn off all lights when michel leaves.
   trigger:
     type: person_left
-    action: person_left
     who: michel
     conditions:
     - time_of_day:
@@ -327,7 +307,6 @@ rules:
   description: Turn off all lights when michel leaves.
   trigger:
     type: person_left
-    action: person_left
     who: michel
     conditions:
     - time_of_day:
@@ -346,7 +325,6 @@ rules:
   description: Turn off all lights when michel leaves.
   trigger:
     type: person_left
-    action: person_left
     who: michel
     conditions:
     - time_of_day:
@@ -365,7 +343,6 @@ rules:
   description: Turn off all lights when michel leaves.
   trigger:
     type: person_left
-    action: person_left
     who: michel
     conditions:
     - time_of_day:
@@ -384,7 +361,6 @@ rules:
   description: Turn off all lights when michel leaves.
   trigger:
     type: person_left
-    action: person_left
     who: michel
     conditions:
     - time_of_day:
@@ -403,7 +379,6 @@ rules:
   description: Turn off all lights when michel leaves.
   trigger:
     type: person_left
-    action: person_left
     who: michel
     conditions:
     - time_of_day:
@@ -422,7 +397,6 @@ rules:
   description: Turn off all lights when michel leaves.
   trigger:
     type: person_left
-    action: person_left
     who: michel
     conditions:
     - time_of_day:
@@ -441,7 +415,6 @@ rules:
   description: Turn off all lights when michel leaves.
   trigger:
     type: person_left
-    action: person_left
     who: michel
     conditions:
     - time_of_day:
@@ -460,7 +433,6 @@ rules:
   description: Turn off all lights when Michel leaves.
   trigger:
     type: person_left
-    action: leave
     who: michel
     conditions: []
   action:
@@ -477,7 +449,6 @@ rules:
   description: Turn off all lights when Michel leaves.
   trigger:
     type: person_left
-    action: leave
     who: michel
     conditions: []
   action:
@@ -494,7 +465,6 @@ rules:
   description: Turn off all lights when Michel leaves.
   trigger:
     type: person_left
-    action: leave
     who: michel
     conditions:
     - time_of_day:
@@ -513,7 +483,6 @@ rules:
   description: Turn off all lights when Michel leaves (repetition of previous request)
   trigger:
     type: person_left
-    action: turn_off_all_lights
     who: michel
     conditions:
     - time_of_day:
@@ -532,7 +501,6 @@ rules:
   description: Turn off all lights when Michel leaves.
   trigger:
     type: person_left
-    action: light_status_change
     who: michel
     conditions: []
   action:

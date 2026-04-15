@@ -1127,6 +1127,73 @@ class TestEdgeCases:
 
 
 class TestLatencyGuards:
+    @pytest.mark.asyncio
+    async def test_speech_event_skips_generic_rule_engine_before_reasoning(self, tmp_path):
+        bus = EventBus()
+        system = DecisionSystem(bus, rules_path=str(tmp_path / "rules.yaml"), lm_studio_url="http://fake:1234")
+        system.llm._available = False
+        pushed = []
+
+        async def callback(payload):
+            pushed.append(payload)
+
+        system.set_dashboard_callback(callback)
+        await system._process_event(Event(type="speech_text", data={"who": "michel", "text": "turn off all lights when I leave"}))
+
+        trace = pushed[-1]["trace"]
+        layers = [layer["layer"] for layer in trace["layers"]]
+        assert "llm_reasoner" in layers
+        assert "rule_engine" not in layers
+
+    def test_non_action_trigger_fields_are_sanitized(self, tmp_path):
+        world = WorldState()
+        engine = RuleEngine(str(tmp_path / "rules.yaml"), world)
+        rule = engine.sanitize_rule({
+            "id": "leave_rule",
+            "description": "Turn off all lights when michel leaves.",
+            "trigger": {
+                "type": "person_left",
+                "action": "person_left",
+                "action_in": ["leave"],
+                "who": "michel",
+                "conditions": [],
+            },
+            "action": {"type": "smart_home", "command": "turn_off_all_lights", "params": {}},
+            "permission": "auto",
+        })
+        assert rule["trigger"]["type"] == "person_left"
+        assert "action" not in rule["trigger"]
+        assert "action_in" not in rule["trigger"]
+
+    def test_upsert_rule_prevents_duplicate_repeated_rule(self, tmp_path):
+        world = WorldState()
+        engine = RuleEngine(str(tmp_path / "rules.yaml"), world)
+        engine._rules = []
+
+        candidate = {
+            "id": "rule_turn_off_all_lights_when_michel_leaves",
+            "description": "Turn off all lights when Michel leaves.",
+            "trigger": {
+                "type": "person_left",
+                "action": "leave",
+                "who": "michel",
+                "conditions": [],
+            },
+            "action": {
+                "type": "smart_home",
+                "command": "turn_off_all_lights",
+                "params": {},
+            },
+            "permission": "auto",
+        }
+
+        created = engine.upsert_rule(candidate, speaker="michel", source_text="turn off all lights when I leave")
+        repeated = engine.upsert_rule(candidate, speaker="michel", source_text="turn off all lights when I leave")
+
+        assert created["status"] == "created"
+        assert repeated["status"] in ("duplicate", "reactivated")
+        assert len(engine.rules) == 1
+
     def test_fast_intent_guess_short_circuits_common_automation_phrase(self, tmp_path):
         bus = EventBus()
         system = DecisionSystem(bus, rules_path=str(tmp_path / "rules.yaml"), lm_studio_url="http://fake:1234")

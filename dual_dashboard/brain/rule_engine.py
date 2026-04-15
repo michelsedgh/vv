@@ -19,6 +19,7 @@ Permission model:
 from __future__ import annotations
 
 import copy
+import json
 import logging
 import time
 import uuid
@@ -146,7 +147,12 @@ class RuleEngine:
             try:
                 with open(self.rules_path) as f:
                     data = yaml.safe_load(f) or {}
-                self._rules = data.get("rules", [])
+                loaded_rules = data.get("rules", [])
+                sanitized_rules = [self.sanitize_rule(rule) for rule in loaded_rules]
+                self._rules = sanitized_rules
+                if sanitized_rules != loaded_rules:
+                    self._save_rules()
+                    log.info("Sanitized %d rule definitions while loading %s", len(sanitized_rules), self.rules_path)
                 log.info("Loaded %d rules from %s", len(self._rules), self.rules_path)
                 return
             except Exception as exc:
@@ -173,8 +179,168 @@ class RuleEngine:
                 return copy.deepcopy(rule)
         return None
 
+    def _canonicalize(self, value: Any) -> Any:
+        if isinstance(value, dict):
+            cleaned = {}
+            for key in sorted(value):
+                child = self._canonicalize(value[key])
+                if child in ("", None, [], {}):
+                    continue
+                cleaned[str(key)] = child
+            return cleaned
+        if isinstance(value, list):
+            items = [self._canonicalize(item) for item in value]
+            items = [item for item in items if item not in ("", None, [], {})]
+            return sorted(items, key=lambda item: json.dumps(item, sort_keys=True))
+        if isinstance(value, str):
+            return " ".join(value.strip().lower().split())
+        return value
+
+    def sanitize_rule(self, rule: dict) -> dict:
+        """Normalize a rule so invalid LLM fields do not make it unroutable."""
+        sanitized = copy.deepcopy(rule or {})
+        trigger = copy.deepcopy(sanitized.get("trigger") or {})
+        action = copy.deepcopy(sanitized.get("action") or {})
+
+        trigger_type = str(trigger.get("type", "") or "").strip()
+        trigger["type"] = trigger_type
+
+        conditions = trigger.get("conditions", [])
+        if not isinstance(conditions, list):
+            conditions = [conditions]
+        trigger["conditions"] = [copy.deepcopy(cond) for cond in conditions if isinstance(cond, dict)]
+
+        if trigger_type not in ("action_changed", "action_detected"):
+            # Non-action triggers should ignore action/action_in entirely.
+            trigger.pop("action", None)
+            trigger.pop("action_in", None)
+        else:
+            if "action" in trigger:
+                action_value = str(trigger.get("action") or "").strip()
+                if action_value:
+                    trigger["action"] = action_value
+                else:
+                    trigger.pop("action", None)
+            if "action_in" in trigger:
+                action_values = trigger.get("action_in")
+                if not isinstance(action_values, list):
+                    action_values = [action_values]
+                action_values = [str(item).strip() for item in action_values if str(item or "").strip()]
+                if action_values:
+                    trigger["action_in"] = action_values
+                else:
+                    trigger.pop("action_in", None)
+
+        if "who" in trigger:
+            who = str(trigger.get("who") or "").strip()
+            if who:
+                trigger["who"] = who
+            else:
+                trigger.pop("who", None)
+
+        action_type = str(action.get("type", "") or "").strip()
+        if action_type:
+            action["type"] = action_type
+        command = str(action.get("command", "") or "").strip()
+        if command:
+            action["command"] = command
+        elif "command" in action:
+            action.pop("command", None)
+        params = action.get("params")
+        action["params"] = copy.deepcopy(params) if isinstance(params, dict) else {}
+
+        sanitized["trigger"] = trigger
+        sanitized["action"] = action
+        sanitized["description"] = str(sanitized.get("description", "") or sanitized.get("id", "rule")).strip()
+
+        permission = str(sanitized.get("permission", "ask") or "ask").strip().lower()
+        sanitized["permission"] = permission if permission in ("auto", "notify", "ask", "suggest") else "ask"
+        sanitized["active"] = bool(sanitized.get("active", True))
+        try:
+            sanitized["cooldown_sec"] = max(0, int(sanitized.get("cooldown_sec", 60) or 0))
+        except (TypeError, ValueError):
+            sanitized["cooldown_sec"] = 60
+        sanitized["expires"] = sanitized.get("expires", None)
+        return sanitized
+
+    def _rule_exact_signature(self, rule: dict) -> str:
+        sanitized = self.sanitize_rule(rule)
+        payload = {
+            "trigger": sanitized.get("trigger", {}),
+            "action": sanitized.get("action", {}),
+            "permission": sanitized.get("permission", "ask"),
+            "expires": sanitized.get("expires"),
+        }
+        return json.dumps(self._canonicalize(payload), sort_keys=True)
+
+    def _rule_near_signature(self, rule: dict) -> str:
+        sanitized = self.sanitize_rule(rule)
+        trigger = sanitized.get("trigger", {})
+        action = sanitized.get("action", {})
+        payload = {
+            "description": sanitized.get("description", ""),
+            "trigger_type": trigger.get("type"),
+            "who": trigger.get("who"),
+            "action_type": action.get("type"),
+            "command": action.get("command"),
+            "params": action.get("params", {}),
+            "permission": sanitized.get("permission", "ask"),
+        }
+        return json.dumps(self._canonicalize(payload), sort_keys=True)
+
+    def find_equivalent_rule(self, rule: dict) -> Optional[dict]:
+        signature = self._rule_exact_signature(rule)
+        for existing in self._rules:
+            if self._rule_exact_signature(existing) == signature:
+                return copy.deepcopy(existing)
+        return None
+
+    def find_similar_rule(self, rule: dict) -> Optional[dict]:
+        signature = self._rule_near_signature(rule)
+        for existing in self._rules:
+            if self._rule_near_signature(existing) == signature:
+                return copy.deepcopy(existing)
+        return None
+
+    def upsert_rule(self, rule: dict, *, speaker: Optional[str] = None, source_text: str = "") -> dict:
+        """
+        Add a rule idempotently.
+
+        Repeated speech should not keep creating near-identical automations.
+        """
+        candidate = self.sanitize_rule(rule)
+        if speaker and not candidate.get("created_by"):
+            candidate["created_by"] = speaker
+
+        normalized_text = " ".join(str(source_text or "").lower().split())
+        trigger = candidate.setdefault("trigger", {})
+        if speaker and trigger.get("type") == "person_left" and not trigger.get("who"):
+            if any(phrase in normalized_text for phrase in ("when i leave", "after i leave", "once i leave", "whenever i leave")):
+                trigger["who"] = speaker
+
+        exact = self.find_equivalent_rule(candidate)
+        if exact:
+            refreshed = exact
+            if not exact.get("active", True):
+                refreshed = self.update_rule(exact["id"], {"active": True}) or exact
+                return {"status": "reactivated", "rule": refreshed, "matched_rule_id": exact["id"]}
+            return {"status": "duplicate", "rule": refreshed, "matched_rule_id": exact["id"]}
+
+        similar = self.find_similar_rule(candidate)
+        if similar:
+            refreshed = similar
+            if not similar.get("active", True):
+                refreshed = self.update_rule(similar["id"], {"active": True}) or similar
+                return {"status": "reactivated", "rule": refreshed, "matched_rule_id": similar["id"]}
+            return {"status": "duplicate", "rule": refreshed, "matched_rule_id": similar["id"]}
+
+        created = self.add_rule(candidate)
+        return {"status": "created", "rule": created, "matched_rule_id": None}
+
     def add_rule(self, rule: dict) -> dict:
         """Add a new rule. Returns the added rule."""
+        rule = self.sanitize_rule(rule)
+
         # Ensure required fields
         if "id" not in rule:
             rule["id"] = f"rule_{uuid.uuid4().hex[:8]}"
@@ -198,11 +364,14 @@ class RuleEngine:
         """Update fields of an existing rule."""
         for i, rule in enumerate(self._rules):
             if rule["id"] == rule_id:
-                rule.update(changes)
-                self._rules[i] = rule
+                updated_rule = copy.deepcopy(rule)
+                updated_rule.update(changes)
+                updated_rule = self.sanitize_rule(updated_rule)
+                updated_rule["id"] = rule_id
+                self._rules[i] = updated_rule
                 self._save_rules()
                 log.info("Updated rule %s: %s", rule_id, changes)
-                return copy.deepcopy(rule)
+                return copy.deepcopy(updated_rule)
         return None
 
     def delete_rule(self, rule_id: str) -> bool:
@@ -363,12 +532,7 @@ class RuleEngine:
             seen = set()
             unique_rules = []
             for rule in rules:
-                fingerprint = (
-                    str(rule.get("description", "")).strip().lower(),
-                    str(rule.get("trigger", {}).get("type", "")).strip().lower(),
-                    str(rule.get("action", {}).get("command", "")).strip().lower(),
-                    str(rule.get("permission", "ask")).strip().lower(),
-                )
+                fingerprint = self._rule_near_signature(rule)
                 if fingerprint in seen:
                     continue
                 seen.add(fingerprint)
