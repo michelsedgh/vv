@@ -57,6 +57,10 @@ class VoiceService:
         self._mic_stream = None
         self._cleanup_lock = threading.Lock()
         self._brain_active_speakers: Set[str] = set()
+        self._status_lock = threading.Lock()
+        self._phase = "idle"
+        self._status_message = "Voice is stopped"
+        self._last_error: Optional[str] = None
 
     def set_loop(self, loop: asyncio.AbstractEventLoop) -> None:
         self.loop = loop
@@ -179,12 +183,31 @@ class VoiceService:
         return self.config_payload()
 
     def status(self) -> dict:
+        with self._status_lock:
+            phase = self._phase
+            message = self._status_message
+            error = self._last_error
         return {
             "running": self.monitor.running,
+            "phase": phase,
+            "status_message": message,
+            "error": error,
             "step": self.monitor.step_count if self.monitor.running else 0,
             "infer_ms": round(self.monitor.last_infer_ms, 1) if self.monitor.running else None,
             "last_capture_dir": self.monitor.last_capture_dir,
         }
+
+    def _set_status(
+        self,
+        phase: str,
+        message: str,
+        *,
+        error: Optional[str] = None,
+    ) -> None:
+        with self._status_lock:
+            self._phase = str(phase)
+            self._status_message = str(message)
+            self._last_error = str(error) if error else None
 
     def _sanitize_slug(self, value: str, default: str = "clip") -> str:
         slug = re.sub(r"[^a-zA-Z0-9]+", "_", value.strip()).strip("_").lower()
@@ -496,6 +519,7 @@ class VoiceService:
             raise ValueError("Voice is already running")
         self._brain_active_speakers.clear()
         self.monitor.reset()
+        self._set_status("starting", "Starting Voice monitor...")
         self.monitor.running = True
         self._publish_brain_event("system_status", {"voice_running": True})
         self.monitor.thread = threading.Thread(target=self._run_monitor, daemon=True)
@@ -505,6 +529,7 @@ class VoiceService:
     def stop(self, wait: bool = True, timeout: float = 15.0) -> dict:
         if not self.monitor.running:
             raise ValueError("Voice is not running")
+        self._set_status("stopping", "Stopping Voice...")
         self.ws_event("status", message="Stopping Voice...")
         self.monitor.stop_event.set()
         mic_stream = self._mic_stream
@@ -582,19 +607,25 @@ class VoiceService:
             )
 
         enrolled = voice_source.load_enrolled_embeddings(cfg)
+        self._set_status("loading_model", "Loading Voice models...")
         self.ws_event("status", message="Loading Voice models...")
 
         try:
             with self.gpu_lock:
                 pipeline = RealtimePipeline(cfg, enrolled)
                 self._pipeline = pipeline
+            del enrolled
+            gc.collect()
+            trim_process_heap()
         except Exception as exc:
+            self._set_status("error", f"Voice init failed: {exc}", error=str(exc))
             self.ws_event("error", message=f"Voice init failed: {exc}")
             self.monitor.running = False
             self._publish_brain_event("system_status", {"voice_running": False})
             self._finalize_runtime_refs()
             return
 
+        self._set_status("opening_mic", "Voice ready. Starting mic capture...")
         self.ws_event("status", message="Voice ready. Starting mic capture...")
 
         audio_buffer = np.zeros(0, dtype=np.float32)
@@ -617,12 +648,14 @@ class VoiceService:
             mic_stream.start()
             self._mic_stream = mic_stream
         except Exception as exc:
+            self._set_status("error", f"Voice mic failed: {exc}", error=str(exc))
             self.ws_event("error", message=f"Voice mic failed: {exc}")
             self.monitor.running = False
             self._publish_brain_event("system_status", {"voice_running": False})
             self._finalize_runtime_refs()
             return
 
+        self._set_status("live", "Voice live.")
         self.ws_event("status", message="Voice live.")
 
         def broadcast_step_result(result) -> None:
@@ -712,6 +745,7 @@ class VoiceService:
                 if not drained:
                     time.sleep(0.05)
         except Exception as exc:
+            self._set_status("error", f"Voice monitor error: {exc}", error=str(exc))
             self.ws_event("error", message=f"Voice monitor error: {exc}")
         finally:
             try:
@@ -734,6 +768,10 @@ class VoiceService:
             self._pipeline = None
             self._mic_stream = None
             self._finalize_runtime_refs()
+            if self._last_error:
+                self._set_status("error", self._status_message, error=self._last_error)
+            else:
+                self._set_status("stopped", "Voice stopped.")
             self.ws_event("status", message="Voice stopped.")
 
     async def websocket_loop(self, ws: WebSocket) -> None:

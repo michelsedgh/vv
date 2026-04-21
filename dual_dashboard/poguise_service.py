@@ -180,6 +180,15 @@ def load_model(ckpt_path: str, device: torch.device) -> nn.Module:
     model.load_state_dict(poguise_sd, strict=True)
     model.to(device)
     model.eval()
+    del poguise_sd
+    del raw_sd
+    del clean_hparams
+    del hparams
+    del dm_hp
+    del model_hp
+    del ckpt
+    gc.collect()
+    trim_process_heap()
     return model
 
 
@@ -394,19 +403,53 @@ class PoguiseService:
             self._stats["policy_reason"] = "Loading PO-GUISE..."
             self._stats["phase"] = "loading_model"
             self._stats["status_message"] = "Loading PO-GUISE model..."
+            self._stats["device"] = str(device)
 
+        model = None
+        init_error: Optional[Exception] = None
         try:
             with self.gpu_lock:
                 model = load_model(str(ckpt_path), device)
                 if config["fp16"] and device.type == "cuda":
                     model = model.half()
                 self._model = model
+                if device.type == "cuda":
+                    torch.cuda.empty_cache()
+                    torch.cuda.ipc_collect()
+            gc.collect()
+            trim_process_heap()
         except Exception as exc:
+            init_error = exc
+            if device.type == "cuda":
+                with self._lock:
+                    self._stats["status_message"] = (
+                        f"CUDA init failed ({exc}). Retrying on CPU..."
+                    )
+                    self._stats["device"] = "cpu"
+                try:
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                        torch.cuda.ipc_collect()
+                except Exception:
+                    pass
+                gc.collect()
+                trim_process_heap()
+                device = torch.device("cpu")
+                try:
+                    model = load_model(str(ckpt_path), device)
+                    self._model = model
+                    init_error = None
+                    gc.collect()
+                    trim_process_heap()
+                except Exception as cpu_exc:
+                    init_error = cpu_exc
+
+        if init_error is not None:
             with self._lock:
-                self._stats["error"] = f"Model init failed: {exc}"
+                self._stats["error"] = f"Model init failed: {init_error}"
                 self._stats["running"] = False
                 self._stats["phase"] = "error"
-                self._stats["status_message"] = f"Model init failed: {exc}"
+                self._stats["status_message"] = f"Model init failed: {init_error}"
             self.running = False
             self._publish_brain_event("system_status", {"vision_running": False})
             self._finalize_runtime_refs()
@@ -415,6 +458,7 @@ class PoguiseService:
         with self._lock:
             self._stats["phase"] = "opening_camera"
             self._stats["status_message"] = "Model loaded. Opening camera..."
+            self._stats["device"] = str(device)
 
         cap = cv2.VideoCapture(int(config["camera"]))
         self._capture = cap
@@ -525,7 +569,7 @@ class PoguiseService:
                                         model,
                                         clip,
                                         device,
-                                        bool(config["fp16"]),
+                                        bool(config["fp16"]) and device.type == "cuda",
                                         return_heatmap=want_heatmap,
                                     )
                                     inference_ms = (time.time() - t0) * 1000.0

@@ -577,6 +577,9 @@ class RealtimePipeline:
             )
             self._oa_emb(dummy_waveform, dummy_seg)
         torch.cuda.synchronize(self.device)
+        if self.device.type == "cuda":
+            torch.cuda.empty_cache()
+            torch.cuda.ipc_collect()
         log.info(
             "Pipeline ready (emb_dim=%d, latent=%d filters x %d frames).",
             self._emb_dim,
