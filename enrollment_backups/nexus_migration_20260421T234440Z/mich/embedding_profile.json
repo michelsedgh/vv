@@ -1,0 +1,53 @@
+{
+  "anchor_index": 5,
+  "created_at_epoch": 1776764714.7900858,
+  "dim": 256,
+  "identity": {
+    "beta": 10.0,
+    "denoiser_enabled": false,
+    "denoiser_model": null,
+    "embedding_model": "pyannote/wespeaker-voxceleb-resnet34-LM",
+    "enrollment_min_voiced_sec": 0.4,
+    "enrollment_profile_top_k": 3,
+    "enrollment_scan_step_sec": 0.5,
+    "gamma": 3.0,
+    "pixit_duration": 5.0,
+    "pixit_max_speakers": 3,
+    "pixit_model": "pyannote/separation-ami-1.0",
+    "pixit_step": 0.5,
+    "sample_rate": 16000,
+    "source_min_voiced_sec": 0.1,
+    "source_recent_sec": 2.0,
+    "source_seg_threshold": 0.14
+  },
+  "references": [
+    {
+      "name": "reference.wav",
+      "sha256": "de21843d42801e484e95e1eee0e0e845b2ead61988e0291b557a32ed0e55a3ff",
+      "size_bytes": 960044
+    },
+    {
+      "name": "reference_bedroom.wav",
+      "sha256": "4f0bd36ef5792d904c6c08d26c9020684201fc2d0aec8c89574b4c78986b785b",
+      "size_bytes": 960044
+    },
+    {
+      "name": "reference_far_noise_fridge.wav",
+      "sha256": "e5f87cf568135aaec1dff3108928b1be40c741245dbb5db0faf163eb9a1328a3",
+      "size_bytes": 960044
+    },
+    {
+      "name": "reference_far_noise_fridge_fridge_side.wav",
+      "sha256": "1c9aed4de0c9a9887619b500e8eea60617ed9d0431eec362976825346efadc17",
+      "size_bytes": 960044
+    },
+    {
+      "name": "reference_real_fridge_side_other_is_bathroom.wav",
+      "sha256": "5972d04a1c8533ce14eef43a0cf01d02da99b547027bbcda9fc48a42fdb4a8be",
+      "size_bytes": 960044
+    }
+  ],
+  "rows": 6,
+  "schema": "nexus.voice.runtime_enrollment_profile.v1",
+  "speaker": "mich"
+}

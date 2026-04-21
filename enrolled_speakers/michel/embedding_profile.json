@@ -1,0 +1,53 @@
+{
+  "anchor_index": 4,
+  "created_at_epoch": 1776815526.6796534,
+  "dim": 256,
+  "identity": {
+    "beta": 10.0,
+    "denoiser_enabled": false,
+    "denoiser_model": null,
+    "embedding_model": "pyannote/wespeaker-voxceleb-resnet34-LM",
+    "enrollment_min_voiced_sec": 0.4,
+    "enrollment_profile_top_k": 3,
+    "enrollment_scan_step_sec": 0.5,
+    "gamma": 3.0,
+    "pixit_duration": 5.0,
+    "pixit_max_speakers": 3,
+    "pixit_model": "pyannote/separation-ami-1.0",
+    "pixit_step": 0.5,
+    "sample_rate": 16000,
+    "source_min_voiced_sec": 0.1,
+    "source_recent_sec": 2.0,
+    "source_seg_threshold": 0.14
+  },
+  "references": [
+    {
+      "name": "reference_default_bath_8f9661ded4e3.wav",
+      "sha256": "8f9661ded4e38a1bac5dc86ff816b1e75c451a9a11cbf836cc9a75265935625e",
+      "size_bytes": 996738
+    },
+    {
+      "name": "reference_default_bed_4b1f997ed502.wav",
+      "sha256": "4b1f997ed5020b2347dba08330a85ed1d0abb7dc1610433171fcc545f5b403a9",
+      "size_bytes": 985814
+    },
+    {
+      "name": "reference_default_couch_2bc8fb4158b3.wav",
+      "sha256": "2bc8fb4158b320cec256ebf66124998830d8a7aa35e1003fbe83c676cb33b95d",
+      "size_bytes": 1048620
+    },
+    {
+      "name": "reference_default_fridge_0577dc3752e5.wav",
+      "sha256": "0577dc3752e5bc5013cf24b7c9d0c4eb231e242acde242615d8c51a043c7e914",
+      "size_bytes": 991276
+    },
+    {
+      "name": "reference_default_kitchen_stive_265f1aa89f7e.wav",
+      "sha256": "265f1aa89f7ecb5e7e48ecfe22f571f21234d81fa4be285847e0dd1b7caabec3",
+      "size_bytes": 988546
+    }
+  ],
+  "rows": 6,
+  "schema": "nexus.voice.runtime_enrollment_profile.v1",
+  "speaker": "michel"
+}
