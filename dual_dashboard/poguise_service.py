@@ -221,6 +221,30 @@ class PoguiseService:
         self._model = None
         self._capture = None
         self._cleanup_lock = threading.Lock()
+        # Frame-sink fan-out: external consumers (the Nexus vision service) can
+        # register a callback that receives every raw BGR frame + capture ts
+        # without opening a second cv2.VideoCapture on /dev/video0. Sinks are
+        # called synchronously on the camera thread, so they MUST be cheap —
+        # stash the frame in a latest-wins slot and do the heavy work elsewhere.
+        self._frame_sinks: list = []
+        self._frame_sinks_lock = threading.Lock()
+
+    def register_frame_sink(self, sink) -> None:
+        """Subscribe to every raw BGR frame read from the camera.
+
+        ``sink(frame_bgr: np.ndarray, capture_ts: float) -> None``. Must be
+        cheap (microseconds). Called on the camera thread.
+        """
+        with self._frame_sinks_lock:
+            if sink not in self._frame_sinks:
+                self._frame_sinks.append(sink)
+
+    def unregister_frame_sink(self, sink) -> None:
+        with self._frame_sinks_lock:
+            try:
+                self._frame_sinks.remove(sink)
+            except ValueError:
+                pass
 
     def set_loop(self, loop) -> None:
         self.loop = loop
@@ -450,6 +474,19 @@ class PoguiseService:
                 fps_cam = 0.9 * fps_cam + 0.1 * (1.0 / max(t_now - t_cam_prev, 1e-6))
                 t_cam_prev = t_now
                 frame_count += 1
+
+                # Fan out the raw frame to registered sinks (e.g. the Nexus
+                # VisionService). Sinks are supposed to be cheap (stash +
+                # return); we swallow errors so a misbehaving sink can't wedge
+                # the camera loop.
+                if self._frame_sinks:
+                    with self._frame_sinks_lock:
+                        sinks = list(self._frame_sinks)
+                    for sink in sinks:
+                        try:
+                            sink(raw_frame, t_now)
+                        except Exception:
+                            pass
 
                 small = cv2.resize(
                     raw_frame,
