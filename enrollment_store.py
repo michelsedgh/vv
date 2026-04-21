@@ -32,6 +32,35 @@ def embedding_cache_path(speaker_dir: Path) -> Path:
     return speaker_dir / "embedding.npy"
 
 
+def load_speaker_embedding_cache(speaker_dir: Path) -> Optional[np.ndarray]:
+    cache_path = embedding_cache_path(speaker_dir)
+    if not cache_path.exists():
+        return None
+    try:
+        embedding = np.asarray(np.load(cache_path), dtype=np.float64).reshape(-1)
+    except Exception:
+        return None
+    if embedding.size == 0 or not np.all(np.isfinite(embedding)):
+        return None
+    norm = np.linalg.norm(embedding)
+    if norm > 0:
+        embedding = embedding / norm
+    return embedding.astype(np.float64, copy=False)
+
+
+def _embedding_cache_is_current(cache_path: Path, refs: Iterable[Path]) -> bool:
+    if not cache_path.exists():
+        return False
+    refs = list(refs)
+    if not refs:
+        return True
+    try:
+        cache_mtime = cache_path.stat().st_mtime_ns
+        return all(cache_mtime >= ref.stat().st_mtime_ns for ref in refs)
+    except OSError:
+        return False
+
+
 def _load_reference_audio(path: Path, target_sr: int) -> np.ndarray:
     audio, sample_rate = sf.read(str(path), dtype="float32")
     if audio.ndim > 1:
@@ -108,11 +137,21 @@ def rebuild_enrollment_cache(enroll_dir: Path, cfg: dict) -> Dict[str, np.ndarra
         return enrolled
 
     device = torch.device(cfg["device"])
-    model = load_embedding_model(cfg["embedding"]["model"], device)
+    model = None
     try:
         for speaker_dir in sorted(enroll_dir.iterdir()):
             if not speaker_dir.is_dir():
                 continue
+            refs = reference_paths(speaker_dir)
+            if _embedding_cache_is_current(embedding_cache_path(speaker_dir), refs):
+                cached = load_speaker_embedding_cache(speaker_dir)
+                if cached is not None:
+                    enrolled[speaker_dir.name] = cached
+                    continue
+            if not refs:
+                continue
+            if model is None:
+                model = load_embedding_model(cfg["embedding"]["model"], device)
             embedding = rebuild_speaker_embedding_cache(
                 speaker_dir,
                 cfg,
@@ -122,7 +161,8 @@ def rebuild_enrollment_cache(enroll_dir: Path, cfg: dict) -> Dict[str, np.ndarra
             if embedding is not None:
                 enrolled[speaker_dir.name] = embedding
     finally:
-        del model
+        if model is not None:
+            del model
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
     return enrolled

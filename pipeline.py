@@ -86,8 +86,10 @@ See also: module docstring in ``enrolled_clustering.py`` and comments in
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
+import tempfile
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -107,11 +109,15 @@ from embedding_runtime import (
     extract_embedding_vector,
     load_embedding_model,
 )
-from enrollment_store import reference_paths
+from enrollment_store import embedding_cache_path, reference_paths
 from enrolled_clustering import EnrolledSpeakerClustering
 from pixit_wrapper import make_pixit_segmentation_model
 
 log = logging.getLogger(__name__)
+
+_RUNTIME_PROFILE_SCHEMA = "nexus.voice.runtime_enrollment_profile.v1"
+_RUNTIME_PROFILE_NPY = "embedding_profile.npy"
+_RUNTIME_PROFILE_JSON = "embedding_profile.json"
 
 
 # ─── Output dataclass ────────────────────────────────────────────
@@ -1460,6 +1466,192 @@ class RealtimePipeline:
 
         return updates
 
+    @staticmethod
+    def _runtime_profile_cache_paths(speaker_dir: Path) -> tuple[Path, Path]:
+        return (
+            speaker_dir / _RUNTIME_PROFILE_NPY,
+            speaker_dir / _RUNTIME_PROFILE_JSON,
+        )
+
+    @staticmethod
+    def _atomic_save_npy(path: Path, value: np.ndarray) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path: Optional[Path] = None
+        try:
+            with tempfile.NamedTemporaryFile(dir=path.parent, delete=False) as tmp:
+                np.save(tmp, value)
+                tmp_path = Path(tmp.name)
+            tmp_path.replace(path)
+        finally:
+            if tmp_path is not None and tmp_path.exists():
+                tmp_path.unlink(missing_ok=True)
+
+    @staticmethod
+    def _atomic_write_json(path: Path, value: dict) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path: Optional[Path] = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                "w",
+                encoding="utf-8",
+                dir=path.parent,
+                delete=False,
+            ) as tmp:
+                json.dump(value, tmp, indent=2, sort_keys=True)
+                tmp.write("\n")
+                tmp_path = Path(tmp.name)
+            tmp_path.replace(path)
+        finally:
+            if tmp_path is not None and tmp_path.exists():
+                tmp_path.unlink(missing_ok=True)
+
+    @staticmethod
+    def _normalize_profile_rows(rows: np.ndarray) -> Optional[np.ndarray]:
+        rows = np.asarray(rows, dtype=np.float64)
+        if rows.ndim == 1:
+            rows = rows.reshape(1, -1)
+        if rows.ndim != 2 or rows.shape[0] == 0 or rows.shape[1] == 0:
+            return None
+        finite = np.all(np.isfinite(rows), axis=1)
+        norms = np.linalg.norm(rows, axis=1)
+        keep = finite & (norms > 0)
+        if not np.any(keep):
+            return None
+        rows = rows[keep]
+        norms = np.linalg.norm(rows, axis=1, keepdims=True)
+        return (rows / np.maximum(norms, 1e-12)).astype(np.float64, copy=False)
+
+    @staticmethod
+    def _reference_fingerprints(ref_paths: List[Path]) -> List[dict]:
+        fingerprints: List[dict] = []
+        for path in ref_paths:
+            digest = hashlib.sha256()
+            with path.open("rb") as handle:
+                for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                    digest.update(chunk)
+            stat = path.stat()
+            fingerprints.append(
+                {
+                    "name": path.name,
+                    "size_bytes": int(stat.st_size),
+                    "sha256": digest.hexdigest(),
+                }
+            )
+        return fingerprints
+
+    def _runtime_profile_identity(self, config: dict) -> dict:
+        pixit_cfg = config.get("pixit", {})
+        denoiser_cfg = config.get("denoiser", {})
+        return {
+            "sample_rate": int(self.sample_rate),
+            "pixit_model": str(pixit_cfg.get("model", "")),
+            "pixit_duration": float(self.duration),
+            "pixit_step": float(self.step_duration),
+            "pixit_max_speakers": int(self.n_local_speakers),
+            "embedding_model": self._embedding_model_name,
+            "source_seg_threshold": float(self._embed_seg_threshold),
+            "source_min_voiced_sec": float(self._embed_min_voiced_sec),
+            "source_recent_sec": float(self._embed_recent_sec),
+            "enrollment_profile_top_k": int(self._enroll_profile_top_k),
+            "enrollment_scan_step_sec": float(self._enroll_scan_step_sec),
+            "enrollment_min_voiced_sec": float(self._enroll_min_voiced_sec),
+            "gamma": float(self._embed_gamma),
+            "beta": float(self._embed_beta),
+            "denoiser_enabled": bool(self._denoiser_enabled),
+            "denoiser_model": (
+                str(denoiser_cfg.get("model", "DeepFilterNet3"))
+                if self._denoiser_enabled
+                else None
+            ),
+        }
+
+    def _load_runtime_enrollment_profile(
+        self,
+        name: str,
+        speaker_dir: Path,
+        ref_paths: List[Path],
+        config: dict,
+        fallback_embedding: np.ndarray,
+    ) -> Optional[tuple[np.ndarray, np.ndarray]]:
+        profile_path, metadata_path = self._runtime_profile_cache_paths(speaker_dir)
+        if not profile_path.exists() or not metadata_path.exists():
+            return None
+        try:
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            if not isinstance(metadata, dict):
+                return None
+            if metadata.get("schema") != _RUNTIME_PROFILE_SCHEMA:
+                return None
+            if metadata.get("identity") != self._runtime_profile_identity(config):
+                return None
+            if (
+                ref_paths
+                and metadata.get("references") != self._reference_fingerprints(ref_paths)
+            ):
+                return None
+            profile_rows = self._normalize_profile_rows(np.load(profile_path))
+            if profile_rows is None:
+                return None
+            fallback = np.asarray(fallback_embedding, dtype=np.float64).reshape(-1)
+            if fallback.size and profile_rows.shape[1] != fallback.size:
+                return None
+            anchor_index = int(metadata.get("anchor_index", 0))
+            if anchor_index < 0 or anchor_index >= profile_rows.shape[0]:
+                anchor_index = 0
+            emb = profile_rows[anchor_index].copy()
+            log.info(
+                "Loaded cached overlap-aware enrollment profile for '%s' (rows=%d dim=%d)",
+                name,
+                profile_rows.shape[0],
+                profile_rows.shape[1],
+            )
+            return emb, profile_rows
+        except Exception as exc:
+            log.warning(
+                "Failed to load cached overlap-aware enrollment profile for '%s': %s",
+                name,
+                exc,
+            )
+            return None
+
+    def _save_runtime_enrollment_profile(
+        self,
+        name: str,
+        speaker_dir: Path,
+        profile_rows: np.ndarray,
+        anchor_index: int,
+        config: dict,
+        ref_paths: List[Path],
+    ) -> None:
+        try:
+            normalized_rows = self._normalize_profile_rows(profile_rows)
+            if normalized_rows is None:
+                return
+            anchor_index = max(0, min(int(anchor_index), normalized_rows.shape[0] - 1))
+            profile_path, metadata_path = self._runtime_profile_cache_paths(speaker_dir)
+            self._atomic_save_npy(profile_path, normalized_rows)
+            self._atomic_save_npy(
+                embedding_cache_path(speaker_dir),
+                normalized_rows[anchor_index].copy(),
+            )
+            metadata = {
+                "schema": _RUNTIME_PROFILE_SCHEMA,
+                "speaker": name,
+                "identity": self._runtime_profile_identity(config),
+                "references": self._reference_fingerprints(ref_paths),
+                "anchor_index": anchor_index,
+                "rows": int(normalized_rows.shape[0]),
+                "dim": int(normalized_rows.shape[1]),
+                "created_at_epoch": time.time(),
+            }
+            self._atomic_write_json(metadata_path, metadata)
+        except Exception as exc:
+            log.warning(
+                "Failed to save overlap-aware enrollment profile cache for '%s': %s",
+                name,
+                exc,
+            )
+
     def _reextract_enrollments(
         self,
         enrolled_embeddings: Dict[str, np.ndarray],
@@ -1482,6 +1674,18 @@ class RealtimePipeline:
         for name in enrolled_embeddings:
             speaker_dir = enroll_dir / name
             ref_paths = reference_paths(speaker_dir)
+            cached_profile = self._load_runtime_enrollment_profile(
+                name,
+                speaker_dir,
+                ref_paths,
+                config,
+                enrolled_embeddings[name],
+            )
+            if cached_profile is not None:
+                emb, profile_rows = cached_profile
+                reextracted[name] = emb
+                self._enrollment_profiles_by_name[name] = profile_rows
+                continue
             if not ref_paths:
                 log.warning("No reference*.wav for '%s', using stored embedding", name)
                 reextracted[name] = enrolled_embeddings[name]
@@ -1624,6 +1828,14 @@ class RealtimePipeline:
                 np.float64, copy=False
             )
             reextracted[name] = emb
+            self._save_runtime_enrollment_profile(
+                name,
+                speaker_dir,
+                profile_rows,
+                int(anchor_order[0]),
+                config,
+                ref_paths,
+            )
             log.info(
                 "Re-extracted '%s' through %sPixIT-seg→overlap-aware-%s (dim=%d)",
                 name,

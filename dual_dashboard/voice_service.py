@@ -61,6 +61,7 @@ class VoiceService:
         self._phase = "idle"
         self._status_message = "Voice is stopped"
         self._last_error: Optional[str] = None
+        self.enrollment_cache_ready_callback = None
 
     def set_loop(self, loop: asyncio.AbstractEventLoop) -> None:
         self.loop = loop
@@ -617,6 +618,15 @@ class VoiceService:
             del enrolled
             gc.collect()
             trim_process_heap()
+            callback = self.enrollment_cache_ready_callback
+            if callable(callback):
+                try:
+                    callback(cfg)
+                except Exception as exc:
+                    voice_source.log.warning(
+                        "Enrollment cache ready callback failed: %s",
+                        exc,
+                    )
         except Exception as exc:
             self._set_status("error", f"Voice init failed: {exc}", error=str(exc))
             self.ws_event("error", message=f"Voice init failed: {exc}")
