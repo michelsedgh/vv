@@ -60,6 +60,12 @@ def default_poguise_config() -> Dict[str, Any]:
     return {
         "checkpoint": default_checkpoint,
         "camera": 0,
+        # None of the downstream models need >640×480 (YOLO=512, SCRFD=640,
+        # POGUISE=224, OSNet=256×128, LVFace=112).  Lowering from 1280×720
+        # quarters every memcpy on the camera fan-out path with no
+        # accuracy loss for subjects closer than ~3 m.
+        "camera_width": 640,
+        "camera_height": 480,
         "fp16": True,
         "infer_every": 6,
         "confidence_threshold": 0.12,

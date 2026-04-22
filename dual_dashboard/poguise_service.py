@@ -221,7 +221,18 @@ class PoguiseService:
         self.event_bus: Optional[EventBus] = None
         self._lock = threading.Lock()
         self._show_heatmap = False
+        # Lazy-JPEG state.  The old design composited (heatmap blend) and
+        # JPEG-encoded every raw frame at 30 fps whether or not anyone was
+        # watching — ~25-30% of one core.  Now we just stash a shallow ref
+        # to the latest raw frame + ts and defer the blend + imencode to
+        # ``latest_frame_bytes()``, which is called by the MJPEG endpoint
+        # and the 1-Hz nexus-agent thumbnail loop.  Concurrent callers
+        # share one encode per frame via the (_latest_raw_ts == _latest_jpeg_ts)
+        # cache check.
+        self._latest_raw_frame = None
+        self._latest_raw_ts: float = 0.0
         self._latest_frame_jpeg = b""
+        self._latest_frame_jpeg_ts: float = -1.0
         self._last_heatmap = None
         self.running = False
         self.thread: Optional[threading.Thread] = None
@@ -312,23 +323,61 @@ class PoguiseService:
             return {"show_heatmap": self._show_heatmap}
 
     def video_feed(self):
+        # ~30 fps ceiling.  The MJPEG pull path now composites + encodes
+        # on demand via latest_frame_bytes(), so we need to pace ourselves
+        # instead of spinning on the lock.
+        last_ts = -1.0
         while True:
             with self._lock:
-                frame_bytes = self._latest_frame_jpeg
                 active = self.running
-            if frame_bytes:
-                yield (
-                    b"--frame\r\n"
-                    b"Content-Type: image/jpeg\r\n\r\n" + frame_bytes + b"\r\n"
-                )
-            elif not active:
-                time.sleep(0.15)
-            else:
-                time.sleep(0.01)
+                raw_ts = self._latest_raw_ts
+            if active and raw_ts > last_ts:
+                frame_bytes = self.latest_frame_bytes()
+                last_ts = raw_ts
+                if frame_bytes:
+                    yield (
+                        b"--frame\r\n"
+                        b"Content-Type: image/jpeg\r\n\r\n" + frame_bytes + b"\r\n"
+                    )
+                    continue
+            time.sleep(0.033 if active else 0.15)
 
     def latest_frame_bytes(self) -> bytes:
+        """Lazy: return the most-recent raw frame as a JPEG (with heatmap
+        overlay if enabled), encoding on demand and caching by frame ts.
+
+        No encoding happens when nobody is polling this.  Concurrent callers
+        share one encode per frame.
+        """
         with self._lock:
-            return bytes(self._latest_frame_jpeg)
+            if self._latest_raw_ts == self._latest_frame_jpeg_ts:
+                return bytes(self._latest_frame_jpeg)
+            raw_frame = self._latest_raw_frame
+            raw_ts = self._latest_raw_ts
+            show_heatmap = self._show_heatmap
+            heatmap = self._last_heatmap
+        if raw_frame is None:
+            return b""
+        display_frame = raw_frame.copy()
+        if show_heatmap and heatmap is not None:
+            hm_full = cv2.resize(
+                heatmap,
+                (display_frame.shape[1], display_frame.shape[0]),
+                interpolation=cv2.INTER_CUBIC,
+            )
+            colored_hm = cv2.applyColorMap(hm_full, cv2.COLORMAP_JET)
+            display_frame = cv2.addWeighted(display_frame, 0.6, colored_hm, 0.4, 0)
+        ok, buf = cv2.imencode(
+            ".jpg", display_frame, [int(cv2.IMWRITE_JPEG_QUALITY), 80]
+        )
+        if not ok:
+            return b""
+        jpeg = buf.tobytes()
+        with self._lock:
+            if raw_ts >= self._latest_frame_jpeg_ts:
+                self._latest_frame_jpeg = jpeg
+                self._latest_frame_jpeg_ts = raw_ts
+        return jpeg
 
     def start(self) -> dict:
         if self.running:
@@ -376,7 +425,10 @@ class PoguiseService:
             self._model = None
             self._capture = None
             self._last_heatmap = None
+            self._latest_raw_frame = None
+            self._latest_raw_ts = 0.0
             self._latest_frame_jpeg = b""
+            self._latest_frame_jpeg_ts = -1.0
             gc.collect()
             if torch.cuda.is_available():
                 try:
@@ -467,8 +519,14 @@ class PoguiseService:
             cap = cv2.VideoCapture(int(config["camera"]))
             self._capture = cap
 
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+        # Camera resolution is config-driven (settings.default_poguise_config)
+        # so the nexus-agent stack and standalone poguise dashboard stay in
+        # lock-step.  Driver picks the closest supported mode if the request
+        # is not natively available (typical USB-UVC behaviour).
+        cam_w = int(config.get("camera_width", 640))
+        cam_h = int(config.get("camera_height", 480))
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, cam_w)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, cam_h)
 
         if BUFFER_W <= BUFFER_H:
             scaled_w = SCALE
@@ -548,9 +606,12 @@ class PoguiseService:
                     bool(self.voice_running_getter()),
                 )
                 effective_infer_every = int(plan["effective_infer_every"])
+                startup_gate = getattr(self, "startup_gate", None)
+                startup_ready = startup_gate is None or startup_gate.is_set()
 
                 if (
-                    frame_count % effective_infer_every == 0
+                    startup_ready
+                    and frame_count % effective_infer_every == 0
                     and len(valid_frames) >= N_FRAMES
                 ):
                     if plan["should_pause"]:
@@ -597,21 +658,14 @@ class PoguiseService:
                                     hm_full[hm_y0:hm_y1, hm_x0:hm_x1] = hm_roi
                                     self._last_heatmap = hm_full
 
-                display_frame = raw_frame.copy()
-                if self._show_heatmap and self._last_heatmap is not None:
-                    hm_full = cv2.resize(
-                        self._last_heatmap,
-                        (display_frame.shape[1], display_frame.shape[0]),
-                        interpolation=cv2.INTER_CUBIC,
-                    )
-                    colored_hm = cv2.applyColorMap(hm_full, cv2.COLORMAP_JET)
-                    display_frame = cv2.addWeighted(display_frame, 0.6, colored_hm, 0.4, 0)
-
-                ret_jpg, jpeg = cv2.imencode(
-                    ".jpg",
-                    display_frame,
-                    [int(cv2.IMWRITE_JPEG_QUALITY), 80],
-                )
+                # Publish shallow ref for lazy JPEG encode on demand
+                # (see latest_frame_bytes()).  The old code blended heatmap +
+                # imencode'd every frame here — at 30 fps that was a full CPU
+                # core of composite-and-encode work that got thrown away any
+                # time no browser or thumbnail poller was connected.
+                with self._lock:
+                    self._latest_raw_frame = raw_frame
+                    self._latest_raw_ts = t_now
                 buffer_pct = min(
                     100.0,
                     100.0 * len(valid_frames) / (fps_cam * CONTEXT_SECONDS + 1e-5),
@@ -665,8 +719,7 @@ class PoguiseService:
                 ]
 
                 with self._lock:
-                    if ret_jpg:
-                        self._latest_frame_jpeg = jpeg.tobytes()
+                    # JPEG is now produced lazily by latest_frame_bytes().
                     self._stats = {
                         "running": True,
                         "fps_cam": float(fps_cam),

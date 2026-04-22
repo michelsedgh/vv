@@ -635,6 +635,23 @@ class VoiceService:
             self._finalize_runtime_refs()
             return
 
+        startup_gate = getattr(self, "startup_gate", None)
+        if startup_gate is not None and not startup_gate.is_set():
+            self._set_status(
+                "model_ready",
+                "Voice models loaded. Waiting for shared runtime startup...",
+            )
+            self.ws_event(
+                "status",
+                message="Voice models loaded. Waiting for shared runtime startup...",
+            )
+            startup_gate.wait()
+            if self.monitor.stop_event.is_set():
+                self.monitor.running = False
+                self._publish_brain_event("system_status", {"voice_running": False})
+                self._finalize_runtime_refs()
+                return
+
         self._set_status("opening_mic", "Voice ready. Starting mic capture...")
         self.ws_event("status", message="Voice ready. Starting mic capture...")
 
@@ -755,6 +772,10 @@ class VoiceService:
                 if not drained:
                     time.sleep(0.05)
         except Exception as exc:
+            import traceback as _tb
+            voice_source.log.error(
+                "voice_monitor_crash: %s\n%s", exc, _tb.format_exc()
+            )
             self._set_status("error", f"Voice monitor error: {exc}", error=str(exc))
             self.ws_event("error", message=f"Voice monitor error: {exc}")
         finally:
